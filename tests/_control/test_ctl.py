@@ -327,6 +327,8 @@ def test_print_events_empty_and_done(capsys: pytest.CaptureFixture[str]) -> None
     _print_events({"events": [], "next": "X", "done": True})
     out = capsys.readouterr().out
     assert "(no events)" in out
+    assert "done" in out
+    assert "next:" not in out  # a done stream offers no resume cursor
 
 
 def test_keep_alive_footer_on_when_all_tasks_keep_alive(
@@ -419,5 +421,3 @@ def test_resolve_target_server_none_running_exits(
     with pytest.raises(click.exceptions.Exit):
         _resolve_target_server(None)
     assert "No running inspect processes found" in capsys.readouterr().err
-    assert "done" in out
-    assert "next:" not in out  # a done stream offers no resume cursor
