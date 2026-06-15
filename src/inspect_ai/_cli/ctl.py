@@ -18,6 +18,7 @@ from __future__ import annotations
 import json as json_lib
 from collections.abc import Sequence
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, NoReturn
 
 import click
@@ -436,7 +437,7 @@ def _resolve_target_server(pid: int | None) -> DiscoveredControlServer:
     raise click.exceptions.Exit(code=1)
 
 
-def _post_to_server(socket_path: Any, path: str) -> None:
+def _post_to_server(socket_path: Path, path: str) -> None:
     """POST to a control server's ``path`` over its AF_UNIX socket."""
     transport = httpx.HTTPTransport(uds=str(socket_path))
     with httpx.Client(
