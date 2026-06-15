@@ -35,24 +35,43 @@ jobs:
       actions: read
     with:
       base_branch: main
-      claude_args: >-
-        --append-system-prompt 'Repo context: meridianlabs-ai/inspect_ai is a
-        fork of UKGovernmentBEIS/inspect_ai (upstream). Branch `main` is a
-        pristine mirror of upstream main: always branch from it and open PRs
-        against it, never against the `meridian` branch, and never commit to
-        `main` or `meridian` directly. Before opening a PR, verify your work
-        per CLAUDE.md: install the project (pip install -e ".[dev]"), run
-        pytest on the tests you added or touched, then ruff check and mypy on
-        changed files; fix what they surface. If verification is impossible
-        (a tool is blocked or the environment cannot be set up), state exactly
-        what was not run in the PR description. When you finish implementing
-        work from an issue, open a draft PR in this fork (base: main) with
-        `gh pr create` rather than only linking a compare URL. PRs within this fork are a review
-        surface only and are never merged here; finished work is promoted by a
-        human opening an upstream PR from the same branch (gh pr create --repo
-        UKGovernmentBEIS/inspect_ai --head meridianlabs-ai:BRANCH). When asked
-        to address feedback from an upstream PR, read its comments with gh
-        (upstream is public) and push fixes to the same branch in this fork;
-        the upstream PR updates automatically. Never modify files under
-        .github/workflows that are meridian-only (claude.yml,
-        sync-upstream.yml).'
+      # Fork-specific guidance. Goes through the reusable workflow's
+      # append_system_prompt input (a single composed --append-system-prompt),
+      # NOT claude_args — a second --append-system-prompt would collide with the
+      # composed one. The fork can't ship a CLAUDE.md/AGENTS.md (main must stay
+      # pristine and a file on meridian isn't on the main-cut work branches).
+      append_system_prompt: >-
+        Repo context: meridianlabs-ai/inspect_ai is a fork of
+        UKGovernmentBEIS/inspect_ai (upstream). Branch `main` is a pristine
+        mirror of upstream main: always branch from it and open PRs against it,
+        never against the `meridian` branch, and never commit to `main` or
+        `meridian` directly. Before opening a PR, verify your work per
+        CLAUDE.md: install the project (pip install -e ".[dev]"), run pytest on
+        the tests you added or touched, then ruff check and mypy on changed
+        files; fix what they surface. If verification is impossible (a tool is
+        blocked or the environment cannot be set up), state exactly what was not
+        run in the PR description. When you finish implementing work from an
+        issue, open a draft PR in this fork (base: main) with `gh pr create`
+        rather than only linking a compare URL. PRs within this fork are a
+        review surface only and are never merged here; finished work is promoted
+        by a human opening an upstream PR from the same branch (gh pr create
+        --repo UKGovernmentBEIS/inspect_ai --head meridianlabs-ai:BRANCH). When
+        asked to address feedback from an upstream PR, read its comments with gh
+        (upstream is public) and push fixes to the same branch in this fork; the
+        upstream PR updates automatically. Never modify files under
+        .github/workflows that are meridian-only (claude.yml, sync-upstream.yml).
+        CHANGELOG: for changes to product functionality (not for test-only or
+        build-only changes) add a CHANGELOG entry. Put it in the "## Unreleased"
+        section at the top of the file; if that section does not exist, create
+        it. If "## Unreleased" already has entries, group the new entry with
+        similar items if any, otherwise add it at the end of the list. The entry
+        must be a single line and a single sentence.
+      # Appended to the shared branch_sync_prompt (not replacing it) — adds the
+      # CHANGELOG-merge check, which is fork-specific since the CHANGELOG
+      # convention is. Fires only on PR follow-up runs, where the merge happens.
+      branch_sync_append: >-
+        If this branch added a CHANGELOG entry, review the merge result
+        carefully: the default merge resolution can move your entry out of the
+        "## Unreleased" section (e.g. under a released heading). After merging,
+        always verify your CHANGELOG entry is still under "## Unreleased" and
+        move it back if it was relocated.
