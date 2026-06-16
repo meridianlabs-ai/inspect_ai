@@ -1,7 +1,15 @@
-# Copy to .github/workflows/claude-review.yml in any Meridian repo to add the
-# read-only reviewer. Auto-reviews PRs when they open and on demand via an
-# @review comment. Independent of the dev agent (claude.yml) — different
-# trigger, different (lower) permissions.
+# Read-only reviewer for the meridianlabs-ai/inspect_ai fork. Independent of the
+# dev agent (claude.yml) — different trigger, lower permissions.
+#
+# On this fork the pull_request trigger below does NOT fire: GitHub resolves
+# pull_request-family workflows from the PR's branches (`main` / a feature
+# branch), which don't carry this file (it lives only on `meridian`). So
+# auto-review-on-open can't happen the usual way. Instead the dev agent posts a
+# top-level `@review` comment when it opens a PR, and `allowed_bots:
+# "claude[bot]"` below lets that bot-authored comment through (claude-code-action
+# rejects bot actors otherwise). Humans can also `@review` any PR manually. The
+# pull_request trigger is kept so this stub still works if copied to a normal
+# repo where the base branch carries the workflow.
 
 name: Review
 
@@ -26,3 +34,20 @@ jobs:
       issues: read
       id-token: write
       actions: read
+    with:
+      # Honor the dev agent's @review comment posted when it opens a PR (it runs
+      # as claude[bot]; the action rejects bot actors unless listed here). The
+      # reviewer is read-only, so this only ever starts a review — never a write.
+      allowed_bots: "claude[bot]"
+      # Fork-specific reviewer guidance. On this fork only top-level PR comments
+      # reach the dev agent, so point authors there for follow-ups. And the
+      # reviewer must never emit the literal @review token, or its own comment
+      # would retrigger this workflow (which now accepts bot comments).
+      append_system_prompt: >-
+        Repo context: on the meridianlabs-ai/inspect_ai fork, only top-level PR
+        comments trigger the agents — inline review-comment replies do NOT reach
+        the dev agent. When a finding needs action, tell the author to reply with
+        a top-level `@claude <instruction>` comment on the PR, not an inline
+        reply. Never write the literal token @review anywhere in your output (it
+        would retrigger this review workflow); refer to it as "a review request"
+        instead.

@@ -1,18 +1,23 @@
 # Claude stub for the meridianlabs-ai/inspect_ai fork.
-# Lives on the `meridian` default branch (event workflows only fire from the
-# default branch). Claude branches from and opens PRs against pristine `main`
-# (which mirrors UKGovernmentBEIS/inspect_ai) so review diffs never include
-# meridian infra commits. See the two-stage PR flow in the README.
+# Lives on the `meridian` default branch. Claude branches from and opens PRs
+# against pristine `main` (which mirrors UKGovernmentBEIS/inspect_ai) so review
+# diffs never include meridian infra commits. See the two-stage PR flow in the
+# README.
+#
+# Triggers are limited to issue_comment + issues on purpose: GitHub resolves
+# those from the default branch (meridian, where this file lives), but it
+# resolves pull_request-family events (pull_request_review_comment,
+# pull_request_review) from the PR's own branches — which here are `main` / a
+# `main`-cut feature branch, neither of which carries this workflow. So those
+# events can NEVER fire on the fork; including them would only advertise a
+# trigger that does nothing. Mention @claude in a TOP-LEVEL comment (or use the
+# `claude` label) — inline review-comment replies are not picked up here.
 
 name: Claude
 
 on:
   issue_comment:
     types: [created]
-  pull_request_review_comment:
-    types: [created]
-  pull_request_review:
-    types: [submitted]
   issues:
     types: [opened, labeled]
 
@@ -22,7 +27,6 @@ jobs:
     # action does its own authoritative trigger check.
     if: |
       contains(github.event.comment.body, '@claude') ||
-      contains(github.event.review.body, '@claude') ||
       contains(github.event.issue.body, '@claude') ||
       contains(github.event.issue.title, '@claude') ||
       github.event.label.name == 'claude'
@@ -52,7 +56,11 @@ jobs:
         blocked or the environment cannot be set up), state exactly what was not
         run in the PR description. When you finish implementing work from an
         issue, open a draft PR in this fork (base: main) with `gh pr create`
-        rather than only linking a compare URL. PRs within this fork are a
+        rather than only linking a compare URL. Immediately after opening the
+        PR, post a top-level comment of exactly `@review` on it (e.g.
+        `gh pr comment <number> --body '@review'`) to request an automated
+        review: auto-review-on-open does not fire on this fork, so this comment
+        is what starts the reviewer. PRs within this fork are a
         review surface only and are never merged here; finished work is promoted
         by a human opening an upstream PR from the same branch (gh pr create
         --repo UKGovernmentBEIS/inspect_ai --head meridianlabs-ai:BRANCH). When
