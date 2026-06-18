@@ -1,0 +1,29 @@
+name: Claude agent environment
+description: >-
+  Provision inspect_ai so Claude Code agents can run pytest/mypy/ruff instead of
+  falling back to static checks. Invoked by the reusable agent workflows in
+  meridianlabs-ai/agents when present. Mirrors the env setup in build.yml's test
+  job (upstream inlines setup rather than exposing a composite action, so there
+  is nothing to delegate to). Lives on `meridian` only; it is therefore picked
+  up by the dev agent (which checks out the default branch) but not the reviewer
+  (which checks out the pristine-main-cut PR head) — see the agents repo's
+  design/architecture.md.
+
+runs:
+  using: composite
+  steps:
+    - name: Install uv
+      uses: astral-sh/setup-uv@v7
+      with:
+        # Keep in step with UV_VERSION in build.yml.
+        version: "0.9.4"
+        python-version: "3.11"
+        enable-cache: true
+    - name: Install dependencies
+      shell: bash
+      # Editable (-e), unlike build.yml's plain `.[dev]`: the agent edits src
+      # after this step runs, and an editable install keeps `import inspect_ai`
+      # pointed at the working tree so `uv run pytest` exercises those edits.
+      run: |
+        uv venv
+        uv pip install -e ".[dev]"
