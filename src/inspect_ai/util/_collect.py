@@ -22,11 +22,14 @@ async def collect(*tasks: Awaitable[T]) -> list[T]:
     Using `collect()` in preference to `asyncio.gather()` is highly recommended
     for both Trio compatibility and more legible transcript output.
 
+    The tasks run concurrently and the returned list preserves the order in
+    which the tasks were passed (not the order in which they complete).
+
     Args:
         *tasks: Tasks to run
 
     Returns:
-        List of task results.
+        List of task results, in the same order as the corresponding `tasks`.
     """
     from ._span import span
 
