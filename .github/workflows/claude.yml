@@ -31,6 +31,12 @@ jobs:
       contains(github.event.issue.title, '@claude') ||
       github.event.label.name == 'claude'
     uses: meridianlabs-ai/agents/.github/workflows/claude.yml@main
+    # Pass the machine-account PAT (MARVIN_TOKEN, an org secret) explicitly —
+    # not via `secrets: inherit` — so the fork's other secrets (e.g. SYNC_TOKEN)
+    # aren't exposed to this @main-pinned workflow. Lets agent-opened fork PRs
+    # trigger CI and @review. Absent secret resolves to empty; agent still runs.
+    secrets:
+      MARVIN_TOKEN: ${{ secrets.MARVIN_TOKEN }}
     permissions:
       contents: write
       pull-requests: write
