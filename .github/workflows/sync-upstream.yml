@@ -39,3 +39,17 @@ jobs:
           git push origin refs/remotes/upstream/main:refs/heads/main
           git merge upstream/main --no-edit
           git push origin meridian
+
+      # Notify only on failure — the GitHub Slack app can't filter workflow
+      # runs by conclusion, so success notifications are suppressed by posting
+      # from here instead of subscribing the channel to workflow events.
+      - name: Notify Slack on failure
+        if: failure()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          payload="$(jq -n --arg url "$RUN_URL" \
+            '{text: ("❌ *Sync upstream* failed — " + $url)}')"
+          curl -fsS -X POST -H 'Content-type: application/json' \
+            --data "$payload" "$SLACK_WEBHOOK_URL"
