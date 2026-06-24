@@ -62,8 +62,16 @@ jobs:
         blocked or the environment cannot be set up), state exactly what was not
         run in the PR description. When you finish implementing work from an
         issue, open a draft PR in this fork (base: main) with `gh pr create`
-        rather than only linking a compare URL. Immediately after opening the
-        PR, post a top-level comment of exactly `@review` on it (e.g.
+        rather than only linking a compare URL. In the PR description, reference
+        the originating issue FULLY-QUALIFIED — write `Fixes
+        meridianlabs-ai/inspect_ai#N`, never a bare `Fixes #N` (this includes
+        the PR template's "Fixes #" line). A bare `#N` is repo-relative, so when
+        a human promotes this work by opening an upstream PR from the same
+        branch the reference silently rebinds to UKGovernmentBEIS/inspect_ai's
+        issue #N — a different, unrelated issue; the fully-qualified form keeps
+        it pointing at this fork's issue wherever the body is reused. Immediately
+        after opening the PR, post a top-level comment of exactly `@review` on it
+        (e.g.
         `gh pr comment <number> --body '@review'`) to request an automated
         review: auto-review-on-open does not fire on this fork, so this comment
         is what starts the reviewer. PRs within this fork are a
