@@ -4,6 +4,7 @@
 - Log: Reading sample summaries from an in-progress `.eval` on a remote filesystem (e.g. S3) now fetches the per-sample journal summary files concurrently, reducing load time for logs with many samples.
 - Log: Sample event condensing is now linear, not quadratic, in conversation length.
 - Eval: Warn when non-empty `task_args` are passed but cannot be applied to any task. (#4194)
+- Eval Set: Fix `KeyError` at finalisation when a provider rewrites its own model name mid-run (e.g. vLLM resolving a `base:adapter` LoRA spec to `base`).
 - Model API: Keep the connection-pool/adaptive-concurrency scope stable when a provider's `api_key` is a short-lived credential.
 - HuggingFace: Forward an explicitly supplied API key when loading tokenizers for private or gated models.
 - NNterp: Forward an explicitly supplied API key when loading private or gated Hugging Face models and tokenizers.
@@ -11,6 +12,7 @@
 - AzureAI: Offer `AZUREAI_API_KEY` values to API key override hooks.
 - AzureAI: Honor an explicitly supplied `api_key` instead of replacing it with an environment credential.
 - Google: Retry truncated response streams (`ClientPayloadError` wrapping a `PayloadEncodingError`, e.g. a connection reset mid-body) instead of crashing the sample.
+- Agent Bridge: Forward the Google `generationConfig` structured-output schema (`responseSchema`/`responseJsonSchema`) instead of dropping it.
 - Sandbox Tools: Lower the glibc build floor from 2.31 to 2.17 (build against a conda-forge CPython) so injected tools run on older glibc sandboxes including Ubuntu 16.04 and 18.04.
 - Control Channel: `inspect ctl tasks` now pins each eval's reported start to its first sample's start instead of letting it drift forward as early samples finish.
 - Control Channel: `inspect ctl` reads now use a 15s timeout and retry a busy eval up to 8 times (printing a status on each timeout) before failing with a non-zero exit, instead of silently dropping a momentarily-unresponsive eval from the listing.
