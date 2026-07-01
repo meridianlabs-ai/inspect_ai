@@ -10,9 +10,11 @@ tasks, with a keep-alive status footer), ``samples`` (a task's samples),
 ``events`` (a sample's transcript events), ``keep`` (make a running process
 park after its eval finishes), and ``release`` (let a kept-alive process exit).
 The buffer directives ``flush`` (write buffered samples to the log now) and
-``buffer`` (view / change the sample-buffer params) are also available. The
-remaining state-mutating directives (cancel / drain / requeue / modify-limits)
-are planned but not yet available.
+``buffer`` (view / change the sample-buffer params) are also available, as is
+``limits`` (view / change the ``max_samples`` / ``max_sandboxes`` /
+``max_connections`` concurrency limits mid-flight). The remaining state-mutating
+directives (cancel / drain /
+requeue) are planned but not yet available.
 """
 
 from __future__ import annotations
@@ -41,10 +43,12 @@ def ctl_command() -> None:
     ``sample`` / ``errors`` (an eval's samples), ``events`` (a sample's
     transcript), ``keep`` (park a process after its eval finishes), ``release``
     (let a kept-alive process exit), ``flush`` (write an eval's buffered samples
-    to the log now), ``buffer`` (view / change the sample-buffer params). All
-    are read-only except ``keep`` / ``release`` / ``flush`` / ``buffer`` —
-    further state-mutating directives (cancel, drain, modify limits) are planned
-    but not yet available.
+    to the log now), ``buffer`` (view / change the sample-buffer params),
+    ``limits`` (view / change the ``max_samples`` / ``max_sandboxes`` /
+    ``max_connections`` concurrency limits). All are read-only except ``keep`` /
+    ``release`` / ``flush`` /
+    ``buffer`` / ``limits`` — further state-mutating directives (cancel, drain)
+    are planned but not yet available.
 
     Each command operates on a live Inspect eval via the control
     channel — the HTTP server every running ``inspect eval`` process
@@ -533,6 +537,204 @@ def buffer_command(
     _print_buffer_config(config, changed=changing)
 
 
+@ctl_command.command("limits")
+@click.argument("task", required=False)
+@click.option(
+    "--max-samples",
+    type=int,
+    default=None,
+    help="Set the max samples to run concurrently (for this task).",
+)
+@click.option(
+    "--max-sandboxes",
+    type=int,
+    default=None,
+    help="Set the max sandboxes per provider (process-wide, across all tasks).",
+)
+@click.option(
+    "--max-connections",
+    type=int,
+    default=None,
+    help=(
+        "Set the adaptive-connections scaling ceiling — the controller's max "
+        "(process-wide, across all tasks)."
+    ),
+)
+@click.option(
+    "--model",
+    default=None,
+    help=(
+        "Restrict --max-connections (and the adaptive view) to models matching "
+        "this — at the name start or after a '/' (e.g. 'gpt-4' matches "
+        "'openai/gpt-4')."
+    ),
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Report what would change without applying it (with a set option).",
+)
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    default=False,
+    help="Output as JSON (the limits view).",
+)
+def limits_command(
+    task: str | None,
+    max_samples: int | None,
+    max_sandboxes: int | None,
+    max_connections: int | None,
+    model: str | None,
+    dry_run: bool,
+    as_json: bool,
+) -> None:
+    """View or change a running eval's concurrency limits.
+
+    With no set options, shows the current limits. Pass `--max-samples N` to
+    change how many samples run concurrently, and/or `--max-sandboxes N` to
+    change the per-provider sandbox concurrency. Under adaptive connections,
+    `--max-connections N` retunes the controllers' scaling ceiling instead (sample
+    concurrency then follows it). Lowering a limit below what's currently in use
+    blocks new work until in-flight holders drain — it never interrupts running
+    samples; raising it lets more start immediately.
+
+    Pass `--dry-run` with a set option to see what would change without applying
+    it. A knob with no adjustable limiter for this eval (`--max-samples` under
+    adaptive connections, `--max-sandboxes` with no sandbox limit, or
+    `--max-connections` when not using adaptive connections) is reported with a
+    warning rather than an error.
+
+    TASK selects which running eval to target — a task-id prefix or task name
+    (as listed by `inspect ctl tasks`). `--max-samples` is scoped to the named
+    task, while `--max-sandboxes` and `--max-connections` are process-wide: in an
+    eval-set (many tasks in one process) they affect every task, not just the one
+    named.
+
+    Omit TASK to default to the sole running process: a single-task process shows
+    its full limits, while a multi-task process shows just the process-wide limits
+    (setting `--max-samples` then still requires a task). If several processes are
+    running, pass a task to pick one.
+
+    In a mixed-model run, `--model` restricts `--max-connections` (and the
+    adaptive view) to matching models — matched at the name start or after a `/`,
+    so `gpt-4` matches `openai/gpt-4`.
+    """
+    if max_samples is not None and max_samples < 1:
+        raise click.BadParameter("--max-samples must be >= 1")
+    if max_sandboxes is not None and max_sandboxes < 1:
+        raise click.BadParameter("--max-sandboxes must be >= 1")
+    if max_connections is not None and max_connections < 1:
+        raise click.BadParameter("--max-connections must be >= 1")
+
+    summaries = _fetch_summaries(list_discovered_servers())
+    if not summaries:
+        if as_json:
+            click.echo("null")
+            return
+        _echo_no_running_evals()
+        return
+
+    set_values = (
+        max_samples is not None
+        or max_sandboxes is not None
+        or max_connections is not None
+    )
+
+    # Resolve scope. An explicit TASK targets that eval (full per-eval view). No
+    # TASK defaults to the sole process: a single-eval process still shows the
+    # per-eval view, while a multi-eval process (an eval-set) shows just the
+    # process-global limits — `--max-connections` / `--max-sandboxes` don't need
+    # a task, but the per-eval `--max-samples` still does.
+    header: str
+    eval_id: str | None
+    if task is not None:
+        target = _resolve_target_eval(summaries, task)
+        socket_path = str(target["socket_path"])
+        eval_id = str(target["eval_id"])
+        header = _task_header(target)
+    else:
+        sockets = sorted({str(s.get("socket_path")) for s in summaries})
+        if len(sockets) > 1:
+            # multiple processes: can't default to one — reuse the ambiguity
+            # error (passing a task id disambiguates the process too).
+            _resolve_target_eval(summaries, None)
+            return  # unreachable: _resolve_target_eval exits on ambiguity
+        socket_path = sockets[0]
+        evals_in_proc = [
+            s for s in summaries if str(s.get("socket_path")) == socket_path
+        ]
+        if len(evals_in_proc) == 1:
+            target = evals_in_proc[0]
+            eval_id = str(target["eval_id"])
+            header = _task_header(target)
+        elif max_samples is not None:
+            click.echo(
+                "--max-samples targets a single task, but this process is running "
+                f"{len(evals_in_proc)} tasks. Pass a task id "
+                "(see `inspect ctl tasks`).",
+                err=True,
+            )
+            raise click.exceptions.Exit(code=1)
+        else:
+            eval_id = None  # process-global scope
+            header = f"process · {len(evals_in_proc)} tasks"
+
+    config = _exec_limits(
+        socket_path,
+        eval_id,
+        max_samples=max_samples,
+        max_sandboxes=max_sandboxes,
+        max_connections=max_connections,
+        model=model,
+        dry_run=dry_run,
+        set_values=set_values,
+    )
+
+    if as_json:
+        click.echo(json_lib.dumps(config, indent=2))
+        return
+
+    click.echo(header)
+    click.echo()
+    _print_limits(config, changed=set_values)
+
+    # The process-global knobs reach every eval in the process — flag that after
+    # a set that used one, when the process hosts more than one eval.
+    global_knobs = [
+        name
+        for name, value in (
+            ("--max-connections", max_connections),
+            ("--max-sandboxes", max_sandboxes),
+        )
+        if value is not None
+    ]
+    siblings = sum(1 for s in summaries if str(s.get("socket_path")) == socket_path)
+    note = _process_scope_note(global_knobs, siblings)
+    if note:
+        click.echo(f"\n{note}")
+
+
+def _process_scope_note(global_knobs: list[str], siblings: int) -> str | None:
+    """Note that process-global limit knobs reach every task in the process.
+
+    ``global_knobs`` is the set (``--max-connections`` / ``--max-sandboxes``)
+    supplied on this invocation; ``siblings`` is the number of evals the target
+    process hosts. Returns ``None`` when there's nothing to flag — no such knob
+    was set, or the process hosts a single eval so "process-wide" is exactly the
+    named task and the distinction is invisible.
+    """
+    if not global_knobs or siblings <= 1:
+        return None
+    verb = "applies" if len(global_knobs) == 1 else "apply"
+    return (
+        f"note: {' and '.join(global_knobs)} {verb} across all "
+        f"{siblings} tasks sharing this process."
+    )
+
+
 def _resolve_target_server(pid: int | None) -> DiscoveredControlServer:
     """Pick the single process a ``keep`` / ``release`` targets, or exit.
 
@@ -977,6 +1179,166 @@ def _exec_buffer_config(
         )
         raise click.exceptions.Exit(code=1) from exc
     return config if isinstance(config, dict) else {}
+
+
+def _exec_limits(
+    socket_path: str,
+    eval_id: str | None,
+    *,
+    max_samples: int | None,
+    max_sandboxes: int | None,
+    max_connections: int | None,
+    model: str | None,
+    dry_run: bool,
+    set_values: bool,
+) -> dict[str, Any]:
+    """Read (``set_values=False``) or retune concurrency limits.
+
+    With ``eval_id`` set this targets that eval's ``/evals/<id>/limits`` (the
+    per-eval view, including ``max_samples``); with ``eval_id=None`` it targets
+    the process-level ``/limits`` (``max_sandboxes`` / ``max_connections`` only).
+    ``model`` filters the adaptive controllers (a read param, applies to both).
+    The read is a GET that retries a busy process on timeout; the update is a
+    single-shot PATCH given the full mutation budget (see
+    :data:`_MUTATION_TIMEOUT`). ``dry_run`` only applies to a set.
+    """
+    params: dict[str, Any] = {}
+    if max_samples is not None:
+        params["max_samples"] = max_samples
+    if max_sandboxes is not None:
+        params["max_sandboxes"] = max_sandboxes
+    if max_connections is not None:
+        params["max_connections"] = max_connections
+    if model is not None:
+        params["model"] = model
+    if dry_run:
+        params["dry_run"] = True
+    path = f"/evals/{eval_id}/limits" if eval_id is not None else "/limits"
+    scope = f"eval {eval_id}" if eval_id is not None else "process"
+    verb = "update" if set_values else "read"
+    try:
+        if set_values:
+            transport = httpx.HTTPTransport(uds=str(socket_path))
+            with httpx.Client(
+                transport=transport,
+                base_url="http://localhost",
+                timeout=httpx.Timeout(_MUTATION_TIMEOUT, connect=_CONNECT_TIMEOUT),
+            ) as client:
+                response = client.patch(path, params=params)
+        else:
+            response = _get_response_with_retry(
+                socket_path, path, params=params, what=f"Reading limits for {scope}"
+            )
+        if response.status_code == 404:
+            click.echo(
+                f"Eval '{eval_id}' has no adjustable limits in this process "
+                "(e.g. a reused log, or a retry attempt that's been superseded).",
+                err=True,
+            )
+            raise click.exceptions.Exit(code=1)
+        if response.status_code == 400:
+            click.echo(
+                f"Invalid limit: {_error_detail_from_response(response)}", err=True
+            )
+            raise click.exceptions.Exit(code=1)
+        response.raise_for_status()
+        config = response.json()
+    except _ServerUnreachable as exc:
+        detail = (
+            _error_detail(exc.__cause__)
+            if isinstance(exc.__cause__, Exception)
+            else str(exc)
+        )
+        click.echo(f"Failed to {verb} limits for {scope}: {detail}", err=True)
+        raise click.exceptions.Exit(code=1) from exc
+    except (httpx.HTTPError, OSError, ValueError) as exc:
+        click.echo(
+            f"Failed to {verb} limits for {scope}: {_error_detail(exc)}",
+            err=True,
+        )
+        raise click.exceptions.Exit(code=1) from exc
+    return config if isinstance(config, dict) else {}
+
+
+def _error_detail_from_response(response: httpx.Response) -> str:
+    """Prefer the server's ``{"error": ...}`` body over a bare status message."""
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+    if isinstance(body, dict) and body.get("error"):
+        return str(body["error"])
+    return f"HTTP {response.status_code}"
+
+
+def _print_limits(config: dict[str, Any], *, changed: bool) -> None:
+    """Render an eval's concurrency limits as a short labelled block."""
+    dry_run = bool(config.get("dry_run"))
+    if changed:
+        click.echo("would-be limits (dry run):" if dry_run else "updated limits:")
+    else:
+        click.echo("limits:")
+
+    # On a dry-run the server reports the pre-change view (nothing was mutated);
+    # the intended values live in `requested`. Render `current → would-be` so the
+    # header's promise is met without losing the current value. On a real set the
+    # view already reflects the applied change, so no arrow is needed.
+    requested = config.get("requested") if dry_run else None
+    requested = requested if isinstance(requested, dict) else {}
+
+    def _target(current: Any, key: str) -> str:
+        proposed = requested.get(key)
+        return f"{current}{'' if proposed is None or proposed == current else f' → {proposed}'}"
+
+    adaptive = config.get("adaptive") or []
+
+    # The process-level view carries no `max_samples` key (it's per-eval): show it
+    # as per-task rather than claiming a value. Distinguish that from an eval view
+    # that carries an explicit `{"adjustable": false}`.
+    if "max_samples" not in config:
+        click.echo("  max samples:   per task (pass a task to view/set)")
+    else:
+        max_samples = config.get("max_samples") or {}
+        if max_samples.get("adjustable"):
+            limit = _target(max_samples.get("limit"), "max_samples")
+            in_use = max_samples.get("in_use")
+            click.echo(f"  max samples:   {limit} ({in_use} in use)")
+        elif adaptive:
+            # sample concurrency tracks the adaptive controller(s) below, so
+            # there's no user setpoint to show — point at where the numbers are
+            click.echo("  max samples:   tracks adaptive connections (see below)")
+        else:
+            click.echo("  max samples:   not adjustable (adaptive connections)")
+
+    sandboxes = config.get("max_sandboxes") or []
+    if sandboxes:
+        rendered = ", ".join(
+            f"{s.get('type')} {_target(s.get('limit'), 'max_sandboxes')} ({s.get('in_use')} in use)"
+            for s in sandboxes
+        )
+        click.echo(f"  max sandboxes: {rendered}")
+    else:
+        click.echo("  max sandboxes: none in effect")
+
+    if adaptive:
+        click.echo("  adaptive connections:")
+        for a in adaptive:
+            # on a dry-run set, `_target` renders the ceiling as `max → requested`
+            ceiling = _target(a.get("max"), "max_connections")
+            line = (
+                f"    {a.get('name')}: {a.get('limit')} ({a.get('in_use')} in use), "
+                f"range {a.get('min')}–{ceiling}"
+            )
+            changes = a.get("recent_changes") or []
+            if changes:
+                last = changes[-1]
+                line += (
+                    f", last: {last.get('from')}→{last.get('to')} {last.get('reason')}"
+                )
+            click.echo(line)
+
+    for warning in config.get("warnings") or []:
+        click.echo(f"  ! {warning}")
 
 
 def _print_buffer_config(config: dict[str, Any], *, changed: bool) -> None:

@@ -166,6 +166,60 @@ def resolve_adaptive(
     raise TypeError(f"unexpected adaptive_connections value: {value!r}")
 
 
+class ResizableLimiter:
+    """An async context-manager concurrency limiter whose limit can change live.
+
+    Backed by ``anyio.CapacityLimiter`` (the same primitive the adaptive
+    controller and ``DynamicSampleLimiter`` use), so the limit is settable
+    mid-flight: lowering it below the current in-use count blocks new acquires
+    until enough holders release — it never preempts an in-flight holder. This
+    is the resizable counterpart to the static ``anyio.Semaphore`` path, used
+    where a limit must be adjustable through the control channel (``max_samples``
+    and ``max_sandboxes`` today — see ``design/control-channel.md`` phase 3).
+
+    Used directly as an async context manager (``async with limiter:``), exactly
+    as the static sample semaphore was, so it drops into the existing acquire
+    sites unchanged.
+    """
+
+    def __init__(self, limit: int) -> None:
+        self._limiter = anyio.CapacityLimiter(limit)
+
+    @property
+    def limit(self) -> int:
+        """Current maximum number of concurrent holders."""
+        return int(self._limiter.total_tokens)
+
+    @limit.setter
+    def limit(self, value: int) -> None:
+        # CapacityLimiter requires total_tokens >= 1; callers validate, but
+        # guard here too so a stray 0/negative can't wedge the limiter.
+        if value < 1:
+            raise ValueError(f"ResizableLimiter limit must be >= 1 (got {value})")
+        self._limiter.total_tokens = value
+
+    @property
+    def in_use(self) -> int:
+        """Holders currently inside the limiter (borrowed tokens)."""
+        return int(self._limiter.borrowed_tokens)
+
+    @property
+    def available(self) -> int:
+        """Free capacity (``limit - in_use``), clamped to >= 0.
+
+        Clamped because :attr:`limit` may be lowered below the current in-use
+        count (CapacityLimiter accepts this and blocks new acquires until
+        in-flight drains); without the clamp this would go negative.
+        """
+        return max(0, self.limit - self.in_use)
+
+    async def __aenter__(self) -> None:
+        await self._limiter.__aenter__()
+
+    async def __aexit__(self, *args: Any) -> Any:
+        return await self._limiter.__aexit__(*args)
+
+
 class ConcurrencySemaphore(Protocol):
     """Protocol for concurrency semaphores."""
 
@@ -194,6 +248,7 @@ class ConcurrencySemaphoreRegistry(Protocol):
         key: str | None,
         visible: bool,
         adaptive: AdaptiveConcurrency | None = None,
+        resizable: bool = False,
     ) -> ConcurrencySemaphore:
         """Get existing semaphore or create a new one.
 
@@ -204,6 +259,10 @@ class ConcurrencySemaphoreRegistry(Protocol):
             visible: Whether visible in status display
             adaptive: Adaptive bounds (when set, creates an
                 AdaptiveConcurrencyController instead of a fixed Semaphore)
+            resizable: When set (and ``adaptive`` is not), back the semaphore
+                with a :class:`ResizableLimiter` whose limit can be changed
+                mid-flight (via the control channel) instead of a fixed
+                ``anyio.Semaphore``.
 
         Returns:
             The semaphore instance
@@ -221,19 +280,25 @@ async def get_or_create_semaphore(
     key: str | None,
     visible: bool,
     adaptive: AdaptiveConcurrency | None = None,
+    resizable: bool = False,
 ) -> ConcurrencySemaphore:
     """Get or create a concurrency semaphore.
 
     Delegates to the global _concurrency_registry.
     """
-    if adaptive is None:
-        return await _concurrency_registry.get_or_create(
-            name, concurrency, key, visible
-        )
-    else:
+    # Pass the extra kwargs only when they diverge from the default, so a custom
+    # (pre-adaptive / pre-resizable) registry that implements the older, narrower
+    # `get_or_create` signature keeps working for the common static path — the
+    # same back-compat courtesy the `adaptive` argument already gets.
+    if adaptive is not None:
         return await _concurrency_registry.get_or_create(
             name, concurrency, key, visible, adaptive
         )
+    if resizable:
+        return await _concurrency_registry.get_or_create(
+            name, concurrency, key, visible, resizable=True
+        )
+    return await _concurrency_registry.get_or_create(name, concurrency, key, visible)
 
 
 @contextlib.asynccontextmanager
@@ -243,6 +308,7 @@ async def concurrency(
     key: str | None = None,
     visible: bool = True,
     adaptive: AdaptiveConcurrency | None = None,
+    resizable: bool = False,
 ) -> AsyncIterator[ConcurrencySemaphore]:
     """Concurrency context manager.
 
@@ -273,12 +339,17 @@ async def concurrency(
       adaptive: When set, creates an adaptive controller managing a
          CapacityLimiter that scales between `adaptive.min` and
          `adaptive.max` based on retry feedback.
+      resizable: When set (and `adaptive` is not), back the context with a
+         `ResizableLimiter` whose limit can be changed mid-flight (via the
+         control channel) rather than a fixed `anyio.Semaphore`.
     """
     # sort out key
     key = key if key else name
 
     # do we have an existing semaphore? if not create one and store it
-    semaphore = await get_or_create_semaphore(name, concurrency, key, visible, adaptive)
+    semaphore = await get_or_create_semaphore(
+        name, concurrency, key, visible, adaptive, resizable=resizable
+    )
 
     # wait and yield to protected code (sample_waiting_for tracks concurrent waits
     # to avoid double-counting overlapping wait times within a sample)
@@ -323,6 +394,41 @@ def init_concurrency(
     _concurrency_registry = _AnyIOSemaphoreRegistry() if registry is None else registry
     # clear controller-creation observers so each eval starts fresh
     _controller_created_observers.clear()
+    # drop any resizable sandbox limiters tracked for the previous run so a
+    # long-lived (keep-alive) process doesn't surface stale ones
+    _sandbox_limiters.clear()
+
+
+# ---------------------------------------------------------------------------
+# Resizable sandbox limiters
+# ---------------------------------------------------------------------------
+
+# The live-resizable sandbox concurrency semaphores for the current run, keyed
+# by sandbox type (e.g. "docker"). Populated by `register_sandbox_limiter` when
+# a sample opens its `sandboxes/<type>` concurrency context (see
+# `_eval/task/sandbox.py`), so the control channel's modify-limits directive can
+# read and retune `max_sandboxes` mid-eval. Process-global (sandbox concurrency
+# is shared across the process's evals, not per-eval) and reset per run by
+# `init_concurrency`.
+_sandbox_limiters: "dict[str, ResizableSemaphore]" = {}
+
+
+def register_sandbox_limiter(
+    sandbox_type: str, semaphore: ConcurrencySemaphore
+) -> None:
+    """Track a sandbox-type's resizable concurrency semaphore for the control channel.
+
+    Idempotent per sandbox type — the first sample of each type registers it and
+    later samples (which get the same registry instance) re-register the same
+    object. A no-op for a non-resizable semaphore (nothing to retune).
+    """
+    if isinstance(semaphore, ResizableSemaphore):
+        _sandbox_limiters[sandbox_type] = semaphore
+
+
+def sandbox_limiters() -> "dict[str, ResizableSemaphore]":
+    """The resizable sandbox concurrency semaphores for the current run, by type."""
+    return dict(_sandbox_limiters)
 
 
 class _AnyIOSemaphoreRegistry:
@@ -338,6 +444,7 @@ class _AnyIOSemaphoreRegistry:
         key: str | None,
         visible: bool,
         adaptive: AdaptiveConcurrency | None = None,
+        resizable: bool = False,
     ) -> ConcurrencySemaphore:
         # Adaptive and static modes get separate storage entries even when they
         # share the same caller-provided `key`. Otherwise: (a) a static call
@@ -345,7 +452,10 @@ class _AnyIOSemaphoreRegistry:
         # the caller's `assert isinstance(..., AdaptiveConcurrencyController)`
         # would fail, and (b) an adaptive call followed by a static call would
         # silently get the AdaptiveConcurrencyController, defeating the
-        # "explicit max_connections wins" precedence rule.
+        # "explicit max_connections wins" precedence rule. A resizable request
+        # shares the `#static` slot — it's a static (non-adaptive) semaphore
+        # whose limit merely happens to be settable — so a plain and a resizable
+        # call for the same key coalesce onto the first-created instance.
         base = key if key else name
         k = f"{base}#adaptive" if adaptive is not None else f"{base}#static"
         if k in self._semaphores:
@@ -357,7 +467,11 @@ class _AnyIOSemaphoreRegistry:
             self._semaphores[k] = ctrl
             _fire_controller_created(ctrl)
             return ctrl
-        sem = _create_anyio_semaphore(name, concurrency, visible)
+        sem = (
+            _create_resizable_semaphore(name, concurrency, visible)
+            if resizable
+            else _create_anyio_semaphore(name, concurrency, visible)
+        )
         self._semaphores[k] = sem
         return sem
 
@@ -383,6 +497,53 @@ def _create_anyio_semaphore(
             return self._sem.value
 
     return _ConcurrencySemaphore(name, concurrency, visible)
+
+
+class ResizableSemaphore(ConcurrencySemaphore):
+    """A ``ConcurrencySemaphore`` whose limit can be changed live.
+
+    Backs a registry entry (``max_sandboxes`` today) with a
+    :class:`ResizableLimiter` instead of a fixed ``anyio.Semaphore``, so the
+    control channel can retune it mid-eval. ``concurrency`` mirrors the
+    limiter's current limit (kept in sync by :meth:`set_concurrency`) to satisfy
+    the ``ConcurrencySemaphore`` protocol and the status display, which reads
+    ``concurrency - value`` for the in-use count.
+    """
+
+    def __init__(self, name: str, concurrency: int, visible: bool) -> None:
+        self.name = name
+        self.visible = visible
+        self._limiter = ResizableLimiter(concurrency)
+        self.concurrency = concurrency
+        self.semaphore: contextlib.AbstractAsyncContextManager[Any] = self._limiter
+
+    @property
+    def value(self) -> int:
+        return self._limiter.available
+
+    @property
+    def in_use(self) -> int:
+        """Exact borrowed count (holders currently inside the limiter).
+
+        Prefer this over the status-display ``concurrency - value`` derivation:
+        once the limit is lowered below the in-flight count, ``value`` clamps to
+        0 and that derivation would report ``concurrency`` rather than the true
+        (higher) borrowed count. This reads ``borrowed_tokens`` directly, so it
+        stays exact through a shrink-below-in-use.
+        """
+        return self._limiter.in_use
+
+    def set_concurrency(self, new: int) -> None:
+        """Change the limit live. Lowering below in-use blocks new acquires."""
+        self._limiter.limit = new
+        self.concurrency = new
+
+
+def _create_resizable_semaphore(
+    name: str, concurrency: int, visible: bool
+) -> ConcurrencySemaphore:
+    """Create a live-resizable ConcurrencySemaphore (see :class:`ResizableSemaphore`)."""
+    return ResizableSemaphore(name, concurrency, visible)
 
 
 # Global registry instance
@@ -498,7 +659,11 @@ class AdaptiveConcurrencyController:
         visible: bool,
     ) -> None:
         self.name = name
-        self._config = config
+        # Private copy: set_max() mutates the bounds, and callers can pass the
+        # same AdaptiveConcurrency instance to several controllers (one per
+        # model) — sharing it would leak a --model-scoped retune of one
+        # controller into the others' ceilings.
+        self._config = config.model_copy()
         self.visible = visible
         self._limiter = anyio.CapacityLimiter(config.start)
         # `concurrency` mirrors the limiter's `total_tokens` (kept in sync via
@@ -540,6 +705,27 @@ class AdaptiveConcurrencyController:
         render in-flight as exceeding the cap.
         """
         return max(0, int(self._limiter.total_tokens - self._limiter.borrowed_tokens))
+
+    @property
+    def in_use(self) -> int:
+        """Exact borrowed count (requests currently in flight under this limit).
+
+        Reads `borrowed_tokens` directly rather than deriving `concurrency -
+        value`: after a rate-limit cut lowers the limit below the in-flight
+        count, `value` clamps to 0 and the derivation would under-report the
+        true (higher) borrowed count. See :attr:`value`.
+        """
+        return int(self._limiter.borrowed_tokens)
+
+    @property
+    def min(self) -> int:
+        """The controller's lower scaling bound (`AdaptiveConcurrency.min`)."""
+        return self._config.min
+
+    @property
+    def max(self) -> int:
+        """The controller's upper scaling bound (`AdaptiveConcurrency.max`)."""
+        return self._config.max
 
     @property
     def history(self) -> list[LimitChangeRecord]:
@@ -641,6 +827,32 @@ class AdaptiveConcurrencyController:
         if new != old:
             self._set_limit(new, "rate_limit")
 
+    def set_max(self, new_max: int) -> None:
+        """Retune the controller's scaling ceiling (``max``) mid-flight.
+
+        The control channel's modify-limits directive uses this to throttle (or
+        lift the throttle on) adaptive connections without disabling adaptation.
+
+        Lowering below the current limit clamps the live limit down to the new
+        ceiling immediately — blocking new acquires until in-flight requests
+        drain, never preempting one — and caps subsequent AIMD growth. Raising
+        lifts the ceiling so later clean rounds can grow past the old ``max``;
+        the current limit is left untouched (the controller climbs on its own).
+        ``min`` is pulled down alongside ``max`` if it would otherwise exceed it,
+        preserving the ``min <= max`` invariant.
+
+        Caller is responsible for ``new_max >= 1`` (the route/CLI validate it).
+        """
+        self._config.max = new_max
+        if self._config.min > new_max:
+            self._config.min = new_max
+        # Only the clamp-down changes the live limit; `_set_limit` records the
+        # change and notifies observers (so `DynamicSampleLimiter` follows). On a
+        # raise there's nothing to recompute yet — the sample limiter tracks the
+        # controller's *current* limit, which hasn't moved.
+        if self.concurrency > new_max:
+            self._set_limit(new_max, "manual")
+
     def _set_limit(self, new: int, reason: str) -> None:
         old = self.concurrency
         self._limiter.total_tokens = new
@@ -727,8 +939,13 @@ class DynamicSampleLimiter:
         ctrls = list(adaptive_controllers())
         if not ctrls:
             return
+        # Track the busiest controller's current limit plus a little slack. A
+        # controller's concurrency never exceeds its own `max`, so this already
+        # respects the ceiling — deriving from the live controllers (rather than
+        # this limiter's own snapshot of `_adaptive.max`) means a mid-flight
+        # `set_max` raise isn't silently clamped by a stale cap.
         max_cc = max(c.concurrency for c in ctrls)
-        target = min(max_cc + self.BUFFER, self._adaptive.max + self.BUFFER)
+        target = max_cc + self.BUFFER
         if target != self._limiter.total_tokens:
             self._limiter.total_tokens = target
 

@@ -37,6 +37,7 @@ import anyio
 from inspect_ai._control.buffer import eval_buffer_config, flush_eval_samples
 from inspect_ai._control.discovery import default_socket_path, discovery_dir
 from inspect_ai._control.events import sample_events
+from inspect_ai._control.limits import eval_limits, process_limits
 from inspect_ai._control.state import (
     current_eval_summaries,
     current_sample_summaries,
@@ -356,6 +357,96 @@ class ControlServer:
         ) -> Any:
             result = await eval_buffer_config(
                 eval_id, log_buffer=log_buffer, log_shared=log_shared
+            )
+            if result is None:
+                return JSONResponse(
+                    status_code=404,
+                    content={"error": f"eval {eval_id} not found"},
+                )
+            return result
+
+        # Read the process-global concurrency limits (max_sandboxes /
+        # max_connections) without naming an eval — the common case for viewing
+        # or throttling a whole process. No max_samples (that's per-eval; use
+        # the /evals/<id>/limits routes for it).
+        @app.get("/limits")
+        async def get_process_limits(model: str | None = None) -> Any:
+            return await process_limits(model=model)
+
+        # Retune the process-global limits. Omitting both set values makes this a
+        # read, like GET. `model` filters the adaptive controllers (name start or
+        # after a `/`). `dry_run=true` reports the intended change without
+        # applying it. Never 404s — a process always exists.
+        @app.patch("/limits")
+        async def patch_process_limits(
+            max_sandboxes: int | None = None,
+            max_connections: int | None = None,
+            model: str | None = None,
+            dry_run: bool = False,
+        ) -> Any:
+            for label, value in (
+                ("max_sandboxes", max_sandboxes),
+                ("max_connections", max_connections),
+            ):
+                if value is not None and value < 1:
+                    return JSONResponse(
+                        status_code=400,
+                        content={"error": f"{label} must be >= 1 (got {value})"},
+                    )
+            return await process_limits(
+                max_sandboxes=max_sandboxes,
+                max_connections=max_connections,
+                model=model,
+                dry_run=dry_run,
+            )
+
+        # Read the eval's live concurrency limits (max_samples / max_sandboxes).
+        # A pure read — the companion PATCH applies changes. `model` filters the
+        # adaptive controllers shown.
+        @app.get("/evals/{eval_id}/limits")
+        async def get_limits(eval_id: str, model: str | None = None) -> Any:
+            result = await eval_limits(eval_id, model=model)
+            if result is None:
+                return JSONResponse(
+                    status_code=404,
+                    content={"error": f"eval {eval_id} not found"},
+                )
+            return result
+
+        # Retune the eval's live concurrency limits. `max_samples`,
+        # `max_sandboxes` and `max_connections` are optional query params —
+        # omitting all makes this a read, like GET. `dry_run=true` validates
+        # and reports the intended
+        # change without applying it (the phase-3 agent-shape constraint).
+        # Idempotent: re-applying the same limit is a no-op. Returns the
+        # resulting limits view (with any warnings for a knob that isn't
+        # adjustable for this eval).
+        @app.patch("/evals/{eval_id}/limits")
+        async def patch_limits(
+            eval_id: str,
+            max_samples: int | None = None,
+            max_sandboxes: int | None = None,
+            max_connections: int | None = None,
+            model: str | None = None,
+            dry_run: bool = False,
+        ) -> Any:
+            for label, value in (
+                ("max_samples", max_samples),
+                ("max_sandboxes", max_sandboxes),
+                ("max_connections", max_connections),
+            ):
+                if value is not None and value < 1:
+                    return JSONResponse(
+                        status_code=400,
+                        content={"error": f"{label} must be >= 1 (got {value})"},
+                    )
+            result = await eval_limits(
+                eval_id,
+                max_samples=max_samples,
+                max_sandboxes=max_sandboxes,
+                max_connections=max_connections,
+                model=model,
+                dry_run=dry_run,
             )
             if result is None:
                 return JSONResponse(

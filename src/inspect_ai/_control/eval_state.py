@@ -49,6 +49,7 @@ if TYPE_CHECKING:
 
     from inspect_ai.log._log import EvalSample, EvalSampleSummary
     from inspect_ai.log._transcript import TranscriptHistoryProvider
+    from inspect_ai.util._concurrency import ResizableLimiter
 
     class LiveEvalData(Protocol):
         """A running eval's live data source — the in-process ``TaskLogger``.
@@ -266,6 +267,17 @@ class EvalState:
     total_messages: int = 0
     """Cumulative message count, accumulated like :attr:`total_tokens`."""
 
+    sample_limiter: "ResizableLimiter | None" = None
+    """The eval's live-resizable sample-concurrency limiter (``max_samples``).
+
+    Passed to :func:`register_eval` by the runner (which builds the sample
+    semaphore just before registering), so the control channel's modify-limits
+    directive can read and retune ``max_samples`` mid-eval. ``None`` when the
+    eval's sample concurrency isn't a user setpoint — i.e. the adaptive
+    (``DynamicSampleLimiter``) path, or a reused/synthetic eval that never ran
+    samples in this process — in which case the directive reports ``max_samples``
+    as not adjustable."""
+
     def observe_started(self, started: float | None) -> None:
         """Fold a sample's start time into :attr:`started_at` (running minimum).
 
@@ -322,12 +334,14 @@ def register_eval(
     epochs: int = 1,
     run_id: str | None = None,
     will_retry: bool = False,
+    sample_limiter: "ResizableLimiter | None" = None,
 ) -> EvalState:
     """Initialize tracking for a new eval.
 
-    Idempotent on ``eval_id`` — re-registering an existing eval (eg.
-    on retry) returns the existing state without resetting its
-    counters.
+    Idempotent on ``eval_id`` — re-registering an existing eval returns the
+    existing state without resetting its counters. Each retry attempt gets a
+    fresh ``eval_id`` (see ``TaskLogger.reinit``), so this early-return never
+    strands a superseded attempt's ``sample_limiter``.
     """
     with _lock:
         existing = _eval_states.get(eval_id)
@@ -345,6 +359,7 @@ def register_eval(
             epochs=epochs,
             run_id=run_id,
             will_retry=will_retry,
+            sample_limiter=sample_limiter,
         )
         _eval_states[eval_id] = state
         # A zero-sample eval (``total == 0``, eg. a limit past the dataset) is

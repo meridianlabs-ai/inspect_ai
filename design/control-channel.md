@@ -8,7 +8,7 @@ This is **separate from** the [`agent-acp`](acp/agent-acp.md) work, even though 
 
 The rudimentary control surface that fell out of the ACP work (per-sample cancellation, socket discovery via `--acp-server`) is a useful precedent but not the foundation — the control channel deserves its own protocol choice.
 
-> **Status (phases 1–2 shipped).** The read surface, per-sample events, and process keep-alive are implemented: the embedded FastAPI server on AF_UNIX, discovery, the `GET /evals` / `GET /evals/<id>/samples` (with an `active_since` recency delta) / `GET /evals/<id>/sample` / `GET /evals/<id>/sample/events` read endpoints, `POST /release`, the `inspect ctl tasks` / `samples` / `sample` / `errors` / `events` / `release` commands, and the `--ctl-server` flag (on by default; `false` disables, `keep` parks the process after the eval). **Phase 2** added the cursored-pull per-sample transcript `events` API plus the recency-delta filter on `samples`. **Phase 3** (in progress) adds the state-mutating directives — the buffer directives (`flush` / `buffer`) are shipped; adding a task to a running eval, then cancel / drain / requeue / modify-limits follow; **phase 4** adds the push (SSE / `--follow`) shape, including the eval-wide fan-in. Much of the prose below describes the full target surface — see [Implementation](#implementation) for what's built vs planned, which is the source of truth for phasing.
+> **Status (phases 1–2 shipped).** The read surface, per-sample events, and process keep-alive are implemented: the embedded FastAPI server on AF_UNIX, discovery, the `GET /evals` / `GET /evals/<id>/samples` (with an `active_since` recency delta) / `GET /evals/<id>/sample` / `GET /evals/<id>/sample/events` read endpoints, `POST /release`, the `inspect ctl tasks` / `samples` / `sample` / `errors` / `events` / `release` commands, and the `--ctl-server` flag (on by default; `false` disables, `keep` parks the process after the eval). **Phase 2** added the cursored-pull per-sample transcript `events` API plus the recency-delta filter on `samples`. **Phase 3** (in progress) adds the state-mutating directives — the buffer directives (`flush` / `buffer`) and the concurrency-limits directive (`limits` — `max_samples` / `max_sandboxes` / `max_connections`, with a process-wide variant) are shipped; adding a task to a running eval, then cancel / drain / requeue and the per-sample time/token/message limits follow; **phase 4** adds the push (SSE / `--follow`) shape, including the eval-wide fan-in. Much of the prose below describes the full target surface — see [Implementation](#implementation) for what's built vs planned, which is the source of truth for phasing.
 
 ## Goals
 
@@ -240,7 +240,8 @@ Phase annotations reflect the [Implementation](#implementation) plan; phases 1�
 | Cancel eval | `POST /evals/<id>/cancel` | 3 |
 | Drain | `POST /evals/<id>/drain` | 3 |
 | Requeue sample | `POST /evals/<id>/samples/<sid>/requeue` | 3 |
-| Modify limits | `PATCH /evals/<id>` | 3 |
+| Read / modify concurrency limits | `GET`+`PATCH /limits` (process) and `/evals/<id>/limits` (eval) | 3 ✅ (max-samples / max-sandboxes / max-connections) |
+| Modify per-sample limits (time / token / message) | `PATCH /evals/<id>` | 3 |
 | List eval-sets | `GET /eval-sets` | later |
 | Eval-set status | `GET /eval-sets/<id>` | later |
 | Cancel eval-set | `POST /eval-sets/<id>/cancel` | later |
@@ -600,7 +601,7 @@ Unlocks watchdog agents (cursored polling). Live-render TUIs follow once phase-4
 
 ### Phase 3 — modification (direct) methods
 
-The first endpoints that **mutate the run**, each idempotent and supporting `?dry_run=true` / `--dry-run` from day one. The first directive built is **adding a task to a running eval**; the rest (cancel / drain / requeue / modify-limits) follow. The Security model's "future hardening" (SO_PEERCRED UID check, self-targeting guard) lands with this phase, since it introduces the first state-mutating writes.
+The first endpoints that **mutate the run**, each idempotent and supporting `?dry_run=true` / `--dry-run` from day one. Shipped so far: the buffer directives and the concurrency-limits directive (`max_samples` / `max_sandboxes` / `max_connections`); adding a task to a running eval, then cancel / drain / requeue and the per-sample time/token/message limits follow. The Security model's "future hardening" (SO_PEERCRED UID check, self-targeting guard) lands with this phase, since it introduces the first state-mutating writes.
 
 #### Flush buffered samples + tune buffer params (shipped)
 
@@ -612,6 +613,43 @@ Two small, naturally-idempotent buffer directives shipped ahead of the larger ph
 Both reach the live eval through `EvalState.live` — the running `TaskLogger` the runner attaches to the process-global `EvalState` (as a `LiveEvalData`, the same handle that serves sample summaries / full samples / transcript events) — so the control layer never re-derives the buffer's location; it's detached on retry, and reports a finished no-op once `log_finish` has run (kept attached, so a `--ctl-server=keep` park can still answer). An `anyio.Lock` on the `TaskLogger` serializes the three flush paths — the buffer-full flush that sample completion triggers, the on-demand flush, and `log_finish`'s recorder teardown. The recorder holds its own lock, so the writes themselves are already safe; the `TaskLogger` lock keeps the *bookkeeping* correct (the returned flushed count reflects exactly what was flushed) and stops an on-demand flush from reaching into the recorder after `log_finish` has torn it down.
 
 Unlike the larger phase-3 directives, these two ship without `?dry_run=true` and ahead of the phase's security hardening: they're naturally idempotent (a flush with nothing pending, or a buffer read, has nothing to preview) and low-risk, non-destructive mutations over the local AF_UNIX socket.
+
+#### Modify concurrency limits — max-samples / max-sandboxes (shipped)
+
+The first slice of the "Modify concurrency" directive (open question #2): retune `max_samples` (per-eval sample concurrency) and `max_sandboxes` (per-provider sandbox concurrency) mid-flight.
+
+- **`GET`/`PATCH /evals/<id>/limits`** (CLI: `inspect ctl limits [TASK] [--max-samples N] [--max-sandboxes N] [--dry-run]`) reads (`GET`, or a `PATCH` with no set values) or applies (`PATCH`) the limits. Idempotent — re-applying the same value is a no-op — and `?dry_run=true` / `--dry-run` reports what *would* change without applying it, per the phase-3 agent-shape constraint. (Subsequent slices below extend this with `--max-connections` and `--model`, a process-wide `/limits` endpoint, and an optional `TASK`.)
+
+**The enabler is a resizable limiter.** Both knobs previously bottomed out on a fixed `anyio.Semaphore`. They now back onto a small `ResizableLimiter` wrapping `anyio.CapacityLimiter` (the same primitive the adaptive controller and `DynamicSampleLimiter` already resize via `total_tokens`), so setting a new limit is live: raising it lets more work start on the next acquire; lowering it below the current in-use count blocks new acquires until in-flight holders drain — it **never preempts** a running sample/sandbox. `create_sample_semaphore`'s two static paths return a `ResizableLimiter`; the `concurrency()` registry grows an opt-in `resizable=True` that the sandbox path (`sandboxes/<type>`) uses, leaving every other registry semaphore (notably the static `max_connections` path — deferred to a later slice for the adaptive-precedence decision) on the fixed `anyio.Semaphore` unchanged.
+
+**Reaching the limiters.** `max_samples` is per-eval: the runner attaches its `ResizableLimiter` to the process-global `EvalState` (`EvalState.sample_limiter`, alongside `EvalState.live`), so the directive resolves it by eval id. It's `None` on the adaptive-connections path (concurrency tracks the controller, not a user setpoint) and for reused/synthetic evals; the directive then reports `max_samples` as *not adjustable* (a warning, not an error). `max_sandboxes` is process-global (sandbox concurrency is shared across the process's evals, keyed by sandbox type), so it flows through a process-global sandbox-limiter registry (reset per run) rather than an `EvalState` field; a `PATCH` applies the new value to every tracked sandbox type. A knob with no adjustable limiter for the target eval is reported with a warning while the other knob still applies, so a combined `PATCH` isn't all-or-nothing.
+
+The remaining concurrency knobs — `max_tasks` and the *static* (non-adaptive) `max_connections` path — and the per-sample time / token / message limits are the later slices of this directive. (Adaptive `max_connections` is covered by the ceiling-retune slice below.)
+
+#### Adaptive connections — read-side visibility (shipped)
+
+Under default-on `adaptive_connections`, model-API concurrency isn't a fixed user setpoint: an `AdaptiveConcurrencyController` (one per model, process-global in the concurrency registry) runs slow-start + AIMD off rate-limit feedback, and sample concurrency follows it via `DynamicSampleLimiter` (tracks `max(controller.concurrency) + BUFFER`). So on this path `max_samples` is *not adjustable* — but the old `GET /evals/<id>/limits` said only that, with no numbers, leaving the whole adaptive path opaque to an observing agent. You can't sensibly decide to throttle what you can't see.
+
+This slice makes the path **observable**. The limits view always carries an `adaptive` list: one entry per controller with its live `limit`, in-flight `in_use` (read from `borrowed_tokens` directly — exact through a shrink-below-in-use, matching the `max_sandboxes` fix), scaling bounds (`min` / `max`), and the last few `recent_changes` (each `{at, from, to, reason}`, where `reason` is `slow_start` / `steady_state_up` / `rate_limit`, plus `manual` once the ceiling-retune slice below lands). That's enough to answer "where is concurrency now, how much headroom is left, and is it actively being cut by the provider?". The CLI renders it under an `adaptive connections:` block and repoints the `max samples` line at it (`tracks adaptive connections (see below)`) instead of the bare "not adjustable". Like `max_sandboxes`, controllers are process-global, so the list reports every controller in the process rather than filtering to the queried eval's model.
+
+`AdaptiveConcurrencyController` gains public `in_use` / `min` / `max` accessors (the `min` / `max` also back the write side below).
+
+#### Adaptive connections — retune the ceiling (shipped)
+
+The mutation that pairs with the visibility above: the controller **`max`** (its scaling ceiling) is settable mid-flight via `--max-connections` (`PATCH /evals/<id>/limits?max_connections=N`) — `max_connections` on the adaptive path, the deferred slice noted above. This is the natural throttle for the headline "it's hammering the provider / running up cost" scenario, which otherwise has *no* lever on the adaptive path. It applies to every adaptive controller in the process (process-global, one per model), mirroring how `max_sandboxes` fans out; a run with no adaptive controllers reports it as not adjustable (a warning, not an error), consistent with the other knobs.
+
+- **Lowering** clamps the controller's current limit down to the new ceiling immediately (never preempting in-flight requests — same drain-don't-kill semantics as `ResizableLimiter`) and caps subsequent AIMD growth; sample concurrency follows through the existing observer chain.
+- **Raising** lifts the ceiling so the controller can climb again on clean rounds; the current limit is left untouched (the controller grows on its own).
+
+`AdaptiveConcurrencyController.set_max(new_max)` does the reconciliation: it updates the ceiling, pulls `min` down alongside it if needed (preserving `min <= max`), and clamps the live limit down (recording a `manual` history entry + firing observers) only when lowering below the current limit. That `manual` entry is control-channel-only — `collect_eval_data` skips it when building the eval log's `connection_limit_history` (whose `reason` enum records adaptive-scaling decisions), so the retune stays visible live via `ctl limits` without forcing a log-schema change. The one non-obvious coupling: the controller and `DynamicSampleLimiter` each call `resolve_adaptive()` separately, so they hold *distinct* `AdaptiveConcurrency` objects — a raise would have been silently capped by the sample limiter's stale snapshot of `max`. Fixed by having `DynamicSampleLimiter` derive its cap from the live controllers (`max(concurrency) + BUFFER`) rather than its own snapshot, removing the double source of truth so one `set_max` is authoritative.
+
+**Selector scope.** `--max-samples` is per-eval, but `--max-connections` and `--max-sandboxes` are process-global — a named task just picks the process, and the change reaches every eval in it. For a single-task process this is invisible (process == the named eval); in an eval-set (many tasks per process) it isn't, so the CLI words those two options as process-wide and, after a set that used one of them, prints a note when the target process hosts more than one eval (`... apply across all N tasks sharing this process`).
+
+Because those two knobs are genuinely process-scoped, they get a **process-level `GET`/`PATCH /limits`** endpoint (no eval id) alongside the per-eval `GET`/`PATCH /evals/<id>/limits`. `eval_limits` is a superset of `process_limits` — the process-global logic (`_apply_process_knobs`) is shared, and `eval_limits` just prepends the per-eval `max_samples`. The CLI uses this to make `TASK` optional: with no task it defaults to the sole running process — a single-eval process still shows the full per-eval view, a multi-eval process shows just the process-global limits (with `max samples` rendered as "per task"), and setting the per-eval `--max-samples` there still requires a task. Several running processes with no task is the one ambiguous case (pass a task to pick one).
+
+In a mixed-model run, **`--model`** scopes `--max-connections` (and the reported adaptive view) to matching controllers — matched at the name start or after a `/` with exact-wins precedence, the same rule as CLI task-name selection (`gpt-4` matches `openai/gpt-4`, not `openai/gpt-4-turbo` when both are active). A model that matches no active controller is a warning, not an error.
+
+Deferred beyond this: **pin / freeze** (force a limit and stop adapting — a new controller mode, wait for a concrete ask) and the **tuning-curve knobs** (`cooldown_seconds` / `decrease_factor` / `scale_up_percent` — niche, and hard for an LLM agent to reason about).
 
 #### Add a task to a running eval
 
@@ -643,7 +681,7 @@ The queue-closed check *is* the running→parked test, so the two paths can't bo
 #### Other directives
 
 - `POST /evals/<id>/cancel` + `inspect ctl cancel` — graceful drain vs `--force`.
-- `POST /evals/<id>/drain`, `POST /evals/<id>/samples/<sid>/requeue`, `PATCH /evals/<id>` (modify per-sample limits / concurrency) + their CLI wrappers.
+- `POST /evals/<id>/drain`, `POST /evals/<id>/samples/<sid>/requeue`, `PATCH /evals/<id>` (modify per-sample time / token / message limits) + their CLI wrappers. (Modify *concurrency* — `max_samples` / `max_sandboxes` / adaptive `max_connections` — shipped ahead of these via `PATCH /evals/<id>/limits`; the static `max_connections` path and `max_tasks` are the remaining concurrency slices.)
 
 These are the bigger eval-runner changes (live config mutation, requeue).
 
