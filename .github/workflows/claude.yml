@@ -50,7 +50,10 @@ jobs:
       # NOT claude_args — a second --append-system-prompt would collide with the
       # composed one. The fork can't ship a CLAUDE.md/AGENTS.md (main must stay
       # pristine and a file on meridian isn't on the main-cut work branches).
-      append_system_prompt: >-
+      # Anchored (&fork_prompt) so the @auto kickoff job below reuses the exact
+      # same guidance — the two agents do the same fork work, and an anchor
+      # keeps them from drifting apart.
+      append_system_prompt: &fork_prompt >-
         Repo context: meridianlabs-ai/inspect_ai is a fork of
         UKGovernmentBEIS/inspect_ai (upstream). Branch `main` is a pristine
         mirror of upstream main: always branch from it and open PRs against it,
@@ -91,9 +94,38 @@ jobs:
       # Appended to the shared branch_sync_prompt (not replacing it) — adds the
       # CHANGELOG-merge check, which is fork-specific since the CHANGELOG
       # convention is. Fires only on PR follow-up runs, where the merge happens.
-      branch_sync_append: >-
+      branch_sync_append: &fork_branch_sync >-
         If this branch added a CHANGELOG entry, review the merge result
         carefully: the default merge resolution can move your entry out of the
         "## Unreleased" section (e.g. under a released heading). After merging,
         always verify your CHANGELOG entry is still under "## Unreleased" and
         move it back if it was relocated.
+
+  # @auto kickoff (distinct from the one-shot `claude` above). An `auto` label or
+  # `@auto` mention drives the issue autonomously: the dev agent opens a PR, the
+  # PR inherits the `auto` label (so the CI-fix loop in claude-auto.yml engages),
+  # and it runs to a human handoff. Same reusable dev workflow, different trigger
+  # — the action's trigger_phrase/label_trigger are single-valued, so `auto`
+  # needs its own invocation. Needs MARVIN_TOKEN (the PR must trigger CI/@review).
+  claude-auto:
+    if: |
+      contains(github.event.comment.body, '@auto') ||
+      contains(github.event.issue.body, '@auto') ||
+      contains(github.event.issue.title, '@auto') ||
+      github.event.label.name == 'auto'
+    uses: meridianlabs-ai/agents/.github/workflows/claude.yml@main
+    secrets:
+      MARVIN_TOKEN: ${{ secrets.MARVIN_TOKEN }}
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read
+    with:
+      trigger_phrase: "@auto"
+      label_trigger: "auto"
+      base_branch: main
+      # Same fork guidance as the `claude` job (reused via the YAML anchor).
+      append_system_prompt: *fork_prompt
+      branch_sync_append: *fork_branch_sync
