@@ -2,6 +2,7 @@
 
 - Performance: make `stable_message_ids()` linear per turn.
 - Bugfix: `eval-retry --max-retries 0` now disables retries as documented instead of inheriting the original eval's retry policy.
+- Bugfix: The sample concurrency limiter now composes model-level `GenerateConfig` (e.g. `get_model(..., config=...)` with `max_connections` or `adaptive_connections`) when classifying adaptive vs. static concurrency, matching the path generates actually take.
 
 ## 0.3.244 (01 July 2026)
 

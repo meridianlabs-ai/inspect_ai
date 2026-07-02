@@ -462,6 +462,101 @@ def test_sample_semaphore_batch_mode_disables_adaptive() -> None:
     assert not isinstance(sem, DynamicSampleLimiter)
 
 
+def test_sample_semaphore_model_level_max_connections_is_static() -> None:
+    """Model-level max_connections must classify as static, like the generate path.
+
+    `task_run` composes `model.config.merge(generate_config)` before calling
+    `create_sample_semaphore` — mirroring `Model._resolve_config` — so a model
+    constructed with `max_connections` takes the static path even when the
+    task-level config leaves adaptive at its default. Without the composition
+    this returned a DynamicSampleLimiter with no controller to track.
+    """
+    import anyio as _anyio
+
+    from inspect_ai._eval.task.run import create_sample_semaphore
+    from inspect_ai.log._log import EvalConfig
+    from inspect_ai.util._concurrency import DynamicSampleLimiter, init_concurrency
+
+    init_concurrency()
+    model = get_model("mockllm/model", config=GenerateConfig(max_connections=20))
+    task_config = GenerateConfig()
+    sem = create_sample_semaphore(
+        config=EvalConfig(),
+        generate_config=model.config.merge(task_config),
+        modelapi=model.api,
+    )
+    assert isinstance(sem, _anyio.Semaphore)
+    assert not isinstance(sem, DynamicSampleLimiter)
+    assert sem.value == 20
+
+
+def test_sample_semaphore_model_level_adaptive_false_is_static() -> None:
+    """Model-level adaptive_connections=False opts out; sized from the provider default."""
+    import anyio as _anyio
+
+    from inspect_ai._eval.task.run import create_sample_semaphore
+    from inspect_ai.log._log import EvalConfig
+    from inspect_ai.util._concurrency import DynamicSampleLimiter, init_concurrency
+
+    init_concurrency()
+    model = get_model(
+        "mockllm/model", config=GenerateConfig(adaptive_connections=False)
+    )
+    sem = create_sample_semaphore(
+        config=EvalConfig(),
+        generate_config=model.config.merge(GenerateConfig()),
+        modelapi=model.api,
+    )
+    assert isinstance(sem, _anyio.Semaphore)
+    assert not isinstance(sem, DynamicSampleLimiter)
+    assert sem.value == model.api.max_connections()
+
+
+def test_sample_semaphore_model_level_adaptive_bounds_used() -> None:
+    """Model-level AdaptiveConcurrency bounds size the limiter, not the defaults."""
+    from inspect_ai._eval.task.run import create_sample_semaphore
+    from inspect_ai.log._log import EvalConfig
+    from inspect_ai.util._concurrency import DynamicSampleLimiter, init_concurrency
+
+    init_concurrency()
+    model = get_model(
+        "mockllm/model",
+        config=GenerateConfig(
+            adaptive_connections=AdaptiveConcurrency(min=1, start=2, max=4)
+        ),
+    )
+    sem = create_sample_semaphore(
+        config=EvalConfig(),
+        generate_config=model.config.merge(GenerateConfig()),
+        modelapi=model.api,
+    )
+    assert isinstance(sem, DynamicSampleLimiter)
+    assert sem.total_tokens == min(2, 4) + DynamicSampleLimiter.BUFFER
+
+
+def test_sample_semaphore_task_config_wins_over_model_config() -> None:
+    """Task/CLI-level config takes precedence over model-level config.
+
+    Merge direction matters: `model.config.merge(generate_config)` lets the
+    task config's non-None fields win, matching `_resolve_config`'s
+    active-model branch.
+    """
+    from inspect_ai._eval.task.run import create_sample_semaphore
+    from inspect_ai.log._log import EvalConfig
+    from inspect_ai.util._concurrency import DynamicSampleLimiter, init_concurrency
+
+    init_concurrency()
+    model = get_model(
+        "mockllm/model", config=GenerateConfig(adaptive_connections=False)
+    )
+    sem = create_sample_semaphore(
+        config=EvalConfig(),
+        generate_config=model.config.merge(GenerateConfig(adaptive_connections=True)),
+        modelapi=model.api,
+    )
+    assert isinstance(sem, DynamicSampleLimiter)
+
+
 # ---------- Rate-limit vs transient classification (end-to-end) ----------
 
 

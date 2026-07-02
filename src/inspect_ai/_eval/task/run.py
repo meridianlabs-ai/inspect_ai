@@ -552,9 +552,15 @@ async def task_run(options: TaskRunOptions, task_cancel: TaskCancel | None) -> E
                 # set generate for fork module
                 set_task_generate(generate)
 
-                # semaphore to limit concurrency
+                # semaphore to limit concurrency. compose the model's own
+                # config underneath the task/CLI config (mirroring
+                # Model._resolve_config) so that adaptive-vs-static
+                # classification agrees with the path generates actually take
+                # (e.g. a model constructed with max_connections or
+                # adaptive_connections=False must yield the static path here
+                # too, not a DynamicSampleLimiter with no controller to track)
                 sample_semaphore = create_sample_semaphore(
-                    config, generate_config, model.api
+                    config, model.config.merge(generate_config), model.api
                 )
 
                 scanned_per_scanner = scanned_transcripts_for_resume(
