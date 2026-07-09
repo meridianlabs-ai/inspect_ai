@@ -622,6 +622,19 @@ The control channel defaults **on**; the ACP server defaults **off**. The asymme
 
 The flag shapes match (one overloaded-value flag each: `--acp-server=false|true|<port>|<host:port>|<path>`, `--ctl-server=false|true|keep` with the transport values planned). The remaining difference is just the default (`--ctl-server` omitted means on; `--acp-server` omitted means off), which follows from the audience asymmetry above.
 
+### Version skew: the control-API version
+
+`inspect ctl` talks to live eval processes, which embed whatever inspect version they were launched with. A new CLI pointed at an older process is the *expected* first-contact scenario for any new knob — the user upgrades because they want the new knob on an already-running eval. An older server's PATCH handlers silently ignore unknown query params, so without skew handling a new knob silently no-ops while the CLI prints a success-shaped config view (and any recognized knobs in the same PATCH partially apply).
+
+The mechanism is a single channel-wide integer plus a per-knob min-version table, instead of per-feature response-shape sniffing (which accumulates bespoke compat code that never expires):
+
+- **Server:** `CONTROL_API_VERSION` (`inspect_ai/_control/version.py`) is stamped as `api_version` on every `GET /tasks` row — the read the CLI already performs for selector resolution, so the gate costs no extra round trip. A row without the field means version 0 (a server that predates version reporting); that's the one-time bootstrap sniff, and it expires on its own as pre-versioning processes exit.
+- **CLI:** `_KNOB_SINCE` (`inspect_ai/_cli/ctl.py`, parallel to `_KNOB_SCOPE`) maps each retunable knob to the minimum version it requires. Pre-flight — before sending the PATCH — any requested knob with `since > server api_version` hard-errors, listing the offending flags. This fails *before* the mutation instead of warning after a partial apply. The integer is meaningless to users, so the error names the flags and the fix ("pid N is running an older inspect; restart the eval") rather than citing it.
+
+**Bump convention.** A PR that adds anything the CLI must gate on (a new knob, an endpoint an existing command starts depending on) bumps `CONTROL_API_VERSION` and gives the feature's `_KNOB_SINCE` entry the same new value, atomically in one PR. Purely additive response fields the CLI already null-guards don't need a bump. The failure modes: forgetting the constant bump while the table says N+1 is self-catching (the author's own dev server blocks their own knob — and `max(_KNOB_SINCE.values()) <= CONTROL_API_VERSION` is pinned by a test); reusing the current N without a bump falsely passes old servers and is convention-only. Two in-flight PRs bumping to the same value conflict on the constant, which is a feature — the second PR notices the first.
+
+Why an integer, not the package version or a capability list: the release number isn't known at PR time and dev/editable installs report unparseable `.dev` versions, while the integer is known at PR time, lands atomically with the feature, and dev builds carry the accurate in-source value; a capability list avoids ordering but costs a server-side string per feature that never expires — the integer plus table gives the same per-knob granularity with one counter.
+
 ### Test-suite cost
 
 Pytest runs that spawn many evals will each try to bind. AF_UNIX is cheap and discovery files self-clean via PID-liveness, but per-eval bind overhead is worth measuring in phase 1. Mitigations if it matters:

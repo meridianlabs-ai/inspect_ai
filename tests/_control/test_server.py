@@ -686,6 +686,38 @@ async def test_tasks_endpoint_decorates_keep_alive(
         reset_keep_alive()
 
 
+async def test_tasks_endpoint_reports_api_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GET /tasks stamps each row with the control-API version.
+
+    The `inspect ctl` CLI gates requested config knobs on this value
+    pre-flight (a row without it reads as version 0 — a server that predates
+    version reporting), so the stamp must ride the read the CLI already
+    performs for selector resolution.
+    """
+    from inspect_ai._control import server as server_mod
+    from inspect_ai._control.server import ControlServer, reset_keep_alive
+    from inspect_ai._control.version import CONTROL_API_VERSION
+
+    async def _two_rows(started_at: float) -> list[dict]:
+        return [{"task_id": "a"}, {"task_id": "b"}]
+
+    monkeypatch.setattr(server_mod, "current_eval_summaries", _two_rows)
+
+    reset_keep_alive()
+    try:
+        app = ControlServer(run_id="test")._build_app()
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://localhost"
+        ) as client:
+            rows = (await client.get("/tasks")).json()
+        assert [r["api_version"] for r in rows] == [CONTROL_API_VERSION] * 2
+    finally:
+        reset_keep_alive()
+
+
 def test_keep_alive_intent_resets() -> None:
     """The keep-alive intent clears at the outermost run boundary."""
     from inspect_ai._control.server import (

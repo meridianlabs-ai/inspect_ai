@@ -43,6 +43,7 @@ from inspect_ai._control.state import (
     current_sample_summaries,
     sample_error_detail,
 )
+from inspect_ai._control.version import CONTROL_API_VERSION
 from inspect_ai._util.discovery import (
     prepare_discovery_dir,
     write_discovery_file,
@@ -268,6 +269,10 @@ class ControlServer:
             keep_alive = keep_alive_intent()
             for summary in summaries:
                 summary["keep_alive"] = keep_alive
+                # Stamped per row (rather than an envelope, which would break
+                # older CLIs that expect a bare list) so the CLI can gate a
+                # requested knob against this server's capabilities pre-flight.
+                summary["api_version"] = CONTROL_API_VERSION
             return summaries
 
         @app.get("/evals/{eval_id}/samples")

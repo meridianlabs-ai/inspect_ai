@@ -1396,6 +1396,93 @@ def test_config_log_shared_rejects_below_one() -> None:
     assert "--log-shared" in result.stderr
 
 
+def test_knob_since_parallels_knob_scope() -> None:
+    """Every knob has a min-version entry (and no orphan entries exist).
+
+    The runtime assert in `_exec_limits` pins the same parity; this fails at
+    test time rather than on the first `ctl config` invocation.
+    """
+    from inspect_ai._cli.ctl import _KNOB_SCOPE, _KNOB_SINCE
+
+    assert _KNOB_SINCE.keys() == _KNOB_SCOPE.keys()
+
+
+def test_knob_since_within_control_api_version() -> None:
+    """No knob requires a version newer than the servers we ship.
+
+    Catches forgot-to-bump variant A mechanically: a PR that gives a knob's
+    `_KNOB_SINCE` entry N+1 without bumping `CONTROL_API_VERSION` would block
+    its own feature on every current server.
+    """
+    from inspect_ai._cli.ctl import _KNOB_SINCE
+    from inspect_ai._control.version import CONTROL_API_VERSION
+
+    assert max(_KNOB_SINCE.values()) <= CONTROL_API_VERSION
+
+
+def test_config_gates_too_new_knob_before_patch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A knob newer than the server hard-errors pre-flight — no PATCH is sent.
+
+    An older server (its `/tasks` rows carry no `api_version` → version 0)
+    would silently ignore the unknown query param and report a success-shaped
+    view; the gate must fail the whole request before any mutation, on the
+    dry-run path too.
+    """
+    import inspect_ai._cli.ctl as ctl_mod
+
+    _patch_surface(monkeypatch, [_full_summary("aaa111", "t1")])
+    monkeypatch.setitem(ctl_mod._KNOB_SINCE, "max_samples", 1)
+    patched: list[object] = []
+
+    def record(*args: Any, **kwargs: Any) -> _ConfigResult:
+        patched.append(kwargs)
+        return _ConfigResult(view={}, mutated=True)
+
+    monkeypatch.setattr("inspect_ai._cli.ctl._exec_limits", record)
+
+    for extra in ([], ["--dry-run"]):
+        result = _runner().invoke(ctl_command, ["config", "--max-samples", "3", *extra])
+        assert result.exit_code == 1, result.output
+        assert "--max-samples not supported" in result.stderr
+        assert "pid 7 is running an older inspect" in result.stderr
+        assert "restart the eval" in result.stderr
+    assert patched == []  # the gate fired before any PATCH
+
+
+def test_config_gate_passes_when_server_reports_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A server whose reported api_version covers the knob is not gated."""
+    import inspect_ai._cli.ctl as ctl_mod
+    from inspect_ai._control.version import CONTROL_API_VERSION
+
+    _patch_surface(
+        monkeypatch,
+        [{**_full_summary("aaa111", "t1"), "api_version": CONTROL_API_VERSION}],
+    )
+    monkeypatch.setitem(ctl_mod._KNOB_SINCE, "max_samples", CONTROL_API_VERSION)
+    _stub_limits(monkeypatch)
+    result = _runner().invoke(ctl_command, ["config", "--max-samples", "3", "--json"])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["applied"] is True
+
+
+def test_config_view_is_never_version_gated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pure read (no set knobs) is not gated, even against an old server."""
+    import inspect_ai._cli.ctl as ctl_mod
+
+    _patch_surface(monkeypatch, [_full_summary("aaa111", "t1")])
+    for knob in ctl_mod._KNOB_SINCE:
+        monkeypatch.setitem(ctl_mod._KNOB_SINCE, knob, 1)
+    _stub_limits(monkeypatch)
+    result = _runner().invoke(ctl_command, ["config", "--json"])
+    assert result.exit_code == 0, result.output
+
+
 def test_process_release_json_envelope(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "inspect_ai._cli.ctl.list_discovered_servers", lambda: [_DiscServer(7)]
@@ -1622,6 +1709,8 @@ def test_compose_config_labels_every_knob_with_scope() -> None:
         task="tn",
         header="h",
         siblings=3,
+        pid=7,
+        api_version=0,
     )
     limits_view = {
         "max_samples": {"limit": 3, "in_use": 1, "adjustable": True},
@@ -1660,6 +1749,8 @@ def test_compose_config_process_scope_dry_run() -> None:
         task=None,
         header="process · 2 tasks",
         siblings=2,
+        pid=7,
+        api_version=0,
     )
     limits_view = {
         "max_sandboxes": [],

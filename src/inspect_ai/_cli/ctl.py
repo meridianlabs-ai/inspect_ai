@@ -65,6 +65,24 @@ _KNOB_SCOPE: dict[str, str] = {
     "log_shared": "task",
 }
 
+# Minimum control-API version each retunable knob requires of the server —
+# a table parallel to `_KNOB_SCOPE` (key sets asserted equal in `_exec_limits`).
+# An older server's PATCH handlers silently ignore unknown query params, so a
+# knob newer than the server would silently no-op while the CLI printed a
+# success-shaped config view; `_run_config` instead hard-errors before sending
+# the PATCH (see `_exit_unsupported_knobs`), gated on the `api_version` the
+# server reports in its `/tasks` rows (absent means 0 — a server that predates
+# version reporting). Convention: the PR that adds a gated knob bumps
+# `CONTROL_API_VERSION` and gives the knob's entry here that same new value.
+# Every knob below predates versioning, so all are since-0 (never gated).
+_KNOB_SINCE: dict[str, int] = {
+    "max_samples": 0,
+    "max_sandboxes": 0,
+    "max_connections": 0,
+    "log_buffer": 0,
+    "log_shared": 0,
+}
+
 # Rendered for a task-scoped knob that a process-level view can't show.
 _PER_TASK_PLACEHOLDER = "per task (pass a task to view/set)"
 
@@ -1441,6 +1459,17 @@ def _run_config(
         _echo_no_running_evals()
         return
 
+    _exit_unsupported_knobs(
+        scope,
+        {
+            "max_samples": max_samples,
+            "max_sandboxes": max_sandboxes,
+            "max_connections": max_connections,
+            "log_buffer": log_buffer,
+            "log_shared": log_shared,
+        },
+    )
+
     limits_view, mutated = _exec_limits(
         scope.socket_path,
         scope.task_id,
@@ -1615,6 +1644,12 @@ class _DirectiveScope(NamedTuple):
     retune, but counting it keeps the note from being suppressed while a
     *different* active task would. 0 when resolved before registration.
     """
+    pid: int | None
+    """The hosting process, for version-skew error messages."""
+    api_version: int
+    """The server's control-API version, for the pre-flight knob gate
+    (:func:`_exit_unsupported_knobs`). 0 when unreported — an older server,
+    or a process resolved before its first task registered."""
 
 
 def _resolve_scope(
@@ -1655,6 +1690,10 @@ def _resolve_scope(
                 task=None,
                 header="process · starting",
                 siblings=0,
+                pid=servers[0].pid,
+                # no /tasks row to read the version off yet — unknown reads
+                # as 0, the same as an unreporting older server
+                api_version=0,
             )
         return None
 
@@ -1685,6 +1724,8 @@ def _resolve_scope(
             task=str(target.get("task") or "") or None,
             header=_task_header(target),
             siblings=siblings,
+            pid=_summary_pid(target),
+            api_version=_summary_api_version(target),
         )
 
     sockets = sorted({str(s.get("socket_path")) for s in summaries})
@@ -1707,6 +1748,8 @@ def _resolve_scope(
             task=str(target.get("task") or "") or None,
             header=_task_header(target),
             siblings=_active_siblings(summaries, socket_path),
+            pid=_summary_pid(target),
+            api_version=_summary_api_version(target),
         )
     if per_task_option is not None:
         addressable = [c for c in candidates if str(c.get("task_id") or "")]
@@ -1740,7 +1783,56 @@ def _resolve_scope(
         task=None,
         header=header,
         siblings=_active_siblings(summaries, socket_path),
+        # every row in the process reports the same server's version
+        pid=_summary_pid(tasks_in_proc[0]),
+        api_version=_summary_api_version(tasks_in_proc[0]),
     )
+
+
+def _summary_pid(summary: dict[str, Any]) -> int | None:
+    """The hosting pid a summary row was decorated with (see `_fetch_summaries`)."""
+    pid = summary.get("pid")
+    return pid if isinstance(pid, int) else None
+
+
+def _summary_api_version(summary: dict[str, Any]) -> int:
+    """The control-API version a summary row reports.
+
+    0 when absent or malformed — the wire contract for a server that
+    predates version reporting (see ``CONTROL_API_VERSION``).
+    """
+    version = summary.get("api_version")
+    return version if isinstance(version, int) else 0
+
+
+def _exit_unsupported_knobs(
+    scope: _DirectiveScope, requested: dict[str, int | None]
+) -> None:
+    """Exit before the PATCH when a requested knob is newer than the server.
+
+    An older server's PATCH handlers silently ignore unknown query params, so
+    sending anyway would partially apply (the knobs the server recognizes
+    land, the rest silently no-op) under a success-shaped config view. Gating
+    on the server's reported ``api_version`` fails the whole request before
+    any mutation instead. The version integer is meaningless to users, so the
+    error names the flags and the fix rather than citing it. Applies to
+    ``--dry-run`` too — an old server's dry-run response would misreport the
+    gated knob as applied-to-be.
+    """
+    unsupported = [
+        "--" + knob.replace("_", "-")
+        for knob, value in requested.items()
+        if value is not None and _KNOB_SINCE.get(knob, 0) > scope.api_version
+    ]
+    if not unsupported:
+        return
+    where = f"pid {scope.pid}" if scope.pid is not None else "the target process"
+    click.echo(
+        f"{', '.join(unsupported)} not supported — {where} is running an "
+        "older inspect; restart the eval to pick up the current version.",
+        err=True,
+    )
+    raise click.exceptions.Exit(code=1)
 
 
 def _is_active(summary: dict[str, Any]) -> bool:
@@ -2424,9 +2516,10 @@ def _exec_limits(
         "log_buffer": log_buffer,
         "log_shared": log_shared,
     }
-    # the settable knobs are exactly the scope table's — a knob added to one
-    # without the other fails loudly here rather than silently no-opping
-    assert knob_values.keys() == _KNOB_SCOPE.keys()
+    # the settable knobs are exactly the scope and since tables' — a knob
+    # added to one without the others fails loudly here rather than silently
+    # no-opping (or riding past the version gate ungated)
+    assert knob_values.keys() == _KNOB_SCOPE.keys() == _KNOB_SINCE.keys()
     set_values = any(value is not None for value in knob_values.values())
     params: dict[str, Any] = {
         knob: value for knob, value in knob_values.items() if value is not None
