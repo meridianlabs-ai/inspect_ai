@@ -94,6 +94,19 @@ async def test_no_concurrent_eval_async():
         )
 
 
+def test_eval_display_none_restores_global_console(tmp_path: Path):
+    # regression test: eval(display="none") used to leave the global rich
+    # console reconfigured with quiet=True, silently swallowing all
+    # subsequent rich output in the calling process
+    import rich
+
+    console_before = rich.get_console()
+    task = Task(dataset=[Sample(input="Say Hello", target="Hello")])
+    eval(task, model="mockllm/model", display="none", log_dir=str(tmp_path))
+    assert rich.get_console() is console_before
+    assert not rich.get_console().quiet
+
+
 def test_eval_config_override():
     task = Task(
         dataset=[Sample(input="Say Hello", target="Hello")],

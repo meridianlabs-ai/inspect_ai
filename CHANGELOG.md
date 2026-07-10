@@ -1,5 +1,6 @@
 ## Unreleased
 
+- Display: `eval()`, `eval_set()`, `eval_retry()`, and `score()` now restore the global rich console on completion, so `display="none"` no longer silently mutes the calling process's console output.
 - Grok: Support for Grok 4.5 (model info database entry; accepts `reasoning_effort` with a documented default of `high`).
 - OpenAI: Support for GPT-5.6 (Sol, Terra, and Luna) — model info database entries and codename frontier aliasing now target `gpt-5.6`.
 - OpenAI: `reasoning_effort="max"` is now passed through natively for GPT-5.6+ models rather than being clamped to `xhigh`.

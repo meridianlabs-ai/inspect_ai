@@ -39,6 +39,7 @@ from typing_extensions import Unpack
 from inspect_ai._cli.util import parse_cli_args
 from inspect_ai._display.core.active import active_display as active_task_display
 from inspect_ai._display.core.active import display as task_display
+from inspect_ai._display.core.rich import rich_initialise_scope
 from inspect_ai._eval.task.scan import Scanners, scan_context
 from inspect_ai._util.asyncfiles import with_async_fs
 from inspect_ai._util.config import resolve_args
@@ -377,18 +378,19 @@ def eval(
             else:
                 raise
 
-    result = task_display().run_task_app(with_async_fs(run_task_app))
+    with rich_initialise_scope():
+        result = task_display().run_task_app(with_async_fs(run_task_app))
 
-    # print scan status after the task display has exited so the
-    # message lands AFTER the panel + `Log:` line. Only when eval owns
-    # the scan lifecycle (standalone call, not nested in eval_set).
-    if scanner is not None and eval_set_id is None:
-        from inspect_ai._eval.task.scan import print_scan_status
+        # print scan status after the task display has exited so the
+        # message lands AFTER the panel + `Log:` line. Only when eval owns
+        # the scan lifecycle (standalone call, not nested in eval_set).
+        if scanner is not None and eval_set_id is None:
+            from inspect_ai._eval.task.scan import print_scan_status
 
-        resolved_log_dir = absolute_file_path(
-            log_dir if log_dir else os.environ.get("INSPECT_LOG_DIR", "./logs")
-        )
-        print_scan_status(resolved_log_dir, scanner)
+            resolved_log_dir = absolute_file_path(
+                log_dir if log_dir else os.environ.get("INSPECT_LOG_DIR", "./logs")
+            )
+            print_scan_status(resolved_log_dir, scanner)
 
     return result
 
@@ -1369,18 +1371,19 @@ def eval_retry(
             checkpoint=checkpoint,
         )
 
-    result = task_display().run_task_app(with_async_fs(run_task_app))
+    with rich_initialise_scope():
+        result = task_display().run_task_app(with_async_fs(run_task_app))
 
-    # print scan status after the task display has exited so the
-    # message lands AFTER the panel + `Log:` line. Matches `eval` /
-    # `eval_set`'s trailing summary.
-    if scanner is not None:
-        from inspect_ai._eval.task.scan import print_scan_status
+        # print scan status after the task display has exited so the
+        # message lands AFTER the panel + `Log:` line. Matches `eval` /
+        # `eval_set`'s trailing summary.
+        if scanner is not None:
+            from inspect_ai._eval.task.scan import print_scan_status
 
-        resolved_log_dir = absolute_file_path(
-            log_dir if log_dir else os.environ.get("INSPECT_LOG_DIR", "./logs")
-        )
-        print_scan_status(resolved_log_dir, scanner)
+            resolved_log_dir = absolute_file_path(
+                log_dir if log_dir else os.environ.get("INSPECT_LOG_DIR", "./logs")
+            )
+            print_scan_status(resolved_log_dir, scanner)
 
     return result
 

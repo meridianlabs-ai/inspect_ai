@@ -22,6 +22,32 @@ def rich_no_color(plain: bool) -> bool:
     return plain or not is_running_in_vscode() or is_running_in_jupyterlab()
 
 
+@contextmanager
+def rich_initialise_scope() -> Iterator[None]:
+    """Apply the display config to the global rich console for a scope.
+
+    `rich_initialise()` reconfigures the global rich console (e.g. making it
+    quiet for `display="none"`). Top-level entry points (`eval()`,
+    `eval_set()`, `eval_retry()`, `score()`) wrap their work in this context
+    manager so the caller's console is restored when the work completes,
+    rather than leaking the mutated console into the calling process.
+
+    `rich.reconfigure()` mutates the existing global console in place (it
+    rebinds its `__dict__`, so existing references see the change) — restoring
+    therefore snapshots and restores the console's state, not just the
+    `rich._console` reference.
+    """
+    saved_console = rich.get_console()
+    saved_console_state = dict(saved_console.__dict__)
+    rich_initialise()
+    try:
+        yield
+    finally:
+        saved_console.__dict__.clear()
+        saved_console.__dict__.update(saved_console_state)
+        rich._console = saved_console
+
+
 def rich_initialise(
     display: DisplayType | None = None, plain: bool | None = None
 ) -> None:

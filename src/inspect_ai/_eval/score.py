@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 import anyio
 
 from inspect_ai._display import display as display_manager
+from inspect_ai._display.core.rich import rich_initialise_scope
 from inspect_ai._eval.context import init_task_context
 from inspect_ai._eval.loader import load_file_tasks, scorer_from_spec
 from inspect_ai._eval.task.task import resolve_scorer, resolve_scorer_metrics
@@ -121,34 +122,35 @@ def score(
     # resolve scorers into a list
     scorers = [scorers] if isinstance(scorers, Scorer) else scorers
 
-    if running_in_notebook():
-        return run_coroutine(
-            score_async(
+    with rich_initialise_scope():
+        if running_in_notebook():
+            return run_coroutine(
+                score_async(
+                    log,
+                    scorers,
+                    metrics,
+                    epochs_reducer,
+                    model=model,
+                    model_roles=model_roles,
+                    action=action,
+                    copy=copy,
+                )
+            )
+        else:
+            return anyio.run(
+                functools.partial(
+                    score_async,
+                    model=model,
+                    model_roles=model_roles,
+                    action=action,
+                    copy=copy,
+                ),
                 log,
                 scorers,
                 metrics,
                 epochs_reducer,
-                model=model,
-                model_roles=model_roles,
-                action=action,
-                copy=copy,
+                backend=configured_async_backend(),
             )
-        )
-    else:
-        return anyio.run(
-            functools.partial(
-                score_async,
-                model=model,
-                model_roles=model_roles,
-                action=action,
-                copy=copy,
-            ),
-            log,
-            scorers,
-            metrics,
-            epochs_reducer,
-            backend=configured_async_backend(),
-        )
 
 
 def _get_updated_scores(

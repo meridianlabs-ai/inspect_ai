@@ -35,6 +35,7 @@ from inspect_ai._control.server import (
 )
 from inspect_ai._display import display as display_manager
 from inspect_ai._display.core.panel import set_eval_set_id_display
+from inspect_ai._display.core.rich import rich_initialise_scope
 from inspect_ai._eval.task.log import plan_to_eval_plan
 from inspect_ai._eval.task.run import eval_plan_agent_name, resolve_plan
 from inspect_ai._eval.task.scan import Scanners, scan_already_clean
@@ -513,8 +514,8 @@ def eval_set(
     max_tasks = max_tasks if max_tasks is not None else max(len(models), 10)
     log_dir_allow_dirty = log_dir_allow_dirty is True
 
-    # prepare console/status
-    console = rich.get_console()
+    # prepare status (console is resolved lazily at each use so that it
+    # reflects the configuration applied by rich_initialise_scope below)
     status: Status | None = None
 
     # before sleep
@@ -545,6 +546,7 @@ def eval_set(
             display_manager().print(msg)
         else:
             nonlocal status
+            console = rich.get_console()
             console.print("")
             status = console.status(status_msg(msg), spinner="clock")
             status.start()
@@ -704,61 +706,64 @@ def eval_set(
     # after any keep-alive park — so they stay visible in `inspect ctl task list`
     # through the run + park, but don't leak past it.
     try:
-        with (
-            _embed_viewer(log_dir) if embed_viewer else contextlib.nullcontext(),
-            scan_context(scanner, scan_id=eval_set_id, log_dir=log_dir),
-        ):
-            # emit start event
-            run_coroutine(emit_eval_set_start(eval_set_id, log_dir))
+        with rich_initialise_scope():
+            with (
+                _embed_viewer(log_dir) if embed_viewer else contextlib.nullcontext(),
+                scan_context(scanner, scan_id=eval_set_id, log_dir=log_dir),
+            ):
+                # emit start event
+                run_coroutine(emit_eval_set_start(eval_set_id, log_dir))
 
-            if retry_immediate:
-                # retry handled by eval
-                results = try_eval()
+                if retry_immediate:
+                    # retry handled by eval
+                    results = try_eval()
+                else:
+                    # execute w/ retry
+                    results = retry(try_eval)
+
+                # final sweep to remove failed log files
+                if retry_cleanup:
+                    task_ids = {result.eval.task_id for result in results}
+                    cleanup_older_eval_logs(log_dir, task_ids)
+
+            # if specified, bundle the output directory
+            if bundle_dir:
+                bundle_log_dir(
+                    log_dir=log_dir, output_dir=bundle_dir, overwrite=bundle_overwrite
+                )
+
+            # report final status
+            success = all_evals_succeeded(results)
+            if success:
+                msg = status_msg(f"Completed all tasks in '{log_dir}' successfully")
             else:
-                # execute w/ retry
-                results = retry(try_eval)
+                msg = status_msg(
+                    f"Did not successfully complete all tasks in '{log_dir}'."
+                )
+            rich.get_console().print(f"{msg}")
 
-            # final sweep to remove failed log files
-            if retry_cleanup:
-                task_ids = {result.eval.task_id for result in results}
-                cleanup_older_eval_logs(log_dir, task_ids)
+            if scanner is not None:
+                from inspect_ai._eval.task.scan import print_scan_status
 
-        # if specified, bundle the output directory
-        if bundle_dir:
-            bundle_log_dir(
-                log_dir=log_dir, output_dir=bundle_dir, overwrite=bundle_overwrite
-            )
+                print()
+                print_scan_status(log_dir, scanner)
 
-        # report final status
-        success = all_evals_succeeded(results)
-        if success:
-            msg = status_msg(f"Completed all tasks in '{log_dir}' successfully")
-        else:
-            msg = status_msg(f"Did not successfully complete all tasks in '{log_dir}'.")
-        console.print(f"{msg}")
+            # update manifest
+            write_log_dir_manifest(log_dir)
 
-        if scanner is not None:
-            from inspect_ai._eval.task.scan import print_scan_status
+            # emit end event
+            run_coroutine(emit_eval_set_end(eval_set_id, log_dir))
 
-            print()
-            print_scan_status(log_dir, scanner)
+            # park last of all — display closed and summary printed, so the
+            # keep-alive notice lands in the console (not the live display pane).
+            # Gate on the intent (not just the launch flag) so a runtime `inspect
+            # ctl process keep` during the run also parks; intent reflects the
+            # last-write of any keep / release received during the run.
+            if keep_alive_intent():
+                run_coroutine(_keep_alive_park(eval_set_id))
 
-        # update manifest
-        write_log_dir_manifest(log_dir)
-
-        # emit end event
-        run_coroutine(emit_eval_set_end(eval_set_id, log_dir))
-
-        # park last of all — display closed and summary printed, so the
-        # keep-alive notice lands in the console (not the live display pane).
-        # Gate on the intent (not just the launch flag) so a runtime `inspect
-        # ctl process keep` during the run also parks; intent reflects the last-write
-        # of any keep / release received during the run.
-        if keep_alive_intent():
-            run_coroutine(_keep_alive_park(eval_set_id))
-
-        # return status + results
-        return success, results
+            # return status + results
+            return success, results
     finally:
         clear_all_eval_states()
 
