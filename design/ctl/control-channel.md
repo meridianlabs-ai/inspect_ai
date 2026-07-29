@@ -123,7 +123,7 @@ All live-eval management commands live under a single `inspect ctl` subcommand r
 
 #### CLI command hierarchy: noun groups
 
-> **Status: implemented** (for the shipped surface — the planned verbs land with their phases). Docs, help, and this doc use only the noun spellings; the original flat names survive as hidden, deprecation-noted aliases per the Migration section below (except `sample`, whose name is claimed by the group).
+> **Status: implemented** (for the shipped surface — the planned verbs land with their phases). Docs, help, and this doc use only the noun spellings; the original flat names shipped as hidden, deprecation-noted aliases for a transition window and have since been removed per the Migration section below (`sample`, whose name is claimed by the group, broke immediately).
 
 The `ctl` surface originally shipped **flat**: ten verbs, heading for ~17 once the remaining phase-3 directives, phase-4 `--follow`, and the eval-set surface landed. Two problems were already visible at ten:
 
@@ -202,7 +202,7 @@ The read/write asymmetry — reads widen when unscoped, mutations refuse to — 
 
 Known accepted edge in the busy handling: the sole-server rule counts *discovered* servers, so a sibling that is discovered but instantly unreachable (version-skewed `/tasks`, exited after discovery) demotes the one live server to the degraded budget. The failure is honest and actionable ("pid N busy — try again shortly"), and closing it needs an escalation re-read whose complexity isn't warranted — the durable fix is server-side (answer reads off the eval loop — issue #48).
 
-**Mapping (flat → noun), as implemented.** The "original" column is what shipped before the reorganization and survives as the hidden aliases; "status" is each command's state at the time of the reorg.
+**Mapping (flat → noun), as implemented.** The "original" column is what shipped before the reorganization; it survived as the hidden aliases for a transition window, and the aliases have since been removed (issue #49) — the flat spellings now fail as unknown commands. "status" is each command's state at the time of the reorg.
 
 | Original (flat) | Status | Current | Notes |
 |---|---|---|---|
@@ -234,11 +234,13 @@ For the agent-discoverability goal, the win is *structured* help, not shorter he
 
 Costs, honestly stated: the hot reads get one word longer (`ctl tasks` → `ctl task list`); discovery takes two help invocations instead of one; and it renames a shipped surface. On raw count alone the flat list would survive — seventeen one-liners still fit a help screen — so the case rests on the scope signal and the dissolved near-collisions/compounds, which are real at ten commands already.
 
-**Migration (implemented).** The reorg landed immediately rather than waiting: the `ctl` surface was weeks old and pre-announcement, phase 3 was mid-flight (so half the planned verbs would otherwise have shipped flat and then moved), and every release the flat names survived as the canonical form would have raised the cost of the rename. The noun surface is canonical from day one — help, docs, and this doc's examples show only the new spellings. The old flat commands remain as **hidden aliases** (click `hidden=True`) for a transition window, with three deliberate properties:
+**Migration (implemented; aliases since removed).** The reorg landed immediately rather than waiting: the `ctl` surface was weeks old and pre-announcement, phase 3 was mid-flight (so half the planned verbs would otherwise have shipped flat and then moved), and every release the flat names survived as the canonical form would have raised the cost of the rename. The noun surface is canonical from day one — help, docs, and this doc's examples show only the new spellings. The old flat commands remained as **hidden aliases** (click `hidden=True`) for a transition window, with three deliberate properties:
 
 - **Except `sample`, which breaks immediately** — the name is claimed by the group, so the old `ctl sample TASK SID [EPOCH]` invocation can't coexist with `ctl sample <verb>`. A fallback ("first token not a known verb → treat as the old form") is rejected for the same reason the implied-`list` default never fires past a positional: selector capture, and verbs added later silently changing the meaning of old invocations. Ironically the command that motivated the reorg (the `samples`/`sample` near-collision) is the one that must break at once; its error message should point at `sample show`. The other nine flat commands (`tasks`, `samples`, `errors`, `events`, `keep`, `release`, `flush`, `buffer`, `limits`) collide with nothing and alias cleanly.
 - **Aliases preserve spellings, not output.** Each alias is a thin delegation to the new implementation — new behavior (unscoped reads widen), new JSON (the `{as_of, ...}` envelopes, unconditional `task_id`, `--since` → `--cursor`). A script parsing the old bare-array output breaks even through the alias; preserving the old shapes would mean maintaining two surfaces in lockstep, which is exactly the drift cost the no-alias principle exists to avoid. The aliases buy muscle-memory continuity for humans and command-spelling continuity for scripts — no more, and that's stated up front.
-- **Deprecation-noted and time-boxed.** Each alias prints a one-line pointer to **stderr** (stderr so `--json` stdout stays parseable) — e.g. "`inspect ctl tasks` is now `inspect ctl task list`" — and is removed after a stated window (say two releases). Hidden means agents reading `--help` never discover the old names, so new consumers learn only the new surface; the stderr note teaches old consumers the new spelling on every use.
+- **Deprecation-noted and time-boxed.** Each alias printed a one-line pointer to **stderr** (stderr so `--json` stdout stays parseable) — e.g. "`inspect ctl tasks` is now `inspect ctl task list`" — and was removed after a stated window (say two releases). Hidden means agents reading `--help` never discover the old names, so new consumers learn only the new surface; the stderr note teaches old consumers the new spelling on every use.
+
+The window closed after the aliases had shipped in several releases, and the aliases were removed (issue #49): the flat spellings now fail as unknown `ctl` commands, and the noun spellings in the mapping table above are the only forms.
 
 The agent-output-contract items that break shipped `--json` shapes ride the same release — one migration, not two.
 
