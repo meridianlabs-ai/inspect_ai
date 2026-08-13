@@ -11,13 +11,20 @@ its runner, the HTTP/discovery client, the `--json` error envelope, and all
 human-output rendering in one module. It is the largest file in the package
 by a wide margin, and each new directive (requeue, pause/resume, config
 knobs) grows it further. The internal structure is already disciplined —
-clearly-marked layer sections with one-way dependencies — so the refactor is
-mostly mechanical: promote the existing sections to modules in a
-`_cli/ctl/` package.
+layered sections, most of them banner-marked — so the refactor is mostly
+mechanical: promote the existing sections to modules in a `_cli/ctl/`
+package. The exceptions are called out below: the client and rendering
+sections have no markers, and a handful of helpers sit in the "wrong"
+section for the module boundaries, so their placement is decided here
+from the call graph rather than by section membership.
 
 ## Current structure
 
-The file is organized by layer, with explicit section markers:
+The file is organized by layer. Banner comments mark the sections through
+`command runners` (line ~1831); the client (~4100) and rendering (~5400)
+boundaries below are unmarked — inferred from where `_process_scope_note`
+ends and `_knob_label` begins — so the `_http` / `_fetch` / `_render`
+extractions need more care than the marked noun sections:
 
 | Lines (approx) | Section |
 |---|---|
@@ -29,9 +36,12 @@ The file is organized by layer, with explicit section markers:
 | 4100–5400 | Server discovery + HTTP client: `_resolve_target_server`, `_ServerUnreachable`/`_ServerBusy`, busy narration, retry budgets, `_request_json`, per-resource fetches, version gates, `_exec_limits` |
 | 5400–6230 | Rendering: every `_print_*` / `_format_*` helper, tables, footers, summaries |
 
-Dependencies already flow one way: click commands → runners → client →
-envelope, with rendering a leaf used by runners. There are no cycles to
-untangle; the sections just need to become importable units.
+Dependencies mostly flow one way: click commands → runners → client →
+envelope, with rendering shared broadly. But a single module cannot have
+import cycles — they appear exactly when boundaries are drawn — so the
+layering below is derived from the actual call graph, not from section
+order, and a handful of helpers are placed away from their current
+section specifically to keep it acyclic (see the placement notes).
 
 ## Constraints
 
@@ -42,9 +52,12 @@ untangle; the sections just need to become importable units.
   `inspect_ai._cli.ctl` reference valid.
 - **Test coupling.** `tests/_control/test_ctl.py` (5,616 lines) plus
   `test_limits.py`, `test_server.py`, `test_buffer.py`, and
-  `test_eval_set_integration.py` import ~35 private symbols from
-  `inspect_ai._cli.ctl` and `monkeypatch.setattr` string targets of the form
-  `"inspect_ai._cli.ctl.<name>"` at 112 sites. Both must be migrated
+  `test_eval_set_integration.py` import 40 private symbols (plus
+  `ctl_command`) from `inspect_ai._cli.ctl`. String patch targets live in
+  `test_ctl.py` alone: 109 of its 112 `monkeypatch.setattr` calls target
+  `"inspect_ai._cli.ctl.<name>"` (the other 3 patch the `discovery` and
+  `process` module objects directly and need no migration); the other four
+  files only import. Both imports and patch targets must be migrated
   mechanically and must fail loudly (not silently patch a dead alias) if a
   target goes stale.
 - **Import-lightness.** The CLI deliberately avoids importing the core
@@ -59,7 +72,8 @@ untangle; the sections just need to become importable units.
 ## Proposed layout
 
 `src/inspect_ai/_cli/ctl.py` becomes the package `src/inspect_ai/_cli/ctl/`.
-Module boundaries follow the existing section markers; the two oversized
+Module boundaries follow the existing sections (banner-marked or inferred
+per the caveat above); the two oversized
 sections (runners, client) split along lines the code already draws — the
 runners by resource noun, the client into transport vs. per-resource
 fetches. Approximate sizes are from today's section extents, plus per-module
@@ -68,19 +82,19 @@ import boilerplate:
 | Module | Contents | ~lines |
 |---|---|---|
 | `__init__.py` | Imports every command module for registration side effects; `__all__ = ["ctl_command"]`. Carries the current module docstring (the noun-group overview). | 80 |
-| `_group.py` | Root `ctl` click group; `_NounGroup`, `_forward_group_options`, `_mirror_list_options`, `_json_option`, `_IntOrClearType`, `_deprecation_note`; shared echo/exit helpers (`_echo_no_running_evals`, `_busy_note`, `_anomalies_pointer`, `_exit_all_busy`). | 400 |
+| `_group.py` | Root `ctl` click group; `_NounGroup`, `_forward_group_options`, `_mirror_list_options`, `_json_option`, `_IntOrClearType`, `_deprecation_note`; shared echo/exit helpers (`_echo_no_running_evals`, `_busy_note`, `_busy_pids_label`, `_anomalies_pointer`, `_exit_all_busy`); shared header constants read across layers (`_KNOB_SCOPE`, `_PER_TASK_PLACEHOLDER`). | 410 |
 | `_failure.py` | The `--json` error envelope section: `_ErrorKind`, `_CtlFailure`, `_fail`, `_classify`, `_structured_failures`, `_envelope_failures`. | 230 |
-| `_http.py` | Transport + targeting: `_resolve_target_server`, `_ServerUnreachable`/`_ServerBusy`, `_BusyNarrator`, retry budgets (`_REQUEST_ATTEMPTS`, `_DEGRADED_READ_ATTEMPTS`, `_MAX_CONCURRENT_READS`, timeouts), `_get_with_retry_async`, `_request_json`, `_handler_404`, `_run_async`, `_collect_reads`, `_exit_busy`, `_unreachable_failure`, error-detail helpers. | 810 |
+| `_http.py` | Transport + targeting: `_resolve_target_server`, `_ServerUnreachable`/`_ServerBusy`, `_BusyNarrator`, retry budgets (`_REQUEST_ATTEMPTS`, `_DEGRADED_READ_ATTEMPTS`, `_MAX_CONCURRENT_READS`, timeouts), `_get_with_retry_async`, `_request_json`, `_handler_404`, `_run_async`, `_collect_reads`, `_exit_busy`, `_unreachable_failure`, error-detail helpers (`_error_body`, `_unreachable_detail`, and `_error_detail` — see placement notes). | 820 |
 | `_fetch.py` | Per-resource reads/writes over `_http`: `_fetch_summaries`, `_read_task_rows` / `_read_all_task_rows`, `_fetch_samples*`, `_fetch_sample_detail` / `_fetch_sample_events` / `_fetch_sample_messages`, `_post_flush`; target-eval resolution (`_resolve_target_eval`, `_match_by_task_name`, `_exit_ambiguous`). | 650 |
-| `_mutate.py` | Shared mutation machinery: `_mutation_envelope`, `_run_sample_mutation`, `_paused_sources`, `_still_held_note`. | 150 |
+| `_mutate.py` | Shared mutation machinery: `_mutation_envelope`, `_run_sample_mutation`, `_still_held_note`. (`_paused_sources` goes to `_render.py` — see placement notes.) | 140 |
 | `_task.py` | `task` group commands + their runners: `_run_task_list`, `_run_task_cancel`, `_run_task_pause_resume`, `_run_log_flush`. | 550 |
-| `_sample.py` | `sample` group commands (list/errors/show/events/messages/cancel/requeue) + the mutation runners (`_run_sample_cancel`, `_run_sample_requeue`) and option-validation helpers (`_validate_cursor`, `_validate_from_start`, `_normalized_types`, `_exit_removed_since`). | 750 |
-| `_sample_read.py` | Sample read runners: `_list_sample_rows`, `_read_all_eval_samples`, `_run_sample_list` / `_run_sample_errors` / `_run_sample_listing`, `_run_sample_show`, `_run_sample_events`, `_run_sample_messages`, idle/truncation footers, and their tuning constants (`_DEFAULT_EVENTS_TAIL`, `_DEFAULT_MESSAGES_TAIL`, `_IDLE_POINTER_MIN_SECONDS`). | 850 |
-| `_config.py` | `config` command + everything config-specific: `_KNOB_SCOPE` / `_KNOB_SINCE` / `_PROVENANCE_SINCE`, `_run_config`, `_compose_config`, `_resolve_scope` / `_DirectiveScope`, `_applied_knob_names`, `_gate_knob_support` / `_gate_provenance_support`, `_exec_limits`, `_ConfigResult`, process-scope notes. | 950 |
+| `_sample.py` | `sample` group commands (list/errors/show/events/messages/cancel/requeue) + the mutation runners (`_run_sample_cancel`, `_run_sample_requeue`). | 700 |
+| `_sample_read.py` | Sample read runners: `_list_sample_rows`, `_read_all_eval_samples`, `_run_sample_list` / `_run_sample_errors` / `_run_sample_listing`, `_run_sample_show`, `_run_sample_events`, `_run_sample_messages`, idle/truncation footers, their tuning constants (`_DEFAULT_EVENTS_TAIL`, `_DEFAULT_MESSAGES_TAIL`, `_IDLE_POINTER_MIN_SECONDS`), and the option-validation helpers (`_validate_cursor`, `_validate_from_start`, `_normalized_types`, `_exit_removed_since`, `_looks_like_timestamp` — see placement notes). | 900 |
+| `_config.py` | `config` command + everything config-specific: `_KNOB_SINCE` / `_PROVENANCE_SINCE`, `_run_config`, `_compose_config`, `_resolve_scope` / `_DirectiveScope`, `_applied_knob_names`, `_gate_knob_support` / `_gate_provenance_support`, `_exec_limits`, `_ConfigResult`, process-scope notes. (`_KNOB_SCOPE` stays in `_group.py` — see placement notes.) | 950 |
 | `_process.py` | `process` group commands + runners: `_run_process_list`, `_run_keep_alive`, `_run_process_pause_resume`, `_run_process_anomalies` (+ `_trace_file_for_pid`, `_PidAnomalies` — the `_cli/trace.py` integration). | 500 |
 | `_model.py` | `model` group commands + `_run_model_pause_resume`. | 160 |
 | `_aliases.py` | The hidden deprecated flat spellings, unchanged thin delegations to the runners. | 190 |
-| `_render.py` | The whole rendering section: `_print_*`, `_format_*`, `_render_table`, `_short_id` / `_SHORT_ID_LEN`, `_truncate`, event/message summaries. | 880 |
+| `_render.py` | The rendering section: `_print_*`, `_format_*`, `_render_table`, `_short_id` / `_SHORT_ID_LEN`, `_truncate`, event/message summaries; plus `_paused_sources` (see placement notes). Excludes `_error_detail`, which goes to `_http.py`. | 880 |
 
 Notes on placement judgment calls:
 
@@ -90,7 +104,7 @@ Notes on placement judgment calls:
   The exception is `sample`, whose read runners are large enough to warrant
   the `_sample.py` / `_sample_read.py` split (commands + mutations vs. read
   runners); if implementation finds the seam awkward, collapsing them into
-  one ~1,500-line `_sample.py` is acceptable — still a 4× reduction and the
+  one ~1,600-line `_sample.py` is acceptable — still a 4× reduction and the
   noun boundary is the one that must hold.
 - **`_render.py` stays one module.** The formatters are small, uniform, and
   heavily shared across nouns (the samples table serves `sample list`,
@@ -102,8 +116,42 @@ Notes on placement judgment calls:
 - **`_unreachable_failure` moves to `_http.py`, not `_failure.py`**, even
   though today it sits in the envelope section: it runtime-dispatches on
   `isinstance(exc, _ServerBusy)`, so keeping it beside `_CtlFailure` would
-  make `_failure` import `_http` — the one cycle the layering forbids. Its
-  natural home is next to the exception types it translates.
+  make `_failure` import `_http`. Its natural home is next to the exception
+  types it translates.
+- **`_error_detail` moves to `_http.py`, not `_render.py`**, even though
+  today it sits in the rendering section (ctl.py:5787) — and it needs a
+  definite home because `tests/_control/test_server.py` imports it. It
+  calls `_error_body` and is called from `_request_json` and
+  `_unreachable_detail`, all `_http.py`; landing it in `_render.py` would
+  make `_http` and `_render` import each other.
+- **`_KNOB_SCOPE` stays in `_group.py`, not `_config.py`.** It is read
+  from both sides of the config/rendering boundary: `_exec_limits`'s
+  key-set parity assertion (ctl.py:5320) on one, `_knob_label` and
+  `_print_config` on the other — and `_run_config` calls `_print_config`,
+  so assigning it to `_config.py` would make `_config` and `_render`
+  import each other. It lives in the header region today (ctl.py:115);
+  `_group.py` inherits that region's shared constants (likewise
+  `_PER_TASK_PLACEHOLDER`, which `_print_config` reads). `_KNOB_SINCE` and
+  `_PROVENANCE_SINCE` are config-only and move to `_config.py`.
+- **The sample option validators move to `_sample_read.py`, not
+  `_sample.py`.** `_run_sample_events` (a `_sample_read` runner) calls
+  `_validate_from_start`, `_validate_cursor`, and `_normalized_types`
+  (ctl.py:2399–2403), while `_sample`'s `sample events` command calls
+  `_run_sample_events` — validators in `_sample.py` would close a
+  `_sample`/`_sample_read` cycle. `_looks_like_timestamp` and
+  `_exit_removed_since` ride along (`_validate_cursor` and
+  `_exit_removed_since` both use the former); `_sample`'s remaining use of
+  `_exit_removed_since` (ctl.py:826) points the already-required
+  `_sample → _sample_read` direction.
+- **`_paused_sources` moves to `_render.py`, not `_mutate.py`**, despite
+  reading as mutation machinery. Its callers are the task pause/resume
+  runners (`_task`) and the paused-state formatters `_format_paused` and
+  `_print_keep_alive_footer` (ctl.py:5881, 5917). Leaving it
+  in `_mutate.py` would give `_render → _mutate`, which closes a cycle
+  transitively: `_mutate` calls `_fetch` (`_run_sample_mutation` resolves
+  targets) and `_fetch` calls `_render` (`_exit_ambiguous` renders the
+  match table). As a pure normalizer with no dependencies it sits
+  naturally beside the formatters that consume it.
 - **Root group in `_group.py`, not `__init__.py`.** Noun modules attach via
   `@task_group.command(...)` decorators at import time, so they need the
   parent group importable without importing the package `__init__`
@@ -112,23 +160,32 @@ Notes on placement judgment calls:
 
 ### Dependency layering
 
-One-way, matching today's section order (leaf → top):
+One-way, derived from the call graph under the placements above
+(leaf → top):
 
 ```
-_render, _failure                    (leaves)
-_group  → _failure                   (shared exit helpers raise _CtlFailure)
-_http   → _failure
-_fetch  → _http, _failure
-_mutate → _http, _fetch, _failure
+_failure                              (leaf)
+_group  → _failure                    (shared exit helpers raise _CtlFailure)
+_render → _group                      (_KNOB_SCOPE, _PER_TASK_PLACEHOLDER)
+_http   → _group, _failure            (busy exits use _anomalies_pointer)
+_fetch  → _http, _render, _group, _failure
+                                      (_exit_ambiguous renders the match
+                                       table; busy notes/exits from _group)
+_mutate → _http, _fetch, _group, _failure
 noun modules (_task, _sample, _sample_read,
   _config, _process, _model, _aliases)
         → _group, _mutate, _fetch, _http, _failure, _render
+  (plus _sample → _sample_read: the sample commands
+   invoke the read runners and validators directly)
 __init__ → _group + every noun module (registration)
 ```
 
-A cycle would be an implementation bug; the extraction order below makes one
-impossible to introduce silently (each extracted module must import cleanly
-before the next extraction starts).
+Note this is *not* today's section order: rendering is mid-stack, not a
+leaf (`_fetch` and the runners both call into it), which is exactly why
+the placement calls above are made from the call graph. A cycle
+would be an implementation bug; the extraction order below makes one
+impossible to introduce silently (each extracted module must import
+cleanly before the next extraction starts).
 
 ### Patchable seams: import modules, not names
 
@@ -143,10 +200,35 @@ module object** — `from inspect_ai._cli.ctl import _fetch` then
 _fetch_samples_async`. Each seam then has exactly one canonical patch target
 (its defining module) that intercepts *every* consumer. Types, constants,
 and never-patched helpers may be imported by name as usual. The seams tests
-patch today: `list_discovered_servers`, `httpx` client classes,
-`_get_with_retry_async`, `_fetch_samples` / `_fetch_samples_async`,
-`_fetch_summaries`, `_exec_limits`, `read_trace_file`, and the retry-budget
-constants. A short comment at each module-object import notes it is a patch
+patch today:
+
+- `_request_json` — the most-patched target in the suite (34 sites),
+  called from what become `_task`, `_process`, `_model`, `_mutate`,
+  `_fetch`, and `_config`. This is the seam that most needs the rule: a
+  `from ._http import _request_json` in any consumer would silently
+  defeat all 34 patches.
+- `_fetch_sample_detail` / `_fetch_sample_events` /
+  `_fetch_sample_messages` and `_post_flush` — defined in `_fetch.py`,
+  called from the `_sample_read.py` runners and `_run_log_flush` in
+  `_task.py` respectively.
+- `_fetch_samples` / `_fetch_samples_async`, `_fetch_summaries`,
+  `_get_with_retry_async`, `_exec_limits`.
+- `list_discovered_servers`, `pid_alive`, `inspect_trace_dir`, and the
+  `httpx` client classes — names imported *into* ctl from elsewhere and
+  patched on the ctl module. `pid_alive` and `inspect_trace_dir` are only
+  called from what becomes `_process.py`, so their targets become
+  `inspect_ai._cli.ctl._process.<name>`. `list_discovered_servers`
+  (31 sites) is called from half a dozen future modules, so like
+  `_request_json` it gets one canonical home (`_http.py` imports it;
+  every other module calls `_http.list_discovered_servers`), as do the
+  `httpx` classes.
+
+Not seams, despite appearing patch-adjacent: `read_trace_file` and the
+retry-budget constants (`_REQUEST_ATTEMPTS`, `_DEGRADED_READ_ATTEMPTS`,
+`_MAX_CONCURRENT_READS`) are imported by name in tests but never
+`setattr`-patched, so by this rule they need no indirection.
+
+A short comment at each module-object import notes it is a patch
 seam, so a later cleanup doesn't "simplify" it back into a name import.
 
 Symbol names are **kept verbatim** (leading underscores included) even
@@ -171,11 +253,14 @@ Mechanical, in the same commit as each extraction (the suite stays green at
 every commit):
 
 1. **Imports** — rewrite `from inspect_ai._cli.ctl import X` to the
-   defining module per the table above (~35 symbols across 5 test files,
-   both the top-of-file blocks and the in-test lazy imports).
+   defining module per the table above (40 private symbols plus
+   `ctl_command` across 5 test files, both the top-of-file blocks and the
+   in-test lazy imports).
 2. **Patch targets** — rewrite `"inspect_ai._cli.ctl.<name>"` to
-   `"inspect_ai._cli.ctl.<module>.<name>"` (112 sites). The module-object
-   seam rule above guarantees the defining module is always the correct
+   `"inspect_ai._cli.ctl.<module>.<name>"` (109 sites, all in
+   `test_ctl.py`; its 3 remaining `setattr`s patch the `discovery` and
+   `process` module objects and are unaffected). The module-object seam
+   rule above guarantees the canonical module is always the correct
    target.
 3. **No assertion changes.** Any test whose *assertions* need touching is a
    red flag that the move changed behavior.
@@ -191,10 +276,12 @@ One PR, reviewable commit by commit, suite green after each:
 1. `git mv src/inspect_ai/_cli/ctl.py src/inspect_ai/_cli/ctl/__init__.py`
    — a pure rename commit (100% similarity), preserving history through the
    package conversion.
-2. Extract leaves: `_render.py`, `_failure.py`.
-3. Extract `_group.py`, `_http.py`, `_fetch.py`, `_mutate.py`.
-4. Extract noun modules: `_config.py`, `_sample.py` + `_sample_read.py`,
-   `_task.py`, `_process.py`, `_model.py`, then `_aliases.py`.
+2. Extract leaves first, per the layering above: `_failure.py`,
+   `_group.py`, then `_render.py` (which imports `_group`).
+3. Extract `_http.py`, `_fetch.py`, `_mutate.py`.
+4. Extract noun modules: `_config.py`, `_sample_read.py` then
+   `_sample.py` (which imports it), `_task.py`, `_process.py`,
+   `_model.py`, then `_aliases.py`.
 5. Shrink `__init__.py` to registration + docstring; update the file-path
    references in `design/ctl/*.md` (`agent-discoverability.md`,
    `config-log-persistence.md`, `sample-requeue.md`, `pause-resume.md`)
@@ -217,8 +304,12 @@ gates.
   the existing suite.
 - **Missed patch-target migration.** Fails loudly by design (no facade;
   `monkeypatch.setattr` raises on a missing attribute).
-- **Import cycles.** The layering is acyclic today; leaf-first extraction
-  order surfaces any accidental inversion immediately as an `ImportError`.
+- **Import cycles.** A single file cannot have them — they appear exactly
+  when boundaries are drawn. The known ones are avoided by the call-graph
+  placements above (`_unreachable_failure`, `_error_detail`,
+  `_KNOB_SCOPE`, the sample validators, `_paused_sources`); leaf-first
+  extraction order surfaces any remaining inversion immediately as an
+  `ImportError`.
 - **`git log --follow` across the split.** History for extracted modules
   needs `git log --follow` from the extraction commit back through
   `__init__.py` to `ctl.py`; the rename-first commit keeps that chain
