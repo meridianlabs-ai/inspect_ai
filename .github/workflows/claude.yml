@@ -200,8 +200,11 @@ jobs:
     # exactly that trigger, so triage-created auto issues never kicked off
     # (observed: issue #236 sat labeled and untouched). Labeling is safe to
     # exempt from the guard: it is deterministic (no quoted-token hazard — the
-    # gate reads the label NAME, not text) and requires write access, so it
-    # stays an authorized action. Comment/body paths keep the full guard.
+    # gate reads the label NAME, not text); labeling needs triage access, and
+    # the action separately verifies the actor has write access before
+    # running, so it stays an authorized action. Comment/body paths keep the full guard.
+    # The guarded branch's own label.name clause is shadowed by the exception
+    # today — kept as defense-in-depth should the exception ever be narrowed.
     if: |
       ( github.event_name == 'issues' && github.event.action == 'labeled'
         && github.event.label.name == 'auto'
