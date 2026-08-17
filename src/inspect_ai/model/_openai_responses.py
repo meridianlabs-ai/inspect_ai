@@ -154,7 +154,11 @@ from inspect_ai._util.content import (
     ContentToolUse,
     ContentVideo,
 )
-from inspect_ai._util.images import as_data_uri, inline_media_data_uri
+from inspect_ai._util.images import (
+    as_data_uri,
+    inline_media_data_uri,
+    is_bare_base64_media,
+)
 from inspect_ai._util.json import to_json_str_safe
 from inspect_ai._util.text import truncate_string_to_bytes
 from inspect_ai._util.url import is_data_uri
@@ -802,7 +806,7 @@ def content_from_response_input_content_param(
     elif is_input_file(input):
         file_data = input["file_data"]
         filename = input["filename"]
-        if not is_data_uri(file_data):
+        if not is_data_uri(file_data) and is_bare_base64_media(file_data):
             mime_type, _ = mimetypes.guess_type(filename, strict=False)
             file_data = as_data_uri(mime_type or "application/octet-stream", file_data)
         return ContentDocument(document=file_data, filename=filename)

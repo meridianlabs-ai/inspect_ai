@@ -8,6 +8,7 @@
 - Inspect CTL: Terminal escape sequences and control characters in agent-generated text are now sanitized in `inspect ctl` human-readable output, preventing spoofing of the operator's terminal.
 - Fixed sandbox tools (`text_editor`, `bash_session`) failing to install in non-root sandboxes (e.g. Kubernetes pods with `runAsNonRoot`).
 - Breaking: Runtime media paths and URLs now require `materialize_media()` before model use; fixed selected-dataset media remains automatic, while sandbox bridges require inline data URIs.
+- Agent Bridge: A Responses-API `input_file` whose `file_data` is a path or URL is now rejected by the sandbox bridge's media policy instead of being disguised as an inline data URI.
 - Mistral: Provider-generated images remain available when replayed in subsequent conversation turns.
 
 ## 0.3.259 (16 August 2026)

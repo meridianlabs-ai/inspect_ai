@@ -452,6 +452,21 @@ def inline_media_data_uri(
     return file
 
 
+def is_bare_base64_media(data: str) -> bool:
+    """Does `data` decode as a bare base64 media payload?
+
+    Input boundaries that normalize bare base64 payloads into data URIs must not
+    wrap a reference they cannot decode: turning a path or URL into a
+    `data:<mime>;base64,<reference>` string disguises it as inline media, so it
+    passes inline-media policy checks such as `validate_bridge_media()`.
+    """
+    try:
+        base64.b64decode("".join(data.split()), validate=True)
+    except ValueError:
+        return False
+    return True
+
+
 def _require_inline_media(file: str) -> None:
     if not is_data_uri(file):
         raise UnresolvedMediaError(

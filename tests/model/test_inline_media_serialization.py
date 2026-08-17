@@ -135,6 +135,23 @@ def test_responses_bare_file_data_is_normalized_without_io() -> None:
     assert content.mime_type == "application/pdf"
 
 
+def test_responses_bare_non_base64_file_data_is_not_normalized() -> None:
+    reference = "/tmp/host-only-secret.txt"
+    content = content_from_response_input_content_param(
+        cast(
+            Any,
+            {
+                "type": "input_file",
+                "file_data": reference,
+                "filename": "secret.txt",
+            },
+        )
+    )
+
+    assert isinstance(content, ContentDocument)
+    assert content.document == reference
+
+
 def test_responses_typed_file_data_is_preserved() -> None:
     uri = "data:text/plain;base64,aGVsbG8="
     content = content_from_response_input_content_param(
