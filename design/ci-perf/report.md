@@ -179,7 +179,15 @@ Reading the data honestly:
    improvement. Est. −40 s on the 414 s CI pytest step; verify against
    next snapshot. Risk: timing-sensitive tests see more contention at 4
    workers — no failures in the benchmark runs, watch flake rate after
-   merge. Safe fix. Status: **new — this run's PR**.
+   merge. Safe fix. Status: **new — needs a human to apply: the
+   issue-253 automation token lacks `workflow` scope, so the one-line
+   build.yml change was prepared and verified but could not be pushed
+   (diff in the issue comment and below)**.
+
+   ```diff
+   -        run: uv run pytest -rA --doctest-modules --color=yes -n auto --timeout=900 --timeout-method=thread --durations=50 --durations-min=1 --report-log=test-report-log.jsonl --report-log-exclude-logs-on-passed-tests
+   +        run: uv run pytest -rA --doctest-modules --color=yes -n logical --timeout=900 --timeout-method=thread --durations=50 --durations-min=1 --report-log=test-report-log.jsonl --report-log-exclude-logs-on-passed-tests
+   ```
 1b. **Evaluate `-n 8` after 1 lands** — best single run 372 s (−20%) but
    29% run-to-run noise, +80% CPU cost, and higher flake exposure. Only
    worth it with a week of CI data at `-n logical` as baseline. The
@@ -227,5 +235,6 @@ Reading the data honestly:
 - #4848 — mark the 43 s docker test slow, `blob:none` on the Viewer
   checkout, collector hardening (2026-08-12, **merged**; docker +
   checkout verified, test-exec estimate missed — see impact section)
-- PR_PLACEHOLDER — `-n logical` for the Build pytest step (2026-08-18,
-  this run)
+- 2026-08-18 run: analysis + this report (PR from
+  `claude/issue-253-20260818-1915`); the `-n logical` workflow change
+  itself needs a human push (token lacks `workflow` scope).
