@@ -50,7 +50,11 @@ from .compose import (
     compose_up,
     docker_image_exists_locally,
 )
-from .diagnostics import sandbox_unavailable_diagnostics, service_dead
+from .diagnostics import (
+    ServicePsState,
+    dead_service_state,
+    sandbox_unavailable_diagnostics,
+)
 from .failure import InjectedWrapper, classify_exec_failure
 from .internal import build_internal_image, is_internal_image
 from .prereqs import validate_prereqs
@@ -387,29 +391,33 @@ class DockerSandboxEnvironment(SandboxEnvironment):
         # (`grep -q` without a match), so only signal-death exits (> 128) pay
         # the `compose ps` confirmation, and only a positively dead container
         # escalates.
+        dead_state: ServicePsState | None = None
         if (
             failure is None
             and not exec_result.success
             and exec_result.returncode > 128
             and not exec_result.stdout.strip()
             and not exec_result.stderr.strip()
-            and await service_dead(self._service, self._project)
         ):
-            failure = SandboxUnavailableError(
-                "The sandbox is not running and cannot execute: command "
-                f"exited with code {exec_result.returncode} and no output, "
-                f'and the container for service "{self._service}" has exited '
-                "(container diagnostics logged as a warning)"
-            )
+            dead_state = await dead_service_state(self._service, self._project)
+            if dead_state is not None:
+                failure = SandboxUnavailableError(
+                    "The sandbox is not running and cannot execute: command "
+                    f"exited with code {exec_result.returncode} and no output, "
+                    f'and the container for service "{self._service}" has exited '
+                    "(container diagnostics logged as a warning)"
+                )
 
         if failure is not None:
             if isinstance(failure, SandboxUnavailableError):
-                await self._log_unavailable_diagnostics()
+                await self._log_unavailable_diagnostics(dead_state)
             raise failure
 
         return exec_result
 
-    async def _log_unavailable_diagnostics(self) -> None:
+    async def _log_unavailable_diagnostics(
+        self, dead_state: ServicePsState | None
+    ) -> None:
         """Log post-mortem evidence for this environment's dead container.
 
         Logged (not embedded in the error): the audience is the human/CI
@@ -423,7 +431,9 @@ class DockerSandboxEnvironment(SandboxEnvironment):
             return
         self._unavailable_diagnostics_logged = True
         logger.warning(
-            await sandbox_unavailable_diagnostics(self._service, self._project)
+            await sandbox_unavailable_diagnostics(
+                self._service, self._project, dead_state
+            )
         )
 
     @override

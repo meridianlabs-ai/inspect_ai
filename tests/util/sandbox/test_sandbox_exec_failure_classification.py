@@ -15,6 +15,10 @@ import pytest
 from test_helpers.utils import skip_if_no_docker
 
 from inspect_ai.util import ExecResult
+from inspect_ai.util._sandbox.docker.diagnostics import (
+    ServicePsState,
+    dead_service_state,
+)
 from inspect_ai.util._sandbox.docker.docker import DockerSandboxEnvironment
 from inspect_ai.util._sandbox.docker.failure import (
     InjectedWrapper,
@@ -437,28 +441,40 @@ def _sandbox() -> DockerSandboxEnvironment:
 
 FAKE_DIAGNOSTICS = 'Container diagnostics for service "default":\n(fake diagnostics)'
 
+FAKE_DEAD_STATE = ServicePsState(
+    section="docker compose ps --all: (fake observation)", container="abc123"
+)
+
 
 def _stub_dead_container_probes(
     monkeypatch: pytest.MonkeyPatch, service_dead: bool
-) -> None:
+) -> list[object]:
     """Stub the docker probes the dead-container paths run.
 
-    These tests must never touch a real docker daemon.
+    These tests must never touch a real docker daemon. Returns a list that
+    records the `ps` argument of each diagnostics call, so tests can assert
+    the confirming observation is reused as evidence.
     """
+    diagnosed_states: list[object] = []
 
-    async def fake_service_dead(*args: object, **kwargs: object) -> bool:
-        return service_dead
+    async def fake_dead_service_state(
+        *args: object, **kwargs: object
+    ) -> ServicePsState | None:
+        return FAKE_DEAD_STATE if service_dead else None
 
-    async def fake_diagnostics(*args: object, **kwargs: object) -> str:
+    async def fake_diagnostics(service: object, project: object, ps: object) -> str:
+        diagnosed_states.append(ps)
         return FAKE_DIAGNOSTICS
 
     monkeypatch.setattr(
-        "inspect_ai.util._sandbox.docker.docker.service_dead", fake_service_dead
+        "inspect_ai.util._sandbox.docker.docker.dead_service_state",
+        fake_dead_service_state,
     )
     monkeypatch.setattr(
         "inspect_ai.util._sandbox.docker.docker.sandbox_unavailable_diagnostics",
         fake_diagnostics,
     )
+    return diagnosed_states
 
 
 def _capture_warnings(monkeypatch: pytest.MonkeyPatch) -> list[str]:
@@ -548,10 +564,46 @@ async def test_silent_signal_death_with_dead_container_raises_and_logs(
 ) -> None:
     warnings = _capture_warnings(monkeypatch)
     died_mid_command = ExecResult(success=False, returncode=137, stdout="", stderr="")
+
+    async def fake_compose_exec(*args: object, **kwargs: object) -> ExecResult[str]:
+        return died_mid_command
+
+    monkeypatch.setattr(
+        "inspect_ai.util._sandbox.docker.docker.compose_exec", fake_compose_exec
+    )
+    diagnosed_states = _stub_dead_container_probes(monkeypatch, service_dead=True)
     with pytest.raises(SandboxUnavailableError) as excinfo:
-        await _exec_returning(monkeypatch, died_mid_command, service_dead=True)
+        await _sandbox().exec(["bash", "-c", "echo hi"], timeout=30)
     assert "exited with code 137" in str(excinfo.value)
     assert FAKE_DIAGNOSTICS in warnings
+    # the diagnostics got the observation that confirmed death, not a re-query
+    assert diagnosed_states == [FAKE_DEAD_STATE]
+
+
+async def test_dead_service_state_renders_the_observation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # the returned state must carry the evidence (state, exit code, container
+    # id for `docker inspect`) — it is all that survives container removal
+    async def fake_compose_ps(
+        *args: object, **kwargs: object
+    ) -> list[dict[str, object]]:
+        return [
+            {"Service": "default", "ID": "abc123", "State": "exited", "ExitCode": 137},
+            {"Service": "other", "ID": "def456", "State": "running"},
+        ]
+
+    monkeypatch.setattr(
+        "inspect_ai.util._sandbox.docker.diagnostics.compose_ps", fake_compose_ps
+    )
+    state = await dead_service_state(
+        "default", ComposeProject(name="p", config=None, sample_id=1, epoch=1, env=None)
+    )
+    assert state is not None
+    assert '"State": "exited"' in state.section
+    assert '"ExitCode": 137' in state.section
+    assert "def456" not in state.section  # other services are not evidence
+    assert state.container == "abc123"
 
 
 async def test_silent_small_exit_code_never_checks_the_container(
@@ -609,13 +661,15 @@ async def test_silent_success_never_checks_the_container(
         return ok
 
     async def exploding_check(*args: object, **kwargs: object) -> bool:
-        raise AssertionError("service_dead must not be called for successful execs")
+        raise AssertionError(
+            "dead_service_state must not be called for successful execs"
+        )
 
     monkeypatch.setattr(
         "inspect_ai.util._sandbox.docker.docker.compose_exec", fake_compose_exec
     )
     monkeypatch.setattr(
-        "inspect_ai.util._sandbox.docker.docker.service_dead", exploding_check
+        "inspect_ai.util._sandbox.docker.docker.dead_service_state", exploding_check
     )
     assert await _sandbox().exec(["true"], timeout=30) == ok
 
