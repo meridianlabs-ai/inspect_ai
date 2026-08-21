@@ -21,11 +21,13 @@ from ._failure import _fail
 from ._render import _echo
 
 
-# click 8.4 made ParamType generic in its stubs, but the package supports
-# older click (>=8.1.3) whose stubs reject the subscript (and CI can resolve
-# such versions, e.g. via inspect-scout's click pin), so subclass the
-# unparametrized base; convert() carries the concrete return type.
-class _IntOrClearType(click.ParamType):
+# click 8.4 made ParamType generic; the older click the package still supports
+# (>=8.1.3) did not, and each spelling errors under the other version — the
+# bare base trips disallow_any_generics on >=8.4, the subscript is rejected on
+# <8.4. Both are `type-arg`, so ignore it here; the pyproject `inspect_ai.*`
+# override disables `unused-ignore`, so the comment is inert on the version
+# that needs no suppression. convert() carries the concrete return type.
+class _IntOrClearType(click.ParamType):  # type: ignore[type-arg]
     """Non-negative integer, or the keyword ``clear`` (restore launch config).
 
     The override knobs' value domain (the retry overrides and the per-sample
