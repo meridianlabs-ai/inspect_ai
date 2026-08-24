@@ -217,8 +217,11 @@ def eval(
             `True` or `None` (default) binds the default AF_UNIX socket;
             `False` disables the control endpoint; `"keep"` additionally
             keeps the process running after the eval finishes so external
-            clients can still query its state — exit via `inspect ctl process release`
-            (or `POST /release`).
+            clients can still query its state — the process exits via
+            `inspect ctl process release` (or `POST /release`), or after
+            24 hours parked with no control-channel activity. Pass
+            `"keep:<idle>"` (e.g. `"keep:4h"`) to tune that idle timeout,
+            or `"keep:forever"` to park indefinitely.
         solver: Alternative solver for task(s).
             Optional (uses task solver by default).
         scanner: Scanner(s) to apply to each sample's transcript after the
@@ -497,8 +500,11 @@ async def eval_async(
             `True` or `None` (default) binds the default AF_UNIX socket;
             `False` disables the control endpoint; `"keep"` additionally
             keeps the process running after the eval finishes so external
-            clients can still query its state — exit via `inspect ctl process release`
-            (or `POST /release`).
+            clients can still query its state — the process exits via
+            `inspect ctl process release` (or `POST /release`), or after
+            24 hours parked with no control-channel activity. Pass
+            `"keep:<idle>"` (e.g. `"keep:4h"`) to tune that idle timeout,
+            or `"keep:forever"` to park indefinitely.
         solver: Alternative solver for task(s).  Optional (uses task solver by default).
         scanner: Scanner(s) to apply to each sample's transcript after the sample completes.
         tags: Tags to associate with this evaluation run.
@@ -1352,8 +1358,11 @@ def eval_retry(
             `True` or `None` (default) binds the default AF_UNIX socket;
             `False` disables the control endpoint; `"keep"` additionally
             keeps the process running after the eval finishes so external
-            clients can still query its state — exit via `inspect ctl process release`
-            (or `POST /release`).
+            clients can still query its state — the process exits via
+            `inspect ctl process release` (or `POST /release`), or after
+            24 hours parked with no control-channel activity. Pass
+            `"keep:<idle>"` (e.g. `"keep:4h"`) to tune that idle timeout,
+            or `"keep:forever"` to park indefinitely.
         acp_server: Override the original eval's ACP server transport on retry.
             `True` enables a default AF_UNIX socket; an integer binds a TCP
             loopback port; a string is taken as a custom UNIX socket path;
@@ -1535,8 +1544,11 @@ async def eval_retry_async(
             `True` or `None` (default) binds the default AF_UNIX socket;
             `False` disables the control endpoint; `"keep"` additionally
             keeps the process running after the eval finishes so external
-            clients can still query its state — exit via `inspect ctl process release`
-            (or `POST /release`).
+            clients can still query its state — the process exits via
+            `inspect ctl process release` (or `POST /release`), or after
+            24 hours parked with no control-channel activity. Pass
+            `"keep:<idle>"` (e.g. `"keep:4h"`) to tune that idle timeout,
+            or `"keep:forever"` to park indefinitely.
         acp_server: Override the original eval's ACP server transport on retry.
             `True` enables a default AF_UNIX socket; an integer binds a TCP
             loopback port; a string is taken as a custom UNIX socket path;

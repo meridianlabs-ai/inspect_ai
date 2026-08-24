@@ -265,9 +265,12 @@ def eval_set(
             `False` disables the control endpoint; `"keep"` additionally
             keeps the process running after the eval-set finishes so external
             clients (the `inspect ctl` CLI, scripted agents, TUIs) can still
-            query state and read results — exit via `inspect ctl process release`
-            (or `POST /release`). Requires `retry_immediate=True` (the
-            default) for the `"keep"` value.
+            query state and read results — the process exits via
+            `inspect ctl process release` (or `POST /release`), or after
+            24 hours parked with no control-channel activity. Pass
+            `"keep:<idle>"` (e.g. `"keep:4h"`) to tune that idle timeout,
+            or `"keep:forever"` to park indefinitely. Requires
+            `retry_immediate=True` (the default) for keep values.
         solver: Alternative solver(s) for
             evaluating task(s). Optional (uses task solver by default).
         scanner: Scanner(s) to apply to each sample's transcript after the
