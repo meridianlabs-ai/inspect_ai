@@ -61,7 +61,7 @@ teardown runs (discovery file removed, `done` record emitted, exit 0). Plus:
 
 ```
 --ctl-server=keep           # park with the default idle timeout (24h)
---ctl-server=keep:4h        # explicit idle timeout (Ns / Nm / Nh / Nd, or bare seconds)
+--ctl-server=keep:4h        # explicit idle timeout (s/m/h/d suffix, or bare seconds)
 --ctl-server=keep:forever   # opt out — park indefinitely
 ```
 
