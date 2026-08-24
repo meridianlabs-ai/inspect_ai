@@ -65,7 +65,9 @@ DETACH_HELP = (
     "file's last line; a process that exited without one died mid-run, with "
     "diagnostics in the same file. Pass --ctl-server=keep to instead keep the "
     "process alive (and queryable via `inspect ctl`) after the eval finishes, "
-    "until `inspect ctl process release`."
+    "until `inspect ctl process release` — or until the park's idle timeout "
+    "(default 24h; tune with keep:<idle>, disable with keep:forever) "
+    "auto-releases it."
 )
 
 

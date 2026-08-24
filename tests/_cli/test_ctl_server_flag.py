@@ -67,8 +67,27 @@ def test_keep_value() -> None:
 
 
 def test_keep_alive_legacy_alias() -> None:
-    """`--ctl-server=keep-alive` still resolves, normalizing to "keep"."""
-    assert _parsed(["--ctl-server=keep-alive"]) == "keep"
+    """`--ctl-server=keep-alive` still resolves (passed through verbatim)."""
+    assert _parsed(["--ctl-server=keep-alive"]) == "keep-alive"
+
+
+def test_keep_idle_timeout_passes_through_verbatim() -> None:
+    """`--ctl-server=keep:<idle>` keeps its suffix.
+
+    Flattening to "keep" would silently drop the requested park idle timeout.
+    """
+    assert _parsed(["--ctl-server=keep:4h"]) == "keep:4h"
+    assert _parsed(["--ctl-server=keep:forever"]) == "keep:forever"
+
+
+def test_keep_bad_idle_timeout_rejected() -> None:
+    """A malformed keep idle timeout is a usage error."""
+    runner = CliRunner()
+    for value in ("keep:0", "keep:4hours"):
+        result = runner.invoke(
+            _build_cmd(), [f"--ctl-server={value}"], standalone_mode=False
+        )
+        assert isinstance(result.exception, click.BadParameter), value
 
 
 def test_unknown_value_rejected() -> None:
@@ -109,9 +128,19 @@ def test_cli_and_python_api_accept_the_same_values() -> None:
 
     from inspect_ai._control.server import resolve_ctl_server
 
-    for value in ("true", "yes", "1", "false", "no", "0", "keep-alive", "keep"):
+    for value in (
+        "true",
+        "yes",
+        "1",
+        "false",
+        "no",
+        "0",
+        "keep-alive",
+        "keep",
+        "keep:4h",
+        "keep:forever",
+    ):
         parsed = cast("bool | str | None", _parsed([f"--ctl-server={value}"]))
-        # the CLI's parsed value round-trips through the resolver...
-        enabled, keep_alive = resolve_ctl_server(parsed)
-        # ...and matches resolving the raw spelling directly
-        assert (enabled, keep_alive) == resolve_ctl_server(value)
+        # the CLI's parsed value round-trips through the resolver and matches
+        # resolving the raw spelling directly
+        assert resolve_ctl_server(parsed) == resolve_ctl_server(value)

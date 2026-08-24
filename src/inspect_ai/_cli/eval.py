@@ -469,7 +469,10 @@ def eval_options(func: Callable[..., Any]) -> Callable[..., click.Context]:
             "Pass `keep` to also keep the process running "
             "after the eval finishes so its state and results stay readable; "
             "the process exits when `inspect ctl process release` is run (or POST "
-            "/release is sent to the control endpoint). Without `keep` "
+            "/release is sent to the control endpoint), or after 24 hours "
+            "parked with no control-channel activity — pass `keep:<idle>` "
+            "(e.g. `keep:4h`) to tune that idle timeout, or `keep:forever` "
+            "to park indefinitely. Without `keep` "
             "the process exits as soon as the eval body returns, taking the "
             "control surface with it. Observe the run from another shell "
             "with `inspect ctl task list`."
@@ -2219,6 +2222,15 @@ def _eval_exec_json(
             "event": "done",
             "run_id": handoffs[-1].run_id if handoffs else None,
         }
+        # a keep-alive park stamps why it ended ("released" vs
+        # "idle_timeout") so a --json/--detach consumer can tell an
+        # auto-release from an operator release — the park's stderr notice
+        # is invisible to them. Absent when no park ended.
+        from inspect_ai._control.server import park_release_reason
+
+        released = park_release_reason()
+        if released is not None:
+            done["released"] = released
         if is_eval_set:
             # resolved id (may be generated / read from the log dir); fall
             # back to the log headers when no eval ran (all tasks reused)

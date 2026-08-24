@@ -73,4 +73,9 @@ external clients (the `inspect ctl` CLI, TUIs, agents). See
 #       `sample show` truthiness-checked the error dict, so a withheld error
 #       (`{}`) on a zero-retries sample prints "(no errors)" under an `error`
 #       status line. Cosmetic only, and unfixable for already-shipped CLIs.
-CONTROL_API_VERSION: int = 6
+#   7 — park idle timeout (design/ctl/park-idle-timeout.md): the park_timeout
+#       knob on the config PATCH routes, the `park` section of the config
+#       views, and `park_deadline` on the /tasks rows. No CLI gate — the
+#       knob rides the strict-mutations policy (an older strict server 400s
+#       it atomically) and the reads are additive.
+CONTROL_API_VERSION: int = 7

@@ -171,6 +171,19 @@ from ._render import _echo, _echo_raw, _print_config
     ),
 )
 @click.option(
+    "--park-timeout",
+    type=_INT_OR_CLEAR,
+    metavar="SECONDS",
+    default=None,
+    help=(
+        f"[{_KNOB_SCOPE['park_timeout']}] Override the keep-alive park's "
+        "idle auto-release window, in seconds — a parked process exits "
+        "after this long with no control-channel activity (default 24h; "
+        "'clear' restores the launch value). Setting it is itself activity, "
+        "so the new window starts now."
+    ),
+)
+@click.option(
     "--reason",
     default=None,
     help=(
@@ -213,6 +226,7 @@ def config_command(
     timeout: int | Literal["clear"] | None,
     attempt_timeout: int | Literal["clear"] | None,
     max_retries: int | Literal["clear"] | None,
+    park_timeout: int | Literal["clear"] | None,
     reason: str | None,
     author: str | None,
     dry_run: bool,
@@ -243,7 +257,11 @@ def config_command(
     overrides on the task's per-sample limits, read where each sample's
     limits are checked — so a retune reaches in-flight samples (a lowered
     time limit cancels a sample already past it) as well as ones not yet
-    started; pass `clear` to restore launch config. Applied
+    started; pass `clear` to restore launch config. `--park-timeout` sets
+    the keep-alive park's idle auto-release window (a parked process exits
+    after that long with no control-channel activity; default 24h, tunable
+    at launch with `--ctl-server=keep:<idle>`); pass `clear` to restore the
+    launch value. Applied
     changes are recorded in each affected eval log (who / when / old → new);
     `--reason` annotates the record with why. TASK
     is required only for setting a task-scoped knob when several tasks run.
@@ -266,6 +284,7 @@ def config_command(
         timeout=timeout,
         attempt_timeout=attempt_timeout,
         max_retries=max_retries,
+        park_timeout=park_timeout,
         reason=reason,
         author=author,
         dry_run=dry_run,
@@ -285,6 +304,7 @@ def _applied_knob_names(
     timeout: int | Literal["clear"] | None,
     attempt_timeout: int | Literal["clear"] | None,
     max_retries: int | Literal["clear"] | None,
+    park_timeout: int | Literal["clear"] | None,
     time_limit: int | Literal["clear"] | None,
     token_limit: int | Literal["clear"] | None,
     message_limit: int | Literal["clear"] | None,
@@ -337,6 +357,7 @@ def _applied_knob_names(
             ("--timeout", timeout, True),
             ("--attempt-timeout", attempt_timeout, True),
             ("--max-retries", max_retries, True),
+            ("--park-timeout", park_timeout, True),
             ("--time-limit", time_limit, True),
             ("--token-limit", token_limit, True),
             ("--message-limit", message_limit, True),
@@ -363,6 +384,7 @@ def _run_config(
     timeout: int | Literal["clear"] | None = None,
     attempt_timeout: int | Literal["clear"] | None = None,
     max_retries: int | Literal["clear"] | None = None,
+    park_timeout: int | Literal["clear"] | None = None,
     reason: str | None = None,
     author: str | None = None,
     dry_run: bool,
@@ -420,6 +442,7 @@ def _run_config(
         "timeout": timeout,
         "attempt_timeout": attempt_timeout,
         "max_retries": max_retries,
+        "park_timeout": park_timeout,
         "time_limit": time_limit,
         "token_limit": token_limit,
         "message_limit": message_limit,
@@ -470,6 +493,7 @@ def _run_config(
         timeout=timeout,
         attempt_timeout=attempt_timeout,
         max_retries=max_retries,
+        park_timeout=park_timeout,
         author=author,
         reason=reason,
         pid=scope.pid,
@@ -498,6 +522,7 @@ def _run_config(
                 timeout=timeout,
                 attempt_timeout=attempt_timeout,
                 max_retries=max_retries,
+                park_timeout=park_timeout,
                 time_limit=time_limit,
                 token_limit=token_limit,
                 message_limit=message_limit,
@@ -669,6 +694,11 @@ def _compose_config(
             "scope": _KNOB_SCOPE["log_shared"],
             "value": buffer_view.get("log_shared"),
         }
+    # The park idle-timeout knob (absent from an older server's view —
+    # skipped then, like the retry knobs: no value claim to make).
+    park_view = limits_view.get("park")
+    if park_view is not None:
+        knobs["park_timeout"] = {"scope": _KNOB_SCOPE["park_timeout"], **park_view}
 
     # applied but unrecorded knobs surface as a warning (the change itself
     # landed; only its eval-log record didn't — e.g. no live log to record
@@ -859,6 +889,7 @@ def _exec_limits(
     timeout: int | Literal["clear"] | None = None,
     attempt_timeout: int | Literal["clear"] | None = None,
     max_retries: int | Literal["clear"] | None = None,
+    park_timeout: int | Literal["clear"] | None = None,
     author: str | None = None,
     reason: str | None = None,
     pid: int | None = None,
@@ -897,6 +928,7 @@ def _exec_limits(
         "timeout": timeout,
         "attempt_timeout": attempt_timeout,
         "max_retries": max_retries,
+        "park_timeout": park_timeout,
         "time_limit": time_limit,
         "token_limit": token_limit,
         "message_limit": message_limit,

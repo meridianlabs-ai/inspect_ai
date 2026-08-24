@@ -21,6 +21,7 @@ _KNOB_SCOPE: dict[str, str] = {
     "timeout": "process",
     "attempt_timeout": "process",
     "max_retries": "process",
+    "park_timeout": "process",
     "time_limit": "task",
     "token_limit": "task",
     "message_limit": "task",

@@ -93,7 +93,7 @@ The detached process's stdout and stderr go to a file under the Inspect data dir
 
 Inspect never deletes these output files: one accumulates per detached run under the data directory until you remove it. Since the file is the completion signal, remove it only after its `done` record has been read.
 
-To instead keep the process alive after the eval finishes — its state still queryable via `inspect ctl` until you `inspect ctl process release` it — pass `--ctl-server=keep` explicitly (or latch it onto an already-running detached eval with `inspect ctl process keep`). The `done` record is then written only when the process is released. Prefer the default exit-when-done unless whatever will issue the release is certain to outlive the eval: a long eval routinely outlives the shell or agent session that launched it, and an unreleased parked process lingers indefinitely.
+To instead keep the process alive after the eval finishes — its state still queryable via `inspect ctl` until you `inspect ctl process release` it — pass `--ctl-server=keep` explicitly (or latch it onto an already-running detached eval with `inspect ctl process keep`). The `done` record is then written only when the process is released — including by the park idle timeout (default 24 hours with no control-channel activity; see [Park Idle Timeout](#park-idle-timeout)), in which case the record carries `"released": "idle_timeout"`. Prefer the default exit-when-done unless whatever will issue the release is certain to outlive the eval: a long eval routinely outlives the shell or agent session that launched it, and an unreleased parked process lingers until the idle timeout reclaims it.
 
 `--detach` works the same on `inspect eval-set` and `inspect eval-retry` (a multi-file retry hands off on its first `launch` record; later files' records go to the output file). Because a detached eval must be observable and cancellable while running, combining `--detach` with `--ctl-server=false` is an error.
 
@@ -461,6 +461,19 @@ inspect ctl process release
 You can also latch keep-alive onto an eval that is *already running* (launched without `--ctl-server=keep`) with `inspect ctl process keep`.
 
 If more than one process is parked, `release` lists their pids and you disambiguate by passing one (`inspect ctl process release <pid>`). Release also works ahead of time: issued while the eval is still running, it means "exit when done" — the process skips the park and exits as soon as the eval finishes (it never cancels in-flight work). `keep` and `release` are last-write-wins, so a `keep` issued after a `release` (while the eval is still running) restores the park. From Python, pass `ctl_server="keep"` to `eval()` or `eval_set()`. For eval sets, keep-alive requires `retry_immediate=True` (the default).
+
+### Park Idle Timeout
+
+So that a forgotten `release` doesn't leak the process forever, a parked process auto-releases after 24 hours with no control-channel activity. Any request to the process — a read like `inspect ctl task list` or a mutation — resets the clock, so a park anyone is actually using never times out; the timer runs only while parked (never during an eval). On expiry the process releases exactly as `inspect ctl process release` would (clean exit, discovery removed) and says why on stderr; `--json` / `--detach` consumers see `"released": "idle_timeout"` on the final `done` record.
+
+Tune the window at launch with a duration suffix, or opt out entirely:
+
+```bash
+inspect eval ctf.py --ctl-server=keep:4h       # 4 hours idle
+inspect eval ctf.py --ctl-server=keep:forever  # park indefinitely
+```
+
+Durations accept `s` / `m` / `h` / `d` suffixes or bare seconds. On a running process, view or retune the window with `inspect ctl config --park-timeout <seconds>` (pass `clear` to restore the launch value) — setting it counts as activity, so the new window starts immediately. While parked, `inspect ctl task list` and `inspect ctl process list` show the auto-release countdown.
 
 ## Disabling the Control Server
 

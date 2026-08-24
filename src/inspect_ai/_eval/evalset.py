@@ -29,9 +29,12 @@ from inspect_ai._control.eval_state import (
 from inspect_ai._control.server import (
     control_server,
     keep_alive_intent,
+    park_notice,
+    print_idle_timeout_release,
     request_keep_alive,
     reset_keep_alive,
     resolve_ctl_server,
+    set_park_idle_timeout,
     wait_for_shutdown_async,
 )
 from inspect_ai._display import display as display_manager
@@ -408,6 +411,7 @@ def eval_set(
     # the same latch, so a runtime `POST /keep` during the run is honoured too.
     if ctl.keep_alive:
         request_keep_alive()
+        set_park_idle_timeout(ctl.park_idle_timeout)
 
     # helper function to run a set of evals
     def run_eval(
@@ -1128,12 +1132,12 @@ async def _keep_alive_park(eval_set_id: str, log_dir: str) -> None:
         # same hole for console consumers that the handoff closes for --json
         print_ctl_pointer(control_socket)
         rich.get_console().print(
-            "Eval-set finished. Keeping process alive — press Ctrl+C or run "
-            "`inspect ctl process release` to let it exit.",
+            park_notice("Eval-set finished."),
             markup=False,
             highlight=False,
         )
         await wait_for_shutdown_async(ctl_server)
+        print_idle_timeout_release()
 
 
 def eval_set_id_for_log_dir(log_dir: str, eval_set_id: str | None = None) -> str:

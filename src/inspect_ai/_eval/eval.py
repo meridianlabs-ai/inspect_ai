@@ -17,9 +17,12 @@ from inspect_ai._control.pause import dispatch_model_name, note_dispatch_models
 from inspect_ai._control.server import (
     control_server,
     keep_alive_intent,
+    park_notice,
+    print_idle_timeout_release,
     request_keep_alive,
     reset_keep_alive,
     resolve_ctl_server,
+    set_park_idle_timeout,
     wait_for_shutdown_async,
 )
 from inspect_ai._eval.handoff import (
@@ -997,6 +1000,7 @@ async def _eval_async_inner(
         # is only ever set here for a standalone eval.
         if ctl.keep_alive:
             request_keep_alive()
+            set_park_idle_timeout(ctl.park_idle_timeout)
 
         # Register a task enqueuer so additional tasks can be added to this run
         # while it's in progress — imperatively via `enqueue_task`, or
@@ -1160,12 +1164,12 @@ async def _eval_async_inner(
                 import rich
 
                 rich.get_console().print(
-                    "Eval finished. Keeping process alive — press Ctrl+C "
-                    "or run `inspect ctl process release` to let it exit.",
+                    park_notice("Eval finished."),
                     markup=False,
                     highlight=False,
                 )
                 await wait_for_shutdown_async(_ctl_server)
+                print_idle_timeout_release()
 
         # cleanup sample buffers if required
         await cleanup_sample_buffers(log_dir)

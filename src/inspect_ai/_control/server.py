@@ -34,6 +34,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
+import sys
 import time
 from contextlib import asynccontextmanager
 from logging import getLogger
@@ -88,6 +90,7 @@ from inspect_ai._util.discovery import (
     write_discovery_file,
 )
 from inspect_ai._util.error import PrerequisiteError
+from inspect_ai._util.format import format_duration_compact
 from inspect_ai._util.sockets import (
     lock_socket_file,
     peer_uid,
@@ -112,6 +115,20 @@ class _ParsedOverrideKnobs(NamedTuple):
 # ---------------------------------------------------------------------------
 
 
+DEFAULT_PARK_IDLE_TIMEOUT: float = 24 * 60 * 60
+"""Default idle timeout for a keep-alive park, in seconds (24 hours).
+
+A parked process (no eval running) auto-releases after this long with no
+control-channel activity, so a forgotten ``inspect ctl process release``
+bounds the leak to a day instead of forever. Default-on because the failure
+mode is *forgetting* — the operators who forget the release are the same
+ones who won't pass an opt-in flag — and low-risk because any request at
+all resets the clock. 24h clears the "come back tomorrow morning" workflow
+with margin. Deliberately standing parks opt out with ``keep:forever``.
+See ``design/ctl/park-idle-timeout.md``.
+"""
+
+
 class CtlServerConfig(NamedTuple):
     """Resolved ``ctl_server`` configuration (see :func:`resolve_ctl_server`)."""
 
@@ -120,6 +137,62 @@ class CtlServerConfig(NamedTuple):
 
     keep_alive: bool
     """Whether the process parks after the eval finishes."""
+
+    park_idle_timeout: float | None = None
+    """Idle seconds after which a park auto-releases (``None`` = forever).
+
+    Only meaningful when ``keep_alive`` is set: plain ``keep`` resolves to
+    :data:`DEFAULT_PARK_IDLE_TIMEOUT`, ``keep:<idle>`` to the parsed
+    duration, ``keep:forever`` to ``None``.
+    """
+
+
+MAX_PARK_IDLE_TIMEOUT: int = 1_000_000_000
+"""Upper bound for a park idle timeout, in seconds (~31.7 years).
+
+Same value and rationale as ``MAX_GENERATE_CONFIG_OVERRIDE`` (far beyond
+any meaningful window, exactly representable as a float), but park-owned so
+the two knobs' value domains can't silently couple. Enforced by both the
+launch grammar and the ``park_timeout`` config knob — a bound at the wire
+beats a nonsense multi-century deadline (or, unbounded, an
+``OverflowError`` converting a huge int to float).
+"""
+
+_PARK_TIMEOUT_UNITS = {None: 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def _parse_park_idle_timeout(spec: str) -> float | None:
+    """Parse the ``keep:<idle>`` suffix: a duration, bare seconds, or ``forever``.
+
+    Accepts ``30m`` / ``4h`` / ``2d`` / ``90s`` / bare seconds, or the
+    keyword ``forever`` (park indefinitely — today's pre-timeout contract).
+    ``0`` is rejected rather than interpreted: it is ambiguous between
+    "release immediately" and "never", and the opt-out is spelled
+    ``forever`` — consistent with :func:`resolve_ctl_server`'s fail-loud
+    stance on unknown values.
+    """
+    if spec == "forever":
+        return None
+    match = re.fullmatch(r"(\d+)(s|m|h|d)?", spec)
+    if match is None:
+        raise PrerequisiteError(
+            f"Unexpected keep idle timeout '{spec}' (expected a duration like "
+            "30m, 4h, 2d, bare seconds, or 'forever')."
+        )
+    seconds = int(match.group(1)) * _PARK_TIMEOUT_UNITS[match.group(2)]
+    if seconds == 0:
+        raise PrerequisiteError(
+            "keep:0 is ambiguous (release immediately vs never) — use "
+            "'keep:forever' to park indefinitely, or drop keep entirely to "
+            "exit when the eval finishes."
+        )
+    if seconds > MAX_PARK_IDLE_TIMEOUT:
+        raise PrerequisiteError(
+            f"keep idle timeout '{spec}' is larger than the maximum "
+            f"({MAX_PARK_IDLE_TIMEOUT} seconds) — use 'keep:forever' to park "
+            "indefinitely."
+        )
+    return float(seconds)
 
 
 def resolve_ctl_server(value: bool | str | None) -> CtlServerConfig:
@@ -132,7 +205,12 @@ def resolve_ctl_server(value: bool | str | None) -> CtlServerConfig:
     - ``None`` / ``True`` — control server on (the default).
     - ``False`` — control server off.
     - ``"keep"`` — control server on, and the process parks after the eval
-      finishes (until ``inspect ctl process release`` / ``POST /release``).
+      finishes (until ``inspect ctl process release`` / ``POST /release``,
+      or after :data:`DEFAULT_PARK_IDLE_TIMEOUT` with no control-channel
+      activity).
+    - ``"keep:<idle>"`` — as ``keep`` with an explicit idle timeout
+      (``30m`` / ``4h`` / ``2d`` / bare seconds).
+    - ``"keep:forever"`` — as ``keep``, parked indefinitely (no timeout).
 
     The CLI spellings (``"true"`` / ``"yes"`` / ``"1"``, ``"false"`` /
     ``"no"`` / ``"0"``, case-insensitive) are accepted too, so programmatic
@@ -158,9 +236,21 @@ def resolve_ctl_server(value: bool | str | None) -> CtlServerConfig:
             return CtlServerConfig(enabled=False, keep_alive=False)
         # `keep-alive` is still accepted as a legacy alias for `keep`.
         if lower in ("keep", "keep-alive"):
-            return CtlServerConfig(enabled=True, keep_alive=True)
+            return CtlServerConfig(
+                enabled=True,
+                keep_alive=True,
+                park_idle_timeout=DEFAULT_PARK_IDLE_TIMEOUT,
+            )
+        for prefix in ("keep:", "keep-alive:"):
+            if lower.startswith(prefix):
+                return CtlServerConfig(
+                    enabled=True,
+                    keep_alive=True,
+                    park_idle_timeout=_parse_park_idle_timeout(lower[len(prefix) :]),
+                )
     raise PrerequisiteError(
-        f"Unexpected ctl_server value '{value}' (expected true, false, or keep)."
+        f"Unexpected ctl_server value '{value}' (expected true, false, keep, "
+        "keep:<idle> — e.g. keep:4h — or keep:forever)."
     )
 
 
@@ -196,8 +286,15 @@ def request_release() -> None:
     running it means "exit when done"; issued against a parked process it
     releases the park. A later :func:`request_keep_alive` overrides it
     (last-write-wins).
+
+    A release that actually clears a held keep records ``"released"`` as the
+    park release reason — here, at the transition, rather than at the park's
+    exit, so a release that lands *before* the park ("exit when done") is
+    reflected in the ``done`` record too, not just one that woke a live park.
     """
-    global _keep_alive
+    global _keep_alive, _park_release_reason
+    if _keep_alive:
+        _park_release_reason = "released"
     _keep_alive = False
 
 
@@ -212,9 +309,179 @@ def keep_alive_intent() -> bool:
 
 
 def reset_keep_alive() -> None:
-    """Clear the keep-alive intent (called at the outermost run boundary)."""
-    global _keep_alive
+    """Reset keep-alive state at the outermost run boundary (run *start*).
+
+    Clears the intent and restores the park idle-timeout state (launch value
+    back to the default, runtime override and release reason cleared). Called
+    at run start rather than run end so :func:`park_release_reason` survives
+    long enough for the CLI's ``done`` record — which is emitted after the
+    run (and its park) return — to read it.
+    """
+    global _keep_alive, _park_idle_timeout, _park_timeout_override
+    global _park_release_reason
     _keep_alive = False
+    _park_idle_timeout = DEFAULT_PARK_IDLE_TIMEOUT
+    _park_timeout_override = None
+    _park_release_reason = None
+
+
+# ---------------------------------------------------------------------------
+# Park idle timeout
+# ---------------------------------------------------------------------------
+
+# State for the park idle timeout (see design/ctl/park-idle-timeout.md):
+# a parked process (keep-alive held, no eval running) auto-releases after
+# the effective timeout elapses with no control-channel activity. Module-
+# level like the keep-alive latch (the eval-set park binds a FRESH server,
+# so per-server state couldn't carry across that boundary). The timer only
+# runs while parked — `wait_for_release` is the sole place it's enforced.
+#
+# `_park_idle_timeout` is the launch value (`--ctl-server=keep:<idle>`;
+# None = park forever) and `_park_timeout_override` the runtime override
+# (`inspect ctl config --park-timeout`; None = no override — note the
+# override cannot express "forever", only a launch value can). Both reset
+# via reset_keep_alive at the run boundary.
+_park_idle_timeout: float | None = DEFAULT_PARK_IDLE_TIMEOUT
+_park_timeout_override: float | None = None
+# Stamped by the ASGI middleware on every control request; (re-)stamped at
+# park entry so the park always gets a full idle window. Monotonic (not
+# wall-clock) so an NTP step or a suspend/resume can't spuriously expire a
+# park the moment it wakes — idle time is time this *running* process went
+# unqueried. Converted to a wall-clock timestamp only at the wire (see
+# park_deadline).
+_last_control_activity: float = time.monotonic()
+# Whether the process is currently parked (a `wait_for_release` is running).
+_parked: bool = False
+# Why keep-alive last ended — surfaces on stderr and the `done` record so a
+# returning operator / --json consumer can tell an auto-release from an
+# operator release (or a crash, which leaves no record at all).
+_park_release_reason: Literal["released", "idle_timeout"] | None = None
+
+
+def set_park_idle_timeout(timeout: float | None) -> None:
+    """Set the launch-configured park idle timeout (``None`` = park forever).
+
+    Called where the launch flag latches keep-alive on (``eval_async`` /
+    ``eval_set``) with the resolved :attr:`CtlServerConfig.park_idle_timeout`.
+    A park latched at runtime (``POST /keep``) never calls this and keeps
+    the default.
+    """
+    global _park_idle_timeout
+    _park_idle_timeout = timeout
+
+
+def set_park_timeout_override(timeout: float | None) -> None:
+    """Set (or with ``None`` clear) the runtime park-timeout override.
+
+    The ``PATCH /config`` ``park_timeout`` knob (``inspect ctl config
+    --park-timeout``); clearing restores the launch value / default.
+    """
+    global _park_timeout_override
+    _park_timeout_override = timeout
+
+
+def park_timeout_override() -> float | None:
+    """The active runtime park-timeout override (``None`` = no override)."""
+    return _park_timeout_override
+
+
+def effective_park_idle_timeout() -> float | None:
+    """The idle timeout the park enforces: the override, else the launch value.
+
+    ``None`` means park forever (a ``keep:forever`` launch with no override).
+    """
+    return (
+        _park_timeout_override
+        if _park_timeout_override is not None
+        else _park_idle_timeout
+    )
+
+
+def note_control_activity() -> None:
+    """Stamp control-channel activity now (resets the park idle clock)."""
+    global _last_control_activity
+    _last_control_activity = time.monotonic()
+
+
+def _park_remaining() -> float | None:
+    """Seconds of idle window left (monotonic), or ``None`` when no deadline.
+
+    ``None`` while an eval is running (the timer only runs in the parked
+    state) or when the effective timeout is "forever". Can be negative once
+    the window has elapsed. The single deadline computation shared by the
+    park's wait loop and the wire-facing :func:`park_deadline`.
+    """
+    if not _parked:
+        return None
+    timeout = effective_park_idle_timeout()
+    if timeout is None:
+        return None
+    return (_last_control_activity + timeout) - time.monotonic()
+
+
+def park_deadline() -> float | None:
+    """When the parked process will auto-release, as a unix timestamp.
+
+    ``None`` when there is no deadline (see :func:`_park_remaining`).
+    Computed live from the last control-channel activity, so any request —
+    including the one reading this — pushes it out. Tracked internally on
+    the monotonic clock; converted to wall-clock here for display only.
+    """
+    remaining = _park_remaining()
+    return None if remaining is None else time.time() + remaining
+
+
+def park_release_reason() -> Literal["released", "idle_timeout"] | None:
+    """Why keep-alive last ended (``None``: it never ended in this run).
+
+    ``"released"`` — a release cleared a held keep intent (``POST
+    /release``, whether it woke a live park or landed mid-run as "exit when
+    done"); ``"idle_timeout"`` — the park auto-released after the idle
+    window elapsed. A park cancelled from outside (Ctrl+C) sets no reason.
+    Read by the park sites (stderr notice) and the CLI's ``done`` record;
+    cleared at the next run's start.
+    """
+    return _park_release_reason
+
+
+def print_idle_timeout_release() -> None:
+    """Report an idle-timeout auto-release on stderr (park sites call this).
+
+    A no-op unless the park just ended via the idle timeout. Stderr — not
+    the display — so a returning operator (or a log scrape) can tell timeout
+    from crash; ``--json`` / ``--detach`` consumers read the ``done``
+    record's ``released`` field instead, since stderr prose is invisible to
+    them.
+    """
+    if park_release_reason() != "idle_timeout":
+        return
+    timeout = effective_park_idle_timeout()
+    window = format_duration_compact(timeout) if timeout is not None else "?"
+    print(
+        f"Parked process idle for {window} with no control-channel activity "
+        "— auto-released. Configure with --ctl-server=keep:<idle|forever> "
+        "or `inspect ctl config --park-timeout`.",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def park_notice(prefix: str) -> str:
+    """The console notice a park prints, with the auto-release window.
+
+    Shared by the standalone-eval and eval-set park sites so the notice —
+    and its mention of the idle timeout, which makes a default-on timeout
+    legible rather than reading as a crash when it fires — can't drift
+    between them.
+    """
+    notice = (
+        f"{prefix} Keeping process alive — press Ctrl+C or run "
+        "`inspect ctl process release` to let it exit."
+    )
+    timeout = effective_park_idle_timeout()
+    if timeout is not None:
+        notice += f" Auto-releases after {format_duration_compact(timeout)} idle."
+    return notice
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +566,28 @@ def _peer_checked_http_protocol() -> "type[asyncio.Protocol] | None":
 # ---------------------------------------------------------------------------
 
 
+class _ActivityStampMiddleware:
+    """Stamp control-channel activity on every HTTP request (pure ASGI).
+
+    Feeds the park idle timeout: any request — read or mutation, current or
+    future route — resets the idle clock, so no route author ever has to
+    remember to. Deliberately ASGI-level rather than an app-wide FastAPI
+    dependency (which fires only on matched routes): an unmatched-route
+    probe, e.g. a newer CLI checking an endpoint this server predates, is
+    still someone using the process and must count as activity. Raw ASGI
+    (not ``BaseHTTPMiddleware``) so it adds no per-request task or response
+    buffering.
+    """
+
+    def __init__(self, app: Any) -> None:
+        self._app = app
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope.get("type") == "http":
+            note_control_activity()
+        await self._app(scope, receive, send)
+
+
 class ControlServer:
     """FastAPI control server for the live eval.
 
@@ -326,23 +615,52 @@ class ControlServer:
         return self._socket_path
 
     async def wait_for_release(self) -> None:
-        """Park until keep-alive intent is released.
+        """Park until keep-alive is released or the idle timeout expires.
 
         Blocks while :func:`keep_alive_intent` holds, re-checking it whenever
         ``POST /release`` wakes it (via :meth:`notify_park_change`). Returns
         immediately when the intent is already off. The loop tolerates a keep
         that re-set the intent on between the release's wake-up and this
         re-check (last-write-wins): it simply waits again.
+
+        The park idle timeout is enforced only here — while the process is
+        actually parked — and (re-)arms fresh at each park entry, so an eval
+        that ran for hours without a control request still gets its full
+        idle window. Each wait is bounded by the deadline derived from the
+        last control-channel activity (monotonic — see the state block);
+        a request arriving mid-wait moves the deadline, so waking at a
+        stale one just re-arms. On expiry the park releases through the
+        same latch as ``POST /release`` (identical teardown) and records
+        ``"idle_timeout"`` for :func:`park_release_reason` (an ordinary
+        release records its reason at the latch — see
+        :func:`request_release`).
         """
-        async with self._park_cond:
-            while keep_alive_intent():
-                await self._park_cond.wait()
+        global _parked, _park_release_reason
+        note_control_activity()
+        _parked = True
+        try:
+            async with self._park_cond:
+                while keep_alive_intent():
+                    remaining = _park_remaining()
+                    if remaining is None:
+                        await self._park_cond.wait()
+                        continue
+                    if remaining <= 0:
+                        request_release()
+                        _park_release_reason = "idle_timeout"
+                        return
+                    with anyio.move_on_after(remaining):
+                        await self._park_cond.wait()
+        finally:
+            _parked = False
 
     async def notify_park_change(self) -> None:
-        """Wake :meth:`wait_for_release` so it re-checks the keep-alive intent.
+        """Wake :meth:`wait_for_release` so it re-checks intent and deadline.
 
-        Only ``POST /release`` needs this — the park exits on a transition to
-        OFF, so a keep (which sets the intent ON) has nothing to wake.
+        Called by ``POST /release`` (the park exits on a transition to OFF —
+        a keep, which sets the intent ON, has nothing to wake) and by a
+        ``park_timeout`` retune (a shortened window must reach a park still
+        sleeping until its old, later deadline).
         """
         async with self._park_cond:
             self._park_cond.notify_all()
@@ -368,6 +686,7 @@ class ControlServer:
         # module docstring for the rationale, including why GETs stay
         # tolerant).
         app = FastAPI(dependencies=[Depends(reject_unknown_query_params)])
+        app.add_middleware(_ActivityStampMiddleware)
         started_at = self._started_at
 
         @app.exception_handler(UnknownQueryParamsError)
@@ -413,17 +732,21 @@ class ControlServer:
             return None
 
         def _parse_override_knobs(
-            maximum: int, *knobs: tuple[str, str | None]
+            maximum: int, *knobs: tuple[str, str | None], minimum: int = 0
         ) -> _ParsedOverrideKnobs:
-            """Parse override knobs' raw query values (retry + sample limits).
+            """Parse override knobs' raw query values (retry / limit / park).
 
             Unlike the limits knobs these are declared ``str`` on the route:
-            every integer >= 0 is a real value (0 = fail after the first
-            attempt / a zero budget), so clearing an override is spelled with
+            every integer >= ``minimum`` is a real value (0 = fail after the
+            first attempt / a zero budget for the retry and sample-limit
+            knobs; ``park_timeout`` passes ``minimum=1`` — for it, 0 is
+            ambiguous between "release immediately" and "never"), so
+            clearing an override is spelled with
             the keyword ``clear`` rather than a sentinel integer. Values above
             ``maximum`` (the store's own bound —
             :data:`MAX_GENERATE_CONFIG_OVERRIDE` /
-            :data:`MAX_SAMPLE_LIMIT_OVERRIDE`) are rejected here too: the
+            :data:`MAX_SAMPLE_LIMIT_OVERRIDE` /
+            :data:`MAX_PARK_IDLE_TIMEOUT`) are rejected here too: the
             store enforces the same bound, but a 400 at the wire beats a 500.
             Returns the parsed values plus a 400 for the first invalid one
             (a ``None`` passes through as "not requested").
@@ -438,15 +761,15 @@ class ControlServer:
                     try:
                         value = int(raw)
                     except ValueError:
-                        value = -1
-                    if value < 0 or value > maximum:
+                        value = minimum - 1
+                    if value < minimum or value > maximum:
                         return _ParsedOverrideKnobs(
                             values=parsed,
                             error=JSONResponse(
                                 status_code=400,
                                 content={
                                     "error": f"{label} must be an integer "
-                                    f"between 0 and "
+                                    f"between {minimum} and "
                                     f"{maximum} or "
                                     f"'clear' (got {raw!r})"
                                 },
@@ -454,6 +777,19 @@ class ControlServer:
                         )
                     parsed[label] = value
             return _ParsedOverrideKnobs(values=parsed, error=None)
+
+        async def _notify_park_retuned(
+            park_timeout: int | Literal["clear"] | None, dry_run: bool
+        ) -> None:
+            """Wake the park after an applied park_timeout retune.
+
+            A shortened window must reach a park already sleeping until its
+            old (later) deadline, so it recomputes now. Shared by both
+            config PATCH routes so the wake condition can't drift between
+            them.
+            """
+            if park_timeout is not None and not dry_run:
+                await self.notify_park_change()
 
         def _key_pair_error(
             key: str | None, key_limit: int | None
@@ -489,8 +825,14 @@ class ControlServer:
             paused = process_paused()
             paused_now = process_paused_now()
             models_paused = paused_models()
+            # the park auto-release deadline (None unless parked with a
+            # timeout) — likewise process-level; lets `ctl task list` /
+            # `ctl process list` show the countdown, and gives an agent a
+            # machine-readable "is my addable run about to evaporate"
+            deadline = park_deadline()
             for summary in summaries:
                 summary["keep_alive"] = keep_alive
+                summary["park_deadline"] = deadline
                 summary["process_paused"] = paused
                 summary["process_paused_now"] = paused_now
                 summary["paused_models"] = models_paused
@@ -880,6 +1222,7 @@ class ControlServer:
             timeout: str | None = None,
             attempt_timeout: str | None = None,
             max_retries: str | None = None,
+            park_timeout: str | None = None,
             author: str | None = None,
             reason: str | None = None,
             dry_run: bool = False,
@@ -905,8 +1248,14 @@ class ControlServer:
             )
             if retry_error is not None:
                 return retry_error
+            park_knobs, park_error = _parse_override_knobs(
+                MAX_PARK_IDLE_TIMEOUT, ("park_timeout", park_timeout), minimum=1
+            )
+            if park_error is not None:
+                return park_error
+            park_knob = park_knobs["park_timeout"]
             try:
-                return await process_limits(
+                result = await process_limits(
                     max_sandboxes=max_sandboxes,
                     max_subprocesses=max_subprocesses,
                     max_connections=max_connections,
@@ -916,12 +1265,15 @@ class ControlServer:
                     timeout=retry_knobs["timeout"],
                     attempt_timeout=retry_knobs["attempt_timeout"],
                     max_retries=retry_knobs["max_retries"],
+                    park_timeout=park_knob,
                     author=author,
                     reason=reason,
                     dry_run=dry_run,
                 )
             except UnknownConcurrencyKeyError as exc:
                 return JSONResponse(status_code=400, content={"error": str(exc)})
+            await _notify_park_retuned(park_knob, dry_run)
+            return result
 
         # Read the task's retunable config (max_samples / max_sandboxes /
         # max_subprocesses / max_connections plus the log_buffer / log_shared
@@ -968,6 +1320,7 @@ class ControlServer:
             timeout: str | None = None,
             attempt_timeout: str | None = None,
             max_retries: str | None = None,
+            park_timeout: str | None = None,
             time_limit: str | None = None,
             token_limit: str | None = None,
             message_limit: str | None = None,
@@ -1008,6 +1361,12 @@ class ControlServer:
             )
             if limit_error is not None:
                 return limit_error
+            park_knobs, park_error = _parse_override_knobs(
+                MAX_PARK_IDLE_TIMEOUT, ("park_timeout", park_timeout), minimum=1
+            )
+            if park_error is not None:
+                return park_error
+            park_knob = park_knobs["park_timeout"]
             try:
                 result = await task_limits(
                     task_id,
@@ -1023,6 +1382,7 @@ class ControlServer:
                     timeout=retry_knobs["timeout"],
                     attempt_timeout=retry_knobs["attempt_timeout"],
                     max_retries=retry_knobs["max_retries"],
+                    park_timeout=park_knob,
                     time_limit=limit_knobs["time_limit"],
                     token_limit=limit_knobs["token_limit"],
                     message_limit=limit_knobs["message_limit"],
@@ -1037,6 +1397,7 @@ class ControlServer:
                     status_code=404,
                     content={"error": f"task {task_id} not found"},
                 )
+            await _notify_park_retuned(park_knob, dry_run)
             return result
 
         # Latches keep-alive OFF for the process (the inverse of /keep) and

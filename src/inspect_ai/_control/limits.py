@@ -135,6 +135,7 @@ async def process_limits(
     timeout: int | Literal["clear"] | None = None,
     attempt_timeout: int | Literal["clear"] | None = None,
     max_retries: int | Literal["clear"] | None = None,
+    park_timeout: int | Literal["clear"] | None = None,
     key: str | None = None,
     key_limit: int | None = None,
     author: str | None = None,
@@ -147,11 +148,14 @@ async def process_limits(
     ``max_sandboxes`` (per-provider sandbox concurrency), ``max_subprocesses``
     (subprocess concurrency), ``max_connections`` (the adaptive controllers'
     scaling ceiling), ``key`` / ``key_limit`` (a named ``concurrency()``
-    registry entry — the registry is process-global), and the retry-loop
+    registry entry — the registry is process-global), the retry-loop
     overrides (``timeout`` / ``attempt_timeout`` / ``max_retries`` — see the
     ``retry`` view and :mod:`inspect_ai.model._generate_overrides`; the
     keyword ``clear`` removes an override, restoring the launch
-    configuration). It carries no
+    configuration), and the keep-alive park's idle auto-release window
+    (``park_timeout``, seconds — see the ``park`` view and
+    ``design/ctl/park-idle-timeout.md``; ``clear`` restores the launch
+    value). It carries no
     ``max_samples`` — that is per-task; use :func:`task_limits` when a
     specific task is in view.
 
@@ -178,6 +182,7 @@ async def process_limits(
         timeout=timeout,
         attempt_timeout=attempt_timeout,
         max_retries=max_retries,
+        park_timeout=park_timeout,
         key=key,
         key_limit=key_limit,
         dry_run=dry_run,
@@ -196,6 +201,7 @@ async def process_limits(
         "max_subprocesses": views.max_subprocesses,
         "adaptive": views.adaptive,
         "retry": views.retry,
+        "park": views.park,
         "concurrency": views.concurrency,
         "requested": views.requested or None,
         "warnings": views.warnings,
@@ -218,6 +224,7 @@ async def task_limits(
     timeout: int | Literal["clear"] | None = None,
     attempt_timeout: int | Literal["clear"] | None = None,
     max_retries: int | Literal["clear"] | None = None,
+    park_timeout: int | Literal["clear"] | None = None,
     time_limit: int | Literal["clear"] | None = None,
     token_limit: int | Literal["clear"] | None = None,
     message_limit: int | Literal["clear"] | None = None,
@@ -276,6 +283,9 @@ async def task_limits(
             semantics as ``timeout``.
         max_retries: New max retries per generate call (``0`` = fail after
             the first attempt) — same override semantics as ``timeout``.
+        park_timeout: New keep-alive park idle auto-release window (seconds,
+            process-scoped) — a runtime override; the keyword ``clear``
+            restores the launch value / default.
         time_limit: New per-sample wall-clock limit (seconds) — a live
             task-scoped override read where the sample limits are resolved,
             so it reaches in-flight samples too (a time retune re-derives
@@ -461,6 +471,7 @@ async def task_limits(
         timeout=timeout,
         attempt_timeout=attempt_timeout,
         max_retries=max_retries,
+        park_timeout=park_timeout,
         key=key,
         key_limit=key_limit,
         dry_run=dry_run,
@@ -502,6 +513,7 @@ async def task_limits(
         "max_subprocesses": views.max_subprocesses,
         "adaptive": views.adaptive,
         "retry": views.retry,
+        "park": views.park,
         "limits": sample_limit_overrides(task_id),
         "concurrency": views.concurrency,
         "buffer": buffer_view,
@@ -531,6 +543,7 @@ class _ProcessKnobViews(NamedTuple):
     max_subprocesses: dict[str, Any] | None
     adaptive: list[dict[str, Any]]
     retry: dict[str, int | None]
+    park: dict[str, Any]
     concurrency: list[dict[str, Any]]
     requested: dict[str, int | str]
     warnings: list[str]
@@ -658,6 +671,7 @@ def _apply_process_knobs(
     timeout: int | Literal["clear"] | None = None,
     attempt_timeout: int | Literal["clear"] | None = None,
     max_retries: int | Literal["clear"] | None = None,
+    park_timeout: int | Literal["clear"] | None = None,
     key: str | None = None,
     key_limit: int | None = None,
     dry_run: bool,
@@ -804,6 +818,52 @@ def _apply_process_knobs(
         applied=applied,
     )
 
+    # park_timeout — the keep-alive park's idle auto-release window
+    # (process-scoped module state in _control.server, not a limiter; see
+    # design/ctl/park-idle-timeout.md). A value sets the runtime override,
+    # "clear" restores the launch value. Always adjustable, like the retry
+    # overrides. Deliberately not recorded in eval logs: the park is process
+    # lifecycle rather than eval behaviour, and the prime retune moment — a
+    # bare park — has no live eval log to record into. Function-local import:
+    # server.py imports this module at module level.
+    from inspect_ai._control.server import (
+        effective_park_idle_timeout,
+        keep_alive_intent,
+        park_deadline,
+        park_timeout_override,
+        set_park_timeout_override,
+    )
+
+    if park_timeout is not None:
+        # fail loud for a programmatic caller passing 0/negative directly (a
+        # 0 window would release the park on its first loop iteration; the
+        # HTTP route already 400s these before reaching here)
+        if park_timeout != "clear" and park_timeout < 1:
+            raise ValueError(
+                f"park_timeout must be >= 1 second or 'clear' (got {park_timeout})"
+            )
+        requested["park_timeout"] = park_timeout
+        if not dry_run:
+            set_park_timeout_override(
+                None if park_timeout == "clear" else float(park_timeout)
+            )
+        if park_timeout != "clear" and not keep_alive_intent():
+            warnings.append(
+                "park_timeout set but keep-alive is off — the timeout only "
+                "applies if the process parks (launch with --ctl-server=keep "
+                "or run `inspect ctl process keep`)."
+            )
+
+    # the park view: the effective idle window (None = forever), the active
+    # override (None = launch value applies), and — while actually parked —
+    # the live auto-release deadline (unix ts; this request already reset it)
+    park_view: dict[str, Any] = {
+        "timeout": effective_park_idle_timeout(),
+        "override": park_timeout_override(),
+        "keep_alive": keep_alive_intent(),
+        "deadline": park_deadline(),
+    }
+
     # key — a named concurrency() registry entry, matched by exact name (a
     # name can back several entries — e.g. one model on two accounts — and the
     # retune reaches them all, like max_connections' name matching). The
@@ -898,6 +958,7 @@ def _apply_process_knobs(
         max_subprocesses=max_subprocesses_view,
         adaptive=adaptive_view,
         retry=generate_config_overrides(),
+        park=park_view,
         concurrency=concurrency_view,
         requested=requested,
         warnings=warnings,

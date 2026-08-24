@@ -19,6 +19,7 @@ from inspect_ai._cli.trace import (
     trace_anomalies,
 )
 from inspect_ai._control.discovery import DiscoveredControlServer
+from inspect_ai._util.format import format_duration_compact
 from inspect_ai._util.process import pid_alive
 from inspect_ai._util.trace import ActionTraceRecord, inspect_trace_dir, read_trace_file
 
@@ -104,9 +105,11 @@ def process_keep_command(pid: int | None, as_json: bool) -> None:
     """Keep a running inspect process alive after its eval finishes.
 
     The process parks after the eval — state and results stay readable
-    here — until `inspect ctl process release` or Ctrl+C. The runtime
-    equivalent of launching with `--ctl-server=keep`; `keep` and `release`
-    are last-write-wins while the eval is still running.
+    here — until `inspect ctl process release` or Ctrl+C, or after 24 hours
+    parked with no control-channel activity (retune the window with
+    `inspect ctl config --park-timeout`). The runtime equivalent of
+    launching with `--ctl-server=keep`; `keep` and `release` are
+    last-write-wins while the eval is still running.
     """
     _run_keep_alive(pid, keep=True, as_json=as_json)
 
@@ -348,6 +351,10 @@ def _run_process_list(as_json: bool) -> None:
         # latch is likewise process-level (also None against an older server
         # that doesn't report it).
         keep_alive = bool(hosted[0].get("keep_alive")) if hosted else None
+        # the park auto-release deadline (unix ts) — set only while the
+        # process is parked with an idle timeout; None otherwise (or against
+        # an older server that doesn't report it)
+        park_deadline = hosted[0].get("park_deadline") if hosted else None
         paused = (
             bool(hosted[0].get("process_paused"))
             if hosted and hosted[0].get("process_paused") is not None
@@ -363,6 +370,7 @@ def _run_process_list(as_json: bool) -> None:
                 "socket_path": str(server.socket_path),
                 "started_at": server.started_at,
                 "keep_alive": keep_alive,
+                "park_deadline": park_deadline,
                 "paused": paused,
                 "paused_now": paused_now,
                 "tasks": [
@@ -389,10 +397,16 @@ def _run_process_list(as_json: bool) -> None:
         keep = row["keep_alive"]
         paused = row["paused"]
         tasks = row["tasks"]
+        keep_cell = "?" if keep is None else ("on" if keep else "off")
+        # a parked process shows its auto-release countdown — a timeout
+        # nobody can see reads as a crash when it fires
+        if row["park_deadline"] is not None:
+            countdown = format_duration_compact(float(row["park_deadline"]) - as_of)
+            keep_cell = f"on (auto-release in {countdown})"
         table_rows.append(
             (
                 str(row["pid"]),
-                "?" if keep is None else ("on" if keep else "off"),
+                keep_cell,
                 _format_process_paused(paused, row["paused_now"]),
                 ", ".join(str(t.get("task") or "?") for t in tasks) or "(starting)",
                 _format_started(row["started_at"]),

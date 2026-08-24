@@ -41,6 +41,28 @@ def format_progress_time(time: float, pad_hours: bool = True) -> str:
     return f"{hours_fmt}:{minutes:02d}:{seconds:02d}"
 
 
+def format_duration_compact(seconds: float) -> str:
+    """Compact unit-word duration: ``45s`` / ``12m30s`` / ``3h12m`` / ``2d1h``.
+
+    For durations that read as prose ("auto-release in 3h12m") and can span
+    days, where :func:`format_progress_time`'s ``H:MM:SS`` clock form reads
+    poorly. At most two adjacent units are shown; negatives clamp to ``0s``.
+    """
+    total = max(0, int(seconds))
+    if total < 60:
+        return f"{total}s"
+    if total < 3600:
+        minutes, secs = divmod(total, 60)
+        return f"{minutes}m" + (f"{secs}s" if secs else "")
+    if total < 86400:
+        hours, rem = divmod(total, 3600)
+        minutes = rem // 60
+        return f"{hours}h" + (f"{minutes}m" if minutes else "")
+    days, rem = divmod(total, 86400)
+    hours = rem // 3600
+    return f"{days}d" + (f"{hours}h" if hours else "")
+
+
 def format_template(
     template: str,
     params: dict[str, Any],

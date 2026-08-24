@@ -13,6 +13,7 @@ import threading
 
 import httpx
 import pytest
+from test_helpers.utils import skip_if_trio
 
 
 def _worker_threads() -> int:
@@ -733,39 +734,77 @@ async def test_404_body_shape_distinguishes_missing_route(
 
 
 def test_resolve_ctl_server_values() -> None:
-    """The ``ctl_server`` param resolves to ``(enabled, keep_alive)``.
+    """The ``ctl_server`` param resolves to ``(enabled, keep_alive, park_idle_timeout)``.
 
     ``None`` and ``True`` are the default-on shape, ``False`` disables,
-    ``"keep"`` enables + parks. The CLI string spellings are accepted
-    case-insensitively so programmatic callers can forward a flag or
-    ``INSPECT_EVAL_CTL_SERVER`` env value verbatim. Any other string is
-    rejected rather than silently treated as ``True`` — it's more likely a
-    typo of ``keep``, and dropping the requested park would strand the
-    user.
+    ``"keep"`` enables + parks (with the default idle timeout). The CLI
+    string spellings are accepted case-insensitively so programmatic
+    callers can forward a flag or ``INSPECT_EVAL_CTL_SERVER`` env value
+    verbatim. Any other string is rejected rather than silently treated as
+    ``True`` — it's more likely a typo of ``keep``, and dropping the
+    requested park would strand the user.
+    """
+    from inspect_ai._control.server import (
+        DEFAULT_PARK_IDLE_TIMEOUT,
+        resolve_ctl_server,
+    )
+    from inspect_ai._util.error import PrerequisiteError
+
+    default = DEFAULT_PARK_IDLE_TIMEOUT
+    assert resolve_ctl_server(None) == (True, False, None)
+    assert resolve_ctl_server(True) == (True, False, None)
+    assert resolve_ctl_server(False) == (False, False, None)
+    assert resolve_ctl_server("keep") == (True, True, default)
+    # `keep-alive` is still accepted as a legacy alias for `keep`
+    assert resolve_ctl_server("keep-alive") == (True, True, default)
+
+    # CLI / env-var spellings forwarded verbatim
+    assert resolve_ctl_server("true") == (True, False, None)
+    assert resolve_ctl_server("yes") == (True, False, None)
+    assert resolve_ctl_server("1") == (True, False, None)
+    assert resolve_ctl_server("false") == (False, False, None)
+    assert resolve_ctl_server("no") == (False, False, None)
+    assert resolve_ctl_server("0") == (False, False, None)
+    assert resolve_ctl_server("TRUE") == (True, False, None)
+    assert resolve_ctl_server("KEEP") == (True, True, default)
+    assert resolve_ctl_server("Keep-Alive") == (True, True, default)
+
+    with pytest.raises(PrerequisiteError, match="keepalive"):
+        resolve_ctl_server("keepalive")
+
+
+def test_resolve_ctl_server_keep_idle_timeout_grammar() -> None:
+    """``keep:<idle>`` tunes the park idle timeout; ``keep:forever`` disables it.
+
+    Durations accept s/m/h/d suffixes or bare seconds; ``keep:0`` is
+    rejected (ambiguous between "release immediately" and "never" — the
+    opt-out is spelled ``forever``), as is a malformed duration.
     """
     from inspect_ai._control.server import resolve_ctl_server
     from inspect_ai._util.error import PrerequisiteError
 
-    assert resolve_ctl_server(None) == (True, False)
-    assert resolve_ctl_server(True) == (True, False)
-    assert resolve_ctl_server(False) == (False, False)
-    assert resolve_ctl_server("keep") == (True, True)
-    # `keep-alive` is still accepted as a legacy alias for `keep`
-    assert resolve_ctl_server("keep-alive") == (True, True)
+    assert resolve_ctl_server("keep:4h") == (True, True, 4 * 3600.0)
+    assert resolve_ctl_server("keep:30m") == (True, True, 1800.0)
+    assert resolve_ctl_server("keep:2d") == (True, True, 2 * 86400.0)
+    assert resolve_ctl_server("keep:90s") == (True, True, 90.0)
+    assert resolve_ctl_server("keep:7200") == (True, True, 7200.0)
+    assert resolve_ctl_server("keep:forever") == (True, True, None)
+    assert resolve_ctl_server("KEEP:4H") == (True, True, 4 * 3600.0)
+    # the legacy alias accepts the suffix too
+    assert resolve_ctl_server("keep-alive:4h") == (True, True, 4 * 3600.0)
 
-    # CLI / env-var spellings forwarded verbatim
-    assert resolve_ctl_server("true") == (True, False)
-    assert resolve_ctl_server("yes") == (True, False)
-    assert resolve_ctl_server("1") == (True, False)
-    assert resolve_ctl_server("false") == (False, False)
-    assert resolve_ctl_server("no") == (False, False)
-    assert resolve_ctl_server("0") == (False, False)
-    assert resolve_ctl_server("TRUE") == (True, False)
-    assert resolve_ctl_server("KEEP") == (True, True)
-    assert resolve_ctl_server("Keep-Alive") == (True, True)
-
-    with pytest.raises(PrerequisiteError, match="keepalive"):
-        resolve_ctl_server("keepalive")
+    with pytest.raises(PrerequisiteError, match="ambiguous"):
+        resolve_ctl_server("keep:0")
+    with pytest.raises(PrerequisiteError, match="idle timeout"):
+        resolve_ctl_server("keep:4hours")
+    with pytest.raises(PrerequisiteError, match="idle timeout"):
+        resolve_ctl_server("keep:")
+    # values beyond the bound reject cleanly — regression: an unbounded
+    # grammar crashed with OverflowError converting a huge int to float
+    with pytest.raises(PrerequisiteError, match="maximum"):
+        resolve_ctl_server("keep:2000000000")
+    with pytest.raises(PrerequisiteError, match="maximum"):
+        resolve_ctl_server("keep:" + "9" * 400)
 
 
 def test_control_server_disabled_binds_nothing(
@@ -1094,6 +1133,286 @@ def test_start_advertises_api_version_in_discovery(
         asyncio.run(run())
     finally:
         shutil.rmtree(dirpath, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Park idle timeout
+# ---------------------------------------------------------------------------
+
+
+def test_park_idle_timeout_expiry_releases() -> None:
+    """A parked process auto-releases after the idle window with no activity.
+
+    The expiry goes through the same latch as ``POST /release`` (intent off,
+    identical teardown) and records ``"idle_timeout"`` as the cause, which
+    the park sites surface on stderr and the ``done`` record.
+    """
+    from inspect_ai._control.server import (
+        ControlServer,
+        keep_alive_intent,
+        park_release_reason,
+        request_keep_alive,
+        reset_keep_alive,
+        set_park_timeout_override,
+        wait_for_shutdown_async,
+    )
+
+    reset_keep_alive()
+    try:
+        request_keep_alive()
+        set_park_timeout_override(0.2)
+
+        async def scenario() -> None:
+            await asyncio.wait_for(
+                wait_for_shutdown_async(ControlServer(run_id="test")), timeout=10
+            )
+
+        asyncio.run(scenario())
+        assert park_release_reason() == "idle_timeout"
+        assert keep_alive_intent() is False
+    finally:
+        reset_keep_alive()
+
+
+def test_park_activity_resets_idle_clock() -> None:
+    """Control-channel activity during the park pushes the deadline out.
+
+    The park must not release before ``last activity + timeout``: activity
+    stamped mid-wait re-arms the window, so the release lands (at least) a
+    full window after the *last* activity, not the park's start.
+    """
+    import time as time_mod
+
+    from inspect_ai._control.server import (
+        ControlServer,
+        note_control_activity,
+        park_release_reason,
+        request_keep_alive,
+        reset_keep_alive,
+        set_park_timeout_override,
+        wait_for_shutdown_async,
+    )
+
+    reset_keep_alive()
+    try:
+        request_keep_alive()
+        set_park_timeout_override(0.5)
+
+        async def scenario() -> float:
+            park = asyncio.ensure_future(
+                wait_for_shutdown_async(ControlServer(run_id="test"))
+            )
+            await asyncio.sleep(0.3)
+            # what the ASGI middleware does on every request
+            note_control_activity()
+            stamped = time_mod.time()
+            await asyncio.wait_for(park, timeout=10)
+            return time_mod.time() - stamped
+
+        elapsed_since_activity = asyncio.run(scenario())
+        # 0.45 rather than 0.5: tolerate clock granularity, not semantics
+        assert elapsed_since_activity >= 0.45
+        assert park_release_reason() == "idle_timeout"
+    finally:
+        reset_keep_alive()
+
+
+def test_park_release_beats_idle_timeout() -> None:
+    """An explicit release wakes a park long before its idle deadline."""
+    from inspect_ai._control.server import (
+        ControlServer,
+        park_release_reason,
+        request_keep_alive,
+        request_release,
+        reset_keep_alive,
+        set_park_timeout_override,
+        wait_for_shutdown_async,
+    )
+
+    reset_keep_alive()
+    try:
+        request_keep_alive()
+        set_park_timeout_override(3600)
+
+        async def scenario() -> None:
+            server = ControlServer(run_id="test")
+            park = asyncio.ensure_future(wait_for_shutdown_async(server))
+            await asyncio.sleep(0.05)
+            request_release()
+            await server.notify_park_change()
+            await asyncio.wait_for(park, timeout=5)
+
+        asyncio.run(scenario())
+        assert park_release_reason() == "released"
+    finally:
+        reset_keep_alive()
+
+
+def test_release_before_park_still_records_reason() -> None:
+    """A release that lands before the park still stamps the done record's cause.
+
+    "Exit when done": the park is skipped entirely (intent off at the gate),
+    so the reason must be recorded at the release latch itself — a --json
+    consumer keying on ``released`` to confirm the keep run was deliberately
+    ended (vs crashed) would otherwise misclassify an operator release.
+    """
+    from inspect_ai._control.server import (
+        park_release_reason,
+        request_keep_alive,
+        request_release,
+        reset_keep_alive,
+    )
+
+    reset_keep_alive()
+    try:
+        request_keep_alive()
+        request_release()  # mid-run: exit when done, no park will run
+        assert park_release_reason() == "released"
+
+        # a release with no keep held records nothing (nothing was released)
+        reset_keep_alive()
+        request_release()
+        assert park_release_reason() is None
+    finally:
+        reset_keep_alive()
+
+
+def test_park_forever_never_times_out() -> None:
+    """``keep:forever`` (a None launch timeout) parks with no deadline."""
+    from inspect_ai._control.server import (
+        ControlServer,
+        park_deadline,
+        request_keep_alive,
+        request_release,
+        reset_keep_alive,
+        set_park_idle_timeout,
+        wait_for_shutdown_async,
+    )
+
+    reset_keep_alive()
+    try:
+        request_keep_alive()
+        set_park_idle_timeout(None)
+
+        async def scenario() -> None:
+            server = ControlServer(run_id="test")
+            park = asyncio.ensure_future(wait_for_shutdown_async(server))
+            await asyncio.sleep(0.2)
+            assert not park.done()
+            assert park_deadline() is None  # parked, but no deadline to show
+            request_release()
+            await server.notify_park_change()
+            await asyncio.wait_for(park, timeout=5)
+
+        asyncio.run(scenario())
+    finally:
+        reset_keep_alive()
+
+
+async def test_park_timeout_config_knob() -> None:
+    """PATCH /config park_timeout sets/clears the runtime override.
+
+    The view's ``park`` section reports the effective window, the active
+    override, and (while parked) the deadline; setting the knob while
+    keep-alive is off warns that nothing will park. 0 and junk are 400s —
+    0 is ambiguous between "release immediately" and "never".
+    """
+    from inspect_ai._control.server import (
+        DEFAULT_PARK_IDLE_TIMEOUT,
+        ControlServer,
+        reset_keep_alive,
+    )
+
+    reset_keep_alive()
+    try:
+        app = ControlServer(run_id="test")._build_app()
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://localhost"
+        ) as client:
+            # the default view: no override, default window, not parked
+            park = (await client.get("/config")).json()["park"]
+            assert park == {
+                "timeout": DEFAULT_PARK_IDLE_TIMEOUT,
+                "override": None,
+                "keep_alive": False,
+                "deadline": None,
+            }
+
+            # set an override (keep-alive off → warned, still applied)
+            body = (await client.patch("/config", params={"park_timeout": 7200})).json()
+            assert body["park"]["timeout"] == 7200
+            assert body["park"]["override"] == 7200
+            assert any("keep-alive is off" in w for w in body["warnings"])
+
+            # clear restores the launch value / default
+            body = (
+                await client.patch("/config", params={"park_timeout": "clear"})
+            ).json()
+            assert body["park"]["timeout"] == DEFAULT_PARK_IDLE_TIMEOUT
+            assert body["park"]["override"] is None
+
+            # dry run reports without applying
+            body = (
+                await client.patch(
+                    "/config", params={"park_timeout": 600, "dry_run": True}
+                )
+            ).json()
+            assert body["requested"]["park_timeout"] == 600
+            assert body["park"]["override"] is None
+
+            # 0 and junk are rejected
+            for bad in ("0", "-5", "abc"):
+                response = await client.patch("/config", params={"park_timeout": bad})
+                assert response.status_code == 400, bad
+                assert "park_timeout" in response.json()["error"]
+    finally:
+        reset_keep_alive()
+
+
+@skip_if_trio  # spawns the park with asyncio.ensure_future
+async def test_tasks_rows_carry_park_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GET /tasks stamps rows with the park auto-release deadline while parked."""
+    from inspect_ai._control import server as server_mod
+    from inspect_ai._control.server import (
+        ControlServer,
+        request_keep_alive,
+        request_release,
+        reset_keep_alive,
+        wait_for_shutdown_async,
+    )
+
+    async def _one_row(started_at: float) -> list[dict]:
+        return [{"task_id": "a"}]
+
+    monkeypatch.setattr(server_mod, "current_eval_summaries", _one_row)
+
+    reset_keep_alive()
+    try:
+        server = ControlServer(run_id="test")
+        app = server._build_app()
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://localhost"
+        ) as client:
+            # not parked (eval notionally running): no deadline
+            rows = (await client.get("/tasks")).json()
+            assert rows[0]["park_deadline"] is None
+
+            # parked with the default timeout: a live deadline
+            request_keep_alive()
+            park = asyncio.ensure_future(wait_for_shutdown_async(server))
+            await asyncio.sleep(0.05)
+            rows = (await client.get("/tasks")).json()
+            assert rows[0]["park_deadline"] is not None
+
+            request_release()
+            await server.notify_park_change()
+            await asyncio.wait_for(park, timeout=5)
+    finally:
+        reset_keep_alive()
 
 
 # ---------------------------------------------------------------------------

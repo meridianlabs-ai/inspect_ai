@@ -593,7 +593,7 @@ This works because in the common case `eval_set` is *also* a single `eval()` cal
 
 **Failure modes worth naming.**
 
-- **Forgotten release.** Agent crashes / loses track of the pid. The process lingers indefinitely. Mitigation: a future idle timeout on the park could auto-shutdown after N minutes. Not in v1; tracked as [meridianlabs-ai/inspect_ai#227](https://github.com/meridianlabs-ai/inspect_ai/issues/227).
+- **Forgotten release.** Agent crashes / loses track of the pid. Mitigated: the park auto-releases after an idle timeout (default 24h with no control-channel activity; `keep:<idle>` / `keep:forever` at launch, `ctl config --park-timeout` at runtime) — see [park-idle-timeout.md](park-idle-timeout.md) ([meridianlabs-ai/inspect_ai#227](https://github.com/meridianlabs-ai/inspect_ai/issues/227)).
 - **Multiple lingering processes.** Several agents each run their own keep-alive eval. `inspect ctl process release` with no args errors and lists pids; the agent disambiguates by passing the `PID`.
 - **External kill.** Operator kills the process while keep-alive is active. The discovery file is left behind; the next `prepare_discovery_dir` sweep picks it up and removes it (pid-liveness check fails).
 - **`retry_immediate=False` + keep-alive.** Rejected at startup with a clear error rather than silently giving a broken keep-alive experience.

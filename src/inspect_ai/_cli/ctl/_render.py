@@ -8,11 +8,14 @@ from __future__ import annotations
 
 import json as json_lib
 import re
+import time
 from collections.abc import Sequence
 from datetime import datetime, timezone
 from typing import Any
 
 import click
+
+from inspect_ai._util.format import format_duration_compact
 
 from ._knobs import _KNOB_SCOPE
 
@@ -233,6 +236,46 @@ def _print_config(config: dict[str, Any], *, changed: bool) -> None:
         )
     elif process_scope:
         _echo(_knob_label("shared sync", "log_shared") + _PER_TASK_PLACEHOLDER)
+
+    # The park idle-timeout knob (absent from an older server's view —
+    # skipped then, like the retry knobs). The effective window plus, while
+    # actually parked, the live auto-release countdown — a timeout nobody
+    # can see reads as a crash when it fires.
+    park = knobs.get("park_timeout")
+    if park is not None:
+        park_timeout = park.get("timeout")
+        rendered = (
+            "forever"
+            if park_timeout is None
+            else f"{format_duration_compact(float(park_timeout))} idle"
+        )
+        if park.get("override") is not None:
+            rendered += " (override)"
+        # dry-run arrow, suppressed for a no-op like the sibling knobs'
+        # _target (a set matching the effective window, or a clear with no
+        # override to remove)
+        proposed = requested.get("park_timeout")
+        no_op = (
+            proposed == "clear"
+            and park.get("override") is None
+            or isinstance(proposed, (int, float))
+            and proposed == park_timeout
+        )
+        if proposed is not None and not no_op:
+            rendered += " → " + (
+                "launch value"
+                if proposed == "clear"
+                else f"{format_duration_compact(float(proposed))} idle"
+            )
+        # an armed-looking window on a process that will never park misleads
+        # — the server stamps keep_alive exactly to disambiguate this
+        if park.get("keep_alive") is False:
+            rendered += " (inactive — keep-alive is off)"
+        park_deadline = park.get("deadline")
+        if park_deadline is not None:
+            countdown = format_duration_compact(float(park_deadline) - time.time())
+            rendered += f", parked — auto-release in {countdown}"
+        _echo(_knob_label("park timeout", "park_timeout") + rendered)
 
     for warning in config.get("warnings") or []:
         _echo(f"  ! {warning}")
@@ -785,14 +828,36 @@ def _print_keep_alive_footer(summaries: list[dict[str, Any]]) -> None:
     ``inspect ctl process keep``, which turns it on for a running process.
     """
     flags = [bool(s.get("keep_alive")) for s in summaries]
+    # rows from a parked process carry the auto-release deadline — show the
+    # soonest as a countdown (in the mixed branch too: the listing spans
+    # processes, and a parked one's deadline must not vanish just because a
+    # keep-off eval is also running) so the timeout is visible before it
+    # fires rather than reading as a crash after
+    deadlines = [
+        float(s["park_deadline"])
+        for s in summaries
+        if s.get("park_deadline") is not None
+    ]
+    countdown = (
+        format_duration_compact(min(deadlines) - time.time()) if deadlines else None
+    )
     _echo()
     if all(flags):
-        _echo("keep-alive: on")
+        if countdown is not None:
+            _echo(
+                f"keep-alive: on  ·  parked — auto-release in {countdown} idle "
+                "(retune with `inspect ctl config --park-timeout`)"
+            )
+        else:
+            _echo("keep-alive: on")
     elif not any(flags):
         _echo("keep-alive: off  ·  set with `inspect ctl process keep`")
     else:
         on = sum(flags)
-        _echo(f"keep-alive: mixed ({on}/{len(flags)} on)")
+        line = f"keep-alive: mixed ({on}/{len(flags)} on)"
+        if countdown is not None:
+            line += f"  ·  a parked process auto-releases in {countdown}"
+        _echo(line)
 
     # flag paused work below the table (the per-row cell can scroll away and
     # a paused run must not read as stalled). A paused run never finishes —
