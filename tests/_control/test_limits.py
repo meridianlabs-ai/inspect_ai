@@ -380,6 +380,35 @@ async def test_process_limits_dry_run_does_not_apply() -> None:
     assert ctrl.max == 100  # unchanged
 
 
+async def test_process_limits_park_timeout_rejects_out_of_domain() -> None:
+    """The store enforces the wire parser's domain (1..MAX) for park_timeout.
+
+    A direct Python caller bypasses the HTTP 400s; without the store-side
+    bound, a value above MAX was silently accepted and a huge int raised an
+    uncontrolled ``OverflowError`` at the ``float()`` conversion.
+    """
+    from inspect_ai._control.limits import process_limits
+    from inspect_ai._control.server import (
+        MAX_PARK_IDLE_TIMEOUT,
+        park_timeout_override,
+        reset_keep_alive,
+    )
+
+    reset_keep_alive()
+    try:
+        for bad in (0, -5, MAX_PARK_IDLE_TIMEOUT + 1, 10**500):
+            with pytest.raises(ValueError, match="park_timeout"):
+                await process_limits(park_timeout=bad)
+            assert park_timeout_override() is None
+        # the bounds themselves are valid
+        result = await process_limits(park_timeout=MAX_PARK_IDLE_TIMEOUT)
+        assert result["park"]["override"] == MAX_PARK_IDLE_TIMEOUT
+        result = await process_limits(park_timeout=1)
+        assert result["park"]["override"] == 1
+    finally:
+        reset_keep_alive()
+
+
 def test_match_controllers_semantics() -> None:
     """--model matching: name-start or leaf (after '/') prefix, exact wins."""
     from inspect_ai._control.limits import _match_controllers

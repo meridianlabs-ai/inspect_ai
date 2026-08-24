@@ -255,11 +255,8 @@ def _print_config(config: dict[str, Any], *, changed: bool) -> None:
         # _target (a set matching the effective window, or a clear with no
         # override to remove)
         proposed = requested.get("park_timeout")
-        no_op = (
-            proposed == "clear"
-            and park.get("override") is None
-            or isinstance(proposed, (int, float))
-            and proposed == park_timeout
+        no_op = (proposed == "clear" and park.get("override") is None) or (
+            isinstance(proposed, (int, float)) and proposed == park_timeout
         )
         if proposed is not None and not no_op:
             rendered += " → " + (

@@ -1277,6 +1277,32 @@ def test_release_before_park_still_records_reason() -> None:
         reset_keep_alive()
 
 
+def test_rekeep_clears_stale_release_reason() -> None:
+    """A keep following a release clears the recorded release reason.
+
+    The reason is last-write-wins like the intent it describes: after
+    keep -> release -> keep the process is parking again, and if that park
+    then ends without a release (Ctrl+C), the ``done`` record must not stamp
+    the stale ``"released"`` from the overridden release.
+    """
+    from inspect_ai._control.server import (
+        park_release_reason,
+        request_keep_alive,
+        request_release,
+        reset_keep_alive,
+    )
+
+    reset_keep_alive()
+    try:
+        request_keep_alive()
+        request_release()
+        assert park_release_reason() == "released"
+        request_keep_alive()  # last write wins — for the reason too
+        assert park_release_reason() is None
+    finally:
+        reset_keep_alive()
+
+
 def test_park_forever_never_times_out() -> None:
     """``keep:forever`` (a None launch timeout) parks with no deadline."""
     from inspect_ai._control.server import (

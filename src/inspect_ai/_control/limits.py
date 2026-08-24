@@ -827,6 +827,7 @@ def _apply_process_knobs(
     # bare park — has no live eval log to record into. Function-local import:
     # server.py imports this module at module level.
     from inspect_ai._control.server import (
+        MAX_PARK_IDLE_TIMEOUT,
         effective_park_idle_timeout,
         keep_alive_intent,
         park_deadline,
@@ -835,12 +836,14 @@ def _apply_process_knobs(
     )
 
     if park_timeout is not None:
-        # fail loud for a programmatic caller passing 0/negative directly (a
-        # 0 window would release the park on its first loop iteration; the
-        # HTTP route already 400s these before reaching here)
-        if park_timeout != "clear" and park_timeout < 1:
+        # fail loud for a programmatic caller passing an out-of-domain value
+        # directly (a 0 window would release the park on its first loop
+        # iteration; above MAX, float() of a huge int can raise OverflowError;
+        # the HTTP route already 400s both before reaching here)
+        if park_timeout != "clear" and not 1 <= park_timeout <= MAX_PARK_IDLE_TIMEOUT:
             raise ValueError(
-                f"park_timeout must be >= 1 second or 'clear' (got {park_timeout})"
+                f"park_timeout must be between 1 and {MAX_PARK_IDLE_TIMEOUT} "
+                f"seconds or 'clear' (got {park_timeout})"
             )
         requested["park_timeout"] = park_timeout
         if not dry_run:

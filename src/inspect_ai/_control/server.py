@@ -274,9 +274,16 @@ _keep_alive = False
 
 
 def request_keep_alive() -> None:
-    """Latch keep-alive on — the process parks after the eval finishes."""
-    global _keep_alive
+    """Latch keep-alive on — the process parks after the eval finishes.
+
+    Like the intent itself, the recorded release reason is last-write-wins:
+    re-keeping clears a reason stamped by an earlier release, so a re-kept
+    park that later ends without a release (Ctrl+C) doesn't report a stale
+    ``"released"`` in the ``done`` record.
+    """
+    global _keep_alive, _park_release_reason
     _keep_alive = True
+    _park_release_reason = None
 
 
 def request_release() -> None:
