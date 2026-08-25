@@ -870,7 +870,7 @@ The `concurrency()` registry is a public API, and per-knob CLI flags will never 
 
 #### Add a task to a running eval
 
-`POST /tasks` (CLI: `inspect ctl task add SPEC [...]`) submits a **task spec** that runs in the target process under the same `run_id`, appearing as a new sibling eval in `task list` / `sample list` / `sample events`. Returns the new `eval_id`.
+`POST /tasks` (CLI: `inspect ctl task add SPEC [...]`) submits a **task spec** that runs in the target process under the same `run_id`, appearing as a new sibling eval in `task list` / `sample list` / `sample events`. [`task-add.md`](task-add.md) owns the full design (accept/reject semantics, the park drain loop, idempotency, identity) and supersedes the sketch below where they differ — notably the response returns the stable `task_id` rather than an `eval_id`, and the pre-started-workers bullet is obsolete (the current dispatcher's wake/feed loop dispatches injected work on free capacity without a worker pool).
 
 **A spec, not a `Task`.** The wire is HTTP/JSON; a `Task` carries code (solvers, scorers, dataset). So the directive carries a *spec* — registry name or file path, `-T` task args, model, config / limit overrides — which the running process resolves in-process via the registry, exactly as `inspect eval <name>` does at launch. A task the process can't resolve (not importable in its environment) fails with a clear error; `--dry-run` surfaces that before committing.
 

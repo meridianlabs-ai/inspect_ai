@@ -1,0 +1,172 @@
+# Task Add (`inspect ctl task add`)
+
+> **Status: design.** Companion to [`control-channel.md`](control-channel.md), which owns the control-channel architecture and pins this directive's surface (the phase-3 endpoint table, the CLI hierarchy, and the "Add a task to a running eval" sketch this doc elaborates); this doc owns the add semantics and the eval-runner/park changes it needs. Originating issue: meridianlabs-ai/inspect_ai#222.
+
+There is no way to add a task to a running eval process from outside it: the task set is fixed at launch, so feeding new work to a warm process (sandboxes provisioned, models and their connection pools warmed, a `--ctl-server=keep` park held open) requires starting a whole new `inspect eval` run. **Task add** submits a *task spec* to the target process over the control channel; the spec resolves in-process and runs under the same `run_id`, appearing as a new sibling eval in `task list` / `sample list` / `sample events`, with its own log file in the run's `log_dir`.
+
+The in-process half already exists: `enqueue_task()` (`_eval/task/enqueue.py`) lets code running inside the eval add tasks to the live run, and the dispatcher (`run_task_retry_attempts` in `_eval/run.py`) accepts a live injection feed. This directive is the *external* surface over that machinery — a spec instead of a `Task` object (the wire is HTTP/JSON), a process-global capability instead of a ContextVar, and a park that can relaunch a scheduler session so an add still works after the run has drained.
+
+## Scenarios
+
+- **Agent feeding a warm process.** An LLM agent launched `inspect eval my_task --model M --ctl-server=keep --detach`, watched it drain, and now — based on the results — wants to run a variant (`-T difficulty=hard`) without re-paying process startup, model warm-up, and (within a session) sandbox provisioning. `inspect ctl task add` submits it; `task list` picks up the new task immediately.
+- **Park-and-feed batch workflows.** A parked keep-alive process as a lightweight job target: a script (or human) submits tasks over hours as upstream work becomes available, each add waking the park, running, and returning to it. All results land in one `log_dir` under one `run_id`.
+- **Incremental exploration.** A human runs a task, inspects the live results (`ctl sample list`, `inspect view`), and adds a follow-up configuration mid-run — today this means a second terminal, a second process, and a second set of sandboxes.
+- **The external counterpart of `TaskSource`.** `TaskSource` / `enqueue_task` drive a run dynamically *from code inside the process* (an RL loop spawning tasks from scores). Task add is the same capability for consumers outside the process — the control-channel shape of the same enqueue machinery, so the two compose (an add lands in the same dispatcher a source feeds).
+
+## Surface
+
+Exactly as pinned by `control-channel.md` (endpoint table and CLI hierarchy):
+
+- **`POST /tasks`** — the creation verb on the collection the read surface already serves (`GET /tasks` is the task listing; same path, different method). Unlike the other phase-3 mutations, the parameters ride a **JSON body**, not query params: `-T` task args are an arbitrary `k: v` map, which query params can't carry without inventing an encoding. Body shape:
+
+  ```json
+  {
+    "spec": "arc.py@arc_easy",          // registry name or (absolute) file path, @task selector optional
+    "task_args": {"difficulty": "hard"}, // optional, the -T map
+    "model": "openai/gpt-5",            // optional, defaults to the run's launch model(s)
+    "request_id": "…uuid…",             // optional, idempotency key (see below)
+    "dry_run": false
+  }
+  ```
+
+  The strict-mutations dependency (`_control/strict.py`) derives its allowed set from query params; a body-carried mutation instead validates the body against a pydantic model, which rejects unknown fields with a 400 — the same fail-loud contract by a different mechanism.
+
+- **CLI: `inspect ctl task add SPEC [--model M] [-T k=v]... [--dry-run] [--json] [--pid PID]`.** `SPEC` uses exactly the `inspect eval` spelling (registry name, or file path with optional `@task` selector); `-T` values parse client-side with the same YAML-ish parse `inspect eval -T` uses, so the two surfaces can't drift. The target is a *process*, not an existing task, so there is no positional task selector; per the selector conventions (`control-channel.md`), the mutation rule applies to the process choice — sole *addable* process (keep intent on) is the default, several running → error with the candidate list and `--pid` disambiguates (the "other objects' ids are flags" rule).
+- **Response** rides the uniform mutation envelope `{target, applied, dry_run, detail}`. `detail` carries the resolved identity available at accept time: `task_id`, task name, model(s), sample count, epochs — see "Identity" below for why `task_id` (not `eval_id`) is the returned handle.
+- **Errors** use the structured `{"error": {kind, exception, message, status}}` contract: an unresolvable spec / bad `-T` arg / unknown model is `invalid_request` (400) with the resolution error's message folded in; a non-addable process is a 409.
+- **No `CONTROL_API_VERSION` gate.** New route: an older server answers the stock `{"detail": "Not Found"}` 404, distinguishable from a handler's `{"error": ...}` 404, so the CLI passes a route-missing message to `_request_json(..., not_found_missing_route=...)` and reports "older inspect — restart the eval" definitively (the `sample requeue` precedent).
+
+## A spec, not a `Task`
+
+The wire is HTTP/JSON; a `Task` carries code (solvers, scorers, dataset). So the directive carries a **spec** — registry name or file path, `-T` task args, an optional model — which the running process resolves via the registry exactly as `inspect eval <spec>` does at launch (`resolve_tasks` in `_eval/loader.py`, reached through the run's enqueue-resolution closure `_resolve_enqueued_tasks`). Consequences worth stating:
+
+- **The spec must be resolvable in the server process's environment.** A registry name must be importable there; a file path must exist there. The CLI resolves a file-path spec to an **absolute path client-side** before sending — the server's cwd is the launch cwd, not the ctl client's, and a relative path would silently resolve against the wrong directory (or fail confusingly). A spec the process can't resolve fails with a clear 400; `--dry-run` surfaces that before committing.
+- **`-T` args type-check through the task's registry signature**, as at launch. Unconsumed/unknown args error rather than warn (an interactive launch can tolerate a warning; a remote add's caller sees only the response).
+- **`--model` resolves in-process via `get_model`**, so the server process must hold that provider's credentials — true of the launch models by construction, not necessarily of a new one; a credential failure is a 400 at accept, not a task error later (the resolution path constructs the `Model`, which validates credentials eagerly where the provider supports it). Without `--model`, the add resolves against **every launch model** — one added task per model — matching both `inspect eval` multi-model semantics and what `enqueue_task` already does (`_resolve_enqueued_tasks` loops the run's models).
+- **Config inheritance.** The added task resolves against the run's launch `GenerateConfig` and eval config, with the task's own attributes merged per the normal precedence (`prepare_options` in `_eval/run.py`) — an add is "the same launch, one more task", not a new launch. Per-add *config overrides* beyond `-T`/`--model` are deliberately out of v1: the retunable knobs are already reachable via `ctl config` once the task is running, and the launch-fixed ones are fixed for the run's siblings too — a per-add carve-out would create tasks the log's shared launch config misdescribes. If demand appears, that's a follow-up with its own log-recording story (`config-log-persistence.md`).
+- **Resolution runs on the eval's loop** (registry imports, task construction, dataset load — user code). The route resolves synchronously in the handler, so a slow dataset load blocks control reads for its duration — the same class of stall the busy-narration machinery already covers ("pid N busy — try again shortly"), and no worse than what launch itself pays. Resolution can't move off-loop: it mutates the active-model/config ContextVars (`_resolve_enqueued_tasks` runs in a copied context for exactly that reason) and user task code may touch loop-bound state.
+
+**`--dry-run`** resolves and validates the spec (importable, `-T` args accepted, model constructible) and reports what *would* run — task name, model(s), sample count, epochs — without minting identity, creating a log, buffering the task, or starting sandboxes. All the reject rows below report their error under dry-run too, so an agent can probe safely.
+
+## Addability: coupled to keep
+
+A normal eval ends when its task set drains — there is no stable window to add to, and an add would race teardown. Task add is therefore a capability of an **addable** run: one whose keep-alive intent is on at accept time (`keep_alive_intent()` in `_control/server.py` — the same last-write-wins latch the park gates on, covering both the `--ctl-server=keep` launch flag and a runtime `inspect ctl process keep`). Gating on the *live intent* rather than the launch flag falls out of the latch design and is a feature: an operator who realizes mid-run that they'll want to add work can `ctl process keep` first, then add — no relaunch needed. A process whose intent is off rejects the add with a 409 that says exactly that ("not addable — launch with `--ctl-server=keep`, or run `inspect ctl process keep` while the eval is running").
+
+Why the coupling is load-bearing rather than a convenience: without the park, the run's final drain is unobservable from outside — an add accepted "while running" could land after the dispatcher's last feed check and before teardown, and would be silently lost. The park is what makes acceptance a guarantee: whatever the timing, either the live queue takes the task or the park drains it (next section). An "always addable" variant is considered and rejected below.
+
+**Acceptance creates an obligation that outlives a release.** Keep intent is last-write-wins, so a `ctl process release` can arrive after an add was accepted but before it ran (e.g. the add is buffered in the handoff window). The accepted task must still run: the park-entry gate widens from `keep_alive_intent()` to `keep_alive_intent() or pending-adds`, and the park loop drains buffered adds *before* honoring a release. A release received while an added session runs simply means the process exits when that session drains (the intent is off, so it doesn't re-park). The inverse race — release wins, park skipped, buffered add dropped — is exactly what the widened gate exists to prevent.
+
+## Two add paths, one discriminator
+
+"Are tasks currently running?" is exactly "is the live work-queue open?", and the queue-closed transition is the running→parked handoff — so the two paths can't both fire, and an add landing *during* the handoff is buffered and drained by the park. The single buffer is the run's existing `TaskEnqueuer` (`_eval/task/enqueue.py`): the accept path resolves the spec and calls `enqueuer.enqueue(...)`, whose buffer both the live dispatcher (`feed.drain()`) and the park drain. One buffer, two consumers, no add lost regardless of timing.
+
+### Inject — tasks running
+
+The dispatcher already supports live injection: `run_task_retry_attempts` takes a `PreparedFeed` whose `drain()` it polls on every wake, and `TaskEnqueuer.on_enqueue` fires the dispatch waker — an injected task starts as soon as there is free capacity, honoring the `parallel` cap, model balancing, `task_retry_attempts`, and the pause latches (`pick_balanced` checks `task_dispatch_paused`, so an add against a paused run is accepted and held at dispatch — it runs on resume, consistent with requeue-while-paused).
+
+What changes: today the feed is only wired when `task_source is not None and parallel > 1` (`eval_async`'s injection branch); otherwise the run takes the `run_batches` path, where `enqueue_task` additions run as a *follow-up batch* after every in-flight task completes. For an addable run that batch boundary is wrong at `parallel > 1` — an add would idle behind unrelated siblings for no reason — so **an addable run wires the injection feed whenever `parallel > 1`, TaskSource or not** (a feed whose `next()` returns `None` immediately preserves fixed-set completion semantics: the run still drains when nothing is pending, nothing is in flight, and the source is exhausted). At `parallel == 1` nothing runs concurrently and `run_batches`' sequence grouping must be preserved, so adds keep the existing follow-up-batch semantics there — same wall-clock either way. Since keep intent can latch on mid-run (a runtime `ctl process keep`), and the feed must be chosen at `eval_run` entry, the feed is wired for every `parallel > 1` run — it is dormant (drains nothing) unless something enqueues, so this costs nothing and removes a mode split.
+
+The earlier sketch in `control-channel.md` pre-started `parallel` workers so an injected task could run immediately; the current dispatcher (post `run_single`/`run_multiple` merge) needs no worker pool — it `start_soon`s per task under an in-flight cap and re-evaluates dispatch on every wake, so injection-on-free-capacity falls out. That bullet is superseded by this doc.
+
+### Restart — parked
+
+The run has drained; the process sits in the keep-alive park (`wait_for_shutdown_async` → `ControlServer.wait_for_release`). The park gains a second wake source and a drain arm:
+
+```
+while True:
+    pending = enqueuer.drain()
+    if pending:
+        logs.extend(await run_batches(pending))   # a fresh scheduler session, same run_id
+        continue                                   # re-check: adds may have landed while running
+    if not keep_alive_intent():
+        break                                      # released (and nothing buffered) — exit the park
+    await wait_for_release_or_add()                # woken by POST /release or an accepted add
+```
+
+- The park's existing wake event (`notify_park_change`, today fired only by `POST /release`) is also fired by the accept path (`enqueuer.on_enqueue`), widening the wake condition from "release" to "release or add".
+- Each drained batch runs through the same `run_batches` machinery as the original body — a fresh `eval_run`, which opens its own task display, prepares options (logger init, incremental sandbox startup), and dispatches. Same `run_id` (the enqueuer is run-scoped and validates it), so the new task registers as a sibling of the originals; the `EvalState` registry is cleared only at the outermost run boundary *after* the park (`reset_run_registries` in `eval_async`'s `finally`), so prior tasks stay visible in `task list` alongside the added one throughout.
+- On drain the loop re-parks (re-printing the park notice so an attached human sees the state), and the accumulated `logs` keep growing — so the `done` record a `--json`/`--detach` consumer reads at exit covers added tasks too, and the function's return value stays complete for programmatic callers.
+- The park stays where it is today (after the eval body, control/ACP servers still bound); it just gains the ability to relaunch a session. The eval-set park is out of scope (see Scope).
+
+### Identity, logging, and the read surface
+
+The added task joins the existing `run_id` with a fresh `task_id` / `eval_id` and its own log file in the run's `log_dir` — `prepare_options` creates its `TaskLogger` exactly as at launch, and it `register_eval`s like any task, so the read surface (`task list`, `sample list`, `sample events`, `ctl config`) covers it with no special-casing.
+
+**The response returns `task_id`, not `eval_id`** (a deliberate deviation from the issue sketch). Two reasons. Mechanically: `task_id` is minted at spec resolution (`ResolvedTask.id`) and is in hand when the accept path returns, whereas `eval_id` is minted at logger init inside the run loop — after the route has responded on the inject path, and potentially long after on the park path (identity-at-accept would mean moving logger init into the route, dragging log I/O and its failure modes into the accept window). Semantically: `task_id` is the selector the entire ctl surface takes ("commands take a task selector, not a raw eval-id" — it is stable across retries, which the added task participates in like any other). The agent's next step is `ctl sample list <task_id>` either way; the task's `eval_id` and `log_location` appear on its `task list` row as soon as it registers.
+
+### Idempotency: `request_id`
+
+Task add is a *creation* verb — two identical adds legitimately mean two task runs (an operator adding the same benchmark twice on purpose), so status-based idempotence (the requeue model) doesn't apply. But agent shape constraint 4 (`control-channel.md`) exists because agents retry on confusion — a timeout on the response must not risk a duplicate task. The body therefore carries an optional client-generated **`request_id`**: the server keeps a per-run map of seen ids to their accept results; a repeat returns the original result with `changed: false` instead of enqueueing again. The CLI mints a uuid per invocation and always sends it (its own transport-level retries are then safe by construction); raw API callers opt in. The map is in-memory and run-scoped like every control intent — a process restart forgets it, which is honest (the task it deduplicated is gone too).
+
+## Semantics: when is an add accepted
+
+The decision table, evaluated at accept time on the eval's loop (single-loop synchronicity — no await between check and enqueue — makes the checks race-free, the same argument as requeue's accept path):
+
+| Process state | Result | Why |
+|---|---|---|
+| queue open (dispatcher running), keep intent on | **applied** — inject | The headline live path. |
+| parked (body drained, park held) | **applied** — buffered; park wakes and restarts a session | The headline warm-process path. |
+| handoff window (queue closing, park not yet entered) | **applied** — buffered; park drains on entry | The buffer is the same either way; the discriminator only decides who consumes it. |
+| keep intent off | **409** | Not addable — no stable window; the error names both fixes (`--ctl-server=keep` at launch, `ctl process keep` at runtime). |
+| eval-set process | **409** | Later increment (see Scope); the error says to add against a standalone eval. |
+| run cancelled / tearing down (ctrl+c, external cancellation ending the run) | **409** | Cancellation wins: the park is skipped on the exception path, so acceptance could not be honored. The accept path checks the run's cancelled/tearing-down state; an add that slipped in just before ctrl+c is dropped with the run (see Failure modes). |
+| spec unresolvable / bad `-T` / model error | **400** (`invalid_request`) | Resolution failed; nothing was enqueued. Dry-run reports the same error. |
+| duplicate `request_id` | **no-op** (`changed: false`, original result echoed) | Idempotency for retrying agents (above). |
+
+## Runner mechanics
+
+What exists, and the delta this directive needs:
+
+**Already shipped (prerequisites, per the issue):**
+
+- The single `run_task_retry_attempts` dispatcher with the `PreparedFeed` injection contract and the `Wake`-driven dispatch loop (`_eval/run.py`) — the `run_single`/`run_multiple` split is gone, so the inject path is uniform.
+- `TaskEnqueuer` / `enqueue_task` / `_resolve_enqueued_tasks` (`_eval/task/enqueue.py`, `_eval/eval.py`) — run-scoped resolution and buffering, already consumed by both `run_batches` (batch boundaries) and the injection feed.
+- The keep park (`keep_alive_intent` latch, `wait_for_release`, `notify_park_change`) and the `POST /release` route precedent for signalling the eval's own loop (`_control/server.py`).
+- `SandboxManager` incremental startup (`_eval/run.py`) — `prepare_options` already handles tasks arriving mid-run (image pull/`task_init` for configs not yet started, no-op for warm ones).
+
+**The delta:**
+
+1. **A process-global `AddTask` capability**, registered by `eval_async` alongside the run (mirroring the keep-alive latch and `EvalState.live`'s shape — *not* the enqueuer ContextVar, which is scoped to the eval's async context and only incidentally visible from the server task). It closes over the run's enqueuer, the addability checks (keep intent, eval-set, cancelled), and the `request_id` map; cleared with the other run registries. The route handler validates the body, invokes the capability, and shapes the response — the control layer never reaches into the runner (the `TaskCancel` precedent).
+2. **Feed wiring for every `parallel > 1` run** (dormant unless fed), replacing the `task_source`-only gate in `eval_async`; `parallel == 1` keeps `run_batches` follow-up-batch semantics.
+3. **The park loop** sketched above: drain-adds arm, widened wake condition, widened entry gate (`intent or pending`), log accumulation across sessions.
+4. **Accept-path plumbing:** resolve → (optionally) dedup by `request_id` → enqueue → return `{task_id, ...}`. Resolution and enqueue are synchronous on the eval loop; the expensive preparation (logger init, sandbox startup) stays where it is today, inside `eval_run`'s `prepare_options`, off the request path.
+
+## Failure modes and edges worth naming
+
+- **Add accepted, then ctrl+c before it runs.** The run unwinds on the exception path; the park is never entered and the buffered task is dropped. Honest and consistent with every control intent: acceptance is in-memory only — control state is never persisted; durability belongs to the log layer, and a task that never started has no log. The accept-time cancelled check (table above) narrows this to the genuine race window.
+- **Add accepted, process dies.** Same story: the add is gone. The caller holds a `task_id` that never appears in any log — detectable by its absence from `task list` / the `done` record.
+- **Added task fails to prepare** (logger init fails, sandbox `task_init` fails). The accept already returned success — preparation is deliberately off the request path — so the failure surfaces the same way a launch-time preparation failure does: the run errors / the task gets an errored log, visible on the read surface. The response's `applied: true` means "accepted and scheduled", not "ran"; the doc/help text says so.
+- **Slow resolution starves reads.** Spec resolution (imports, dataset construction) runs on the shared loop; concurrent `ctl` reads ride the existing busy-retry narration. Bounded by the same reality as launch; not worth a thread hop that the ContextVar mutations preclude anyway.
+- **Repeat-add storms** (a confused agent): each *distinct* invocation is a new task by design, but the CLI's always-sent `request_id` makes retries of one invocation safe, and every accept returns the `task_id` so the agent can reconcile against `task list` before adding again.
+- **Sandbox warmth is per-session.** On the inject path an added task shares the live run's `SandboxManager` — warm configs are no-ops, new configs start incrementally, and all cleanups run once at session end. On the restart path each session builds a fresh manager: sandboxes are re-initialized per session, so a parked process is *not* sandbox-warm across sessions (models, connection pools, and adaptive controllers are process-global and stay warm). Keeping sandboxes alive across the park — and, conversely, tearing down a long-lived open-feed session's accumulated per-task resources *before* run end — is the deferred task-teardown cleanup work the issue names, for which open-feed/add-task usage is the trigger; this doc takes the current lifecycle as given.
+- **Security.** Task add is arbitrary-code-execution by design (a file spec is imported and its module-level code runs). This adds no privilege beyond what the transport already grants — the socket lives in a 0700 directory and a same-UID peer can already ptrace or signal the process — but it sharpens the **self-targeting guard** question (an agent running *inside* an eval must not be able to feed tasks to its parent): task add is the strongest argument yet for landing that guard (`security.md`, control-channel open question #8) with, not after, this directive. It otherwise rides the phase-3 hardening (SO_PEERCRED UID check) like every mutation.
+
+## Alternatives considered
+
+- **Serialize a `Task` over the wire** (pickle or a structural encoding). Rejected: code doesn't survive the wire honestly — pickle is an RCE-shaped foot-gun with environment-mismatch failure modes (the client's module versions vs the server's), and a structural encoding can't carry solvers/scorers at all. The registry *is* Inspect's answer to naming code across process boundaries; the spec form reuses it and inherits `inspect eval`'s exact semantics.
+- **Always addable (no keep coupling).** Rejected: without the park there is a window — after the dispatcher's final feed check, before teardown — where an accepted add is silently lost, and "accepted" must mean "will run" (shape constraint: agents act on responses). Narrowing the window isn't enough; the park closes it. The coupling also keeps the failure honest: a non-keep process rejects loudly at accept rather than losing work at teardown.
+- **Hold the queue open under keep instead of park-restart** (a feed whose `next()` blocks while intent is on, making every add an inject and deleting the restart path). Tempting uniformity, rejected: the run body would never finish while parked-in-all-but-name — the task display sits open over nothing, `task list` shows a permanently "running" run, per-run finalization (buffer cleanup, run-end events) is deferred, and the `parallel == 1` path has no feed at all. The shipped park already has the right observable semantics ("eval finished, process parked") and the right lifecycle hooks; teaching it to relaunch a session is a smaller, more honest change than making "running" ambiguous.
+- **Return `eval_id`** (the issue sketch). Rejected in favor of `task_id` — see "Identity" above.
+- **Query-param body.** Rejected: `-T` args are an open map (see Surface).
+
+## Resolved questions
+
+1. **Gate on launch flag or live intent?** Live intent (`keep_alive_intent()` at accept) — the latch already unifies the launch flag and runtime `keep`/`release`, and it makes `ctl process keep` → `ctl task add` a supported mid-run upgrade path.
+2. **Where does an accepted-but-released add go?** It runs: the park-entry gate and drain loop treat buffered adds as an obligation senior to release (release is honored once the buffer is dry).
+3. **Per-add config overrides?** Not in v1 — `-T` and `--model` only (see "A spec, not a `Task`").
+4. **Multi-model adds?** Default = the run's launch models (one task per model, the `enqueue_task` behavior); `--model` narrows to one.
+
+## Scope and increments
+
+**V1: standalone `inspect eval --ctl-server=keep`.** Eval-set is a later increment: it owns its own retry loop and task resolution (`evalset.py` re-derives the task list from logs on every retry pass, so an injected task must join that reconciliation, not just the dispatcher), demotes the inner `eval()`'s keep latch, and parks outside the display — a different set of seams. The 409 for eval-set processes names this explicitly. When it lands, the natural shape is the same capability registered by the eval-set layer, with the added spec folded into the set's task/log identity model so retries and `eval_set_id` grouping cover it.
+
+Also deferred, tracked with their own work: the task-teardown/cross-park sandbox lifecycle (above), and `task drain` (a sibling directive; an addable run makes drain meaningful — stop accepting adds and exit the park when dry — so the two should compose but neither blocks the other).
+
+## Implementation sketch (blast radius)
+
+- `_control/server.py` — the `POST /tasks` route (body model, addability 409s, envelope shaping); park wake widening (`notify_park_change` fired on enqueue).
+- `_control/` (new or `state.py`) — the `AddTask` capability registration + `request_id` map, reset with the run registries.
+- `_eval/eval.py` — register the capability; wire the injection feed for all `parallel > 1` runs; the park drain loop (`run_batches` reuse) and widened entry gate; log accumulation.
+- `_eval/task/enqueue.py` — likely unchanged (the enqueuer is already the buffer); possibly a small hook so the capability can observe "run tearing down".
+- `_cli/ctl/_task.py` — the `add` verb (spec/`-T` parsing shared with `_cli/eval.py`'s helpers, absolute-path resolution, `--pid` targeting, envelope rendering).
+- Tests — accept/reject table, inject vs park-restart vs handoff buffering, release-vs-buffered-add ordering, `request_id` dedup, dry-run, multi-model default, CLI spec parsing parity with `inspect eval`.
