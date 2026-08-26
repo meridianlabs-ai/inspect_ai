@@ -35,6 +35,7 @@ import os
 import re
 import subprocess
 import sys
+from datetime import datetime, timezone
 
 UPSTREAM = "UKGovernmentBEIS/inspect_ai"
 FORK = "meridianlabs-ai/inspect_ai"
@@ -774,6 +775,86 @@ def reflect_companion_loops() -> None:
             )
 
 
+def retrigger_stale_handbacks() -> None:
+    """Revive auto-loop hand-backs whose consumer run died before starting.
+
+    A hand-back is a comment the loop expects an agent run to consume: a
+    bare re-review trigger (the reviewer runs) or a suggestions verdict
+    (a fix round runs). Runner-infra failures at "Set up job" kill the
+    consumer before any of its own backstops exist — nothing posts, no
+    one is cc'd, the loop waits forever (observed: fork PR #324, whose
+    round-3 hand-back's review run died at job setup). Detection is
+    reconciler-shaped: on an open auto-labeled PR, if the last
+    non-counter comment is a continue signal older than STALE_MINUTES
+    with no agent activity after it (and no standing ⚠️, which means a
+    human was already told), post a fresh re-review trigger as the
+    machine account. Idempotent per stall: the reposted trigger becomes
+    the newest comment, and goes stale again only if its run also dies.
+    """
+    STALE_MINUTES = 45
+    try:
+        prs = gh_json(
+            "pr",
+            "list",
+            "--repo",
+            FORK,
+            "--label",
+            "auto",
+            "--state",
+            "open",
+            "--limit",
+            "200",
+            "--json",
+            "number",
+        )
+    except RuntimeError as e:
+        print(f"::warning::stale-handback check: pr list failed: {e}")
+        return
+    now = datetime.now(timezone.utc)
+    for pr in prs:
+        num = pr["number"]
+        try:
+            comments = gh_json(
+                "api",
+                "--paginate",
+                f"repos/{FORK}/issues/{num}/comments?per_page=100",
+                "--jq",
+                "[.[] | {body: .body, ts: .created_at, who: .user.login}]",
+            )
+        except RuntimeError:
+            continue
+        if isinstance(comments, dict):
+            comments = [comments]
+        last = None
+        for c in comments if isinstance(comments, list) else []:
+            body = c.get("body") or ""
+            if "auto-fix-attempts" in body or "auto-review-rounds" in body:
+                continue  # sticky counters, created mid-round — not signals
+            last = c
+        if last is None:
+            continue
+        body = last.get("body") or ""
+        is_continue = (
+            body.strip() == "@" + "review"
+            or "claude-review-verdict:suggestions" in body
+        )
+        if not is_continue or "⚠️" in body:
+            continue
+        ts = datetime.fromisoformat((last.get("ts") or "").replace("Z", "+00:00"))
+        age_min = (now - ts).total_seconds() / 60
+        if age_min < STALE_MINUTES:
+            continue
+        comment(
+            num,
+            "@" + "review — re-triggered by the Atlas sync: the previous "
+            f"hand-back sat unconsumed for {int(age_min)} minutes (its agent "
+            "run likely died before starting). (Atlas sync)",
+        )
+        actions.append(
+            f"PR #{num}: stale hand-back ({int(age_min)}m) -> review re-triggered"
+        )
+
+
 def main() -> int:
     discover()
     for row in board_items():
@@ -785,6 +866,10 @@ def main() -> int:
         reflect_companion_loops()
     except Exception as e:  # noqa: BLE001 — reflection must not break the sync
         print(f"::warning::companion reflection failed: {e}")
+    try:
+        retrigger_stale_handbacks()
+    except Exception as e:  # noqa: BLE001 — revival must not break the sync
+        print(f"::warning::stale-handback check failed: {e}")
 
     print("\n=== Atlas sync summary ===")
     for a in actions or ["no changes"]:
