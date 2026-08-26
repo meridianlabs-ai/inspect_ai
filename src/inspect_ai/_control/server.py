@@ -699,15 +699,10 @@ class ControlServer:
                     dry_run=request.dry_run,
                 )
             except AddTaskInvalid as exc:
+                # covers spec-resolution failures too (add_task wraps them),
+                # and only pre-enqueue failures: a fault after the add was
+                # applied propagates as a 500 rather than a lying 400
                 return JSONResponse(status_code=400, content={"error": str(exc)})
-            except Exception as exc:
-                # spec resolution runs user code (imports, task construction,
-                # dataset load) — anything it raises is a resolution failure,
-                # not a server fault
-                return JSONResponse(
-                    status_code=400,
-                    content={"error": f"could not resolve '{request.spec}': {exc}"},
-                )
             if result["ok"] is False:
                 return JSONResponse(status_code=409, content={"error": result["error"]})
             if result["changed"] and not request.dry_run:

@@ -12,10 +12,11 @@ run (a process-global slot mirroring the keep-alive latch — *not* the
 enqueuer ContextVar, which is scoped to the eval's async context); the
 ``POST /tasks`` route validates the body and invokes :func:`add_task`, so
 the control layer never reaches into the runner. Results: an
-:class:`AddTaskRejected` maps to a 409; :class:`AddTaskInvalid` (and any
-exception out of spec resolution, which runs user code) maps to a 400;
-otherwise the result carries ``changed`` — ``True`` for a fresh accept,
-``False`` for a ``request_id`` replay echoing the original rows.
+:class:`AddTaskRejected` maps to a 409; :class:`AddTaskInvalid` maps to a
+400 (spec-resolution failures — user code — are wrapped in it here, so the
+route's 400 mapping is exhaustive); otherwise the result carries
+``changed`` — ``True`` for a fresh accept, ``False`` for a ``request_id``
+replay echoing the original rows.
 """
 
 from __future__ import annotations
@@ -125,6 +126,11 @@ class AddTaskCapability:
     """Whether the run is an eval-set (task add rejects — see the doc's Scope)."""
     run_epochs: int | None = None
     """The run-level epochs override, if any (reported in the response rows)."""
+    run_limit: int | tuple[int, int] | None = None
+    """The run-level ``--limit``, if any — it slices the added task's dataset
+    when the task runs, so the response rows' ``samples`` accounts for it."""
+    run_sample_id: str | int | list[str] | list[int] | list[str | int] | None = None
+    """The run-level ``--sample-id`` filter, if any (same treatment)."""
     _closed: bool = False
     # accepted request_ids -> (canonical body key, original result). Only
     # accepted adds are recorded: a rejection enqueued nothing, so a caller
@@ -221,9 +227,11 @@ def add_task(
     Evaluated synchronously on the eval's loop — no await between the checks
     and the enqueue, so the decision table's rows are race-free (the same
     argument as requeue's accept path). Resolution failures (unimportable
-    spec, bad ``-T`` arg, unknown/uncredentialed model) propagate to the
-    route, which maps them to a 400; every rejection row reports its error
-    under ``dry_run`` too, so an agent can probe safely.
+    spec, bad ``-T`` arg, unknown/uncredentialed model, a run ``--sample-id``
+    the added dataset can't satisfy) raise :class:`AddTaskInvalid` — a 400 at
+    the route — before anything is enqueued, so the 400's "resolution
+    failure" meaning holds by construction; every rejection row reports its
+    error under ``dry_run`` too, so an agent can probe safely.
     """
     from inspect_ai._control.server import keep_alive_intent
 
@@ -262,22 +270,40 @@ def add_task(
                 )
             return {**seen_result, "changed": False}
 
-    # resolve (runs user code — task imports, dataset construction); errors
-    # propagate to the route's 400 mapping
-    resolved = capability.resolve(spec, task_args, model)
-
+    from inspect_ai._eval.run import resolve_task_sample_ids
+    from inspect_ai._eval.task.util import slice_dataset
     from inspect_ai._util.constants import DEFAULT_EPOCHS
 
-    rows: list[AddTaskRow] = [
-        {
-            "task_id": r.id,
-            "task_name": r.task.name,
-            "model": str(r.model),
-            "samples": len(r.task.dataset),
-            "epochs": capability.run_epochs or r.task.epochs or DEFAULT_EPOCHS,
-        }
-        for r in resolved
-    ]
+    # resolve (runs user code — task imports, dataset construction) and build
+    # the response rows, wrapping failures so the route's 400 covers exactly
+    # the pre-enqueue work: a failure past this point (enqueue, request_id
+    # bookkeeping) must not masquerade as "could not resolve" for an add that
+    # was actually applied
+    try:
+        resolved = capability.resolve(spec, task_args, model)
+        rows: list[AddTaskRow] = [
+            {
+                "task_id": r.id,
+                "task_name": r.task.name,
+                "model": str(r.model),
+                # the run's --limit/--sample-id slice the added task's dataset
+                # when it runs (same slice as the task runner applies), so the
+                # count reflects what will actually run — mirroring how
+                # `epochs` honors the run-level override
+                "samples": len(
+                    slice_dataset(
+                        r.task.dataset,
+                        capability.run_limit,
+                        resolve_task_sample_ids(r.task.name, capability.run_sample_id),
+                        dynamic=r.task.sample_source is not None,
+                    )
+                ),
+                "epochs": capability.run_epochs or r.task.epochs or DEFAULT_EPOCHS,
+            }
+            for r in resolved
+        ]
+    except Exception as exc:
+        raise AddTaskInvalid(f"could not resolve '{spec}': {exc}") from exc
     result: AddTaskAccepted = {
         "ok": True,
         "dry_run": dry_run,

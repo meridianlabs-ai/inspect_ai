@@ -34,10 +34,17 @@ from inspect_ai.dataset import Sample
 from inspect_ai.solver import generate
 
 
-def _fake_resolved(name: str = "added", task_id: str = "tid-1") -> Any:
+def _fake_resolved(
+    name: str = "added", task_id: str = "tid-1", dataset: Any = None
+) -> Any:
     return SimpleNamespace(
         id=task_id,
-        task=SimpleNamespace(name=name, dataset=[1, 2], epochs=None),
+        task=SimpleNamespace(
+            name=name,
+            dataset=dataset if dataset is not None else [1, 2],
+            epochs=None,
+            sample_source=None,
+        ),
         model="mockllm/model",
         task_args={},
     )
@@ -52,6 +59,8 @@ class _Capability:
         eval_set: bool = False,
         resolve_error: Exception | None = None,
         resolved: list[Any] | None = None,
+        run_limit: Any = None,
+        run_sample_id: Any = None,
     ) -> None:
         self.enqueued: list[list[Any]] = []
         self.resolve_calls: list[tuple[str, dict[str, Any], str | None]] = []
@@ -71,6 +80,8 @@ class _Capability:
             resolve=resolve,
             enqueue=self.enqueued.append,
             eval_set=eval_set,
+            run_limit=run_limit,
+            run_sample_id=run_sample_id,
         )
 
 
@@ -281,13 +292,61 @@ def test_add_task_rejections_are_not_recorded() -> None:
     assert len(cap.enqueued) == 1
 
 
-def test_add_task_resolution_error_propagates() -> None:
+def test_add_task_resolution_error_maps_to_invalid() -> None:
+    """Resolution failures are wrapped in AddTaskInvalid (the route's 400).
+
+    The exception type distinguishes pre-enqueue failures from a fault after
+    the add was applied (which propagates, rather than lying "not resolved").
+    """
     request_keep_alive()
     cap = _Capability(resolve_error=ValueError("no such task"))
     register_add_task(cap.capability)
-    with pytest.raises(ValueError, match="no such task"):
+    with pytest.raises(
+        AddTaskInvalid, match="could not resolve 'missing'.*no such task"
+    ):
         add_task("missing", task_args={}, model=None, request_id=None, dry_run=False)
     assert cap.enqueued == []
+
+
+def test_add_task_samples_honors_run_limit() -> None:
+    """The response rows' `samples` reflects the run's --limit slice.
+
+    The added task runs under the run's resolved config, so the count matches
+    what will run — the way `epochs` honors the run-level override.
+    """
+    request_keep_alive()
+    cap = _Capability(run_limit=1)
+    register_add_task(cap.capability)
+    result = add_task(
+        "some_task", task_args={}, model=None, request_id=None, dry_run=True
+    )
+    assert result["ok"] is True
+    assert result["tasks"][0]["samples"] == 1
+
+
+def test_add_task_samples_honors_run_sample_id() -> None:
+    from inspect_ai.dataset import MemoryDataset
+
+    dataset = MemoryDataset(
+        [Sample(input="a", id="s1"), Sample(input="b", id="s2")], name="added_ds"
+    )
+    request_keep_alive()
+    cap = _Capability(resolved=[_fake_resolved(dataset=dataset)], run_sample_id="s1")
+    register_add_task(cap.capability)
+    result = add_task(
+        "some_task", task_args={}, model=None, request_id=None, dry_run=True
+    )
+    assert result["ok"] is True
+    assert result["tasks"][0]["samples"] == 1
+    # an added dataset that can't satisfy the run's filter fails at accept
+    # (fail-loud at the 400, rather than a contained task error later)
+    cap_no_match = _Capability(
+        resolved=[_fake_resolved(dataset=dataset)], run_sample_id="nope"
+    )
+    register_add_task(cap_no_match.capability)
+    with pytest.raises(AddTaskInvalid, match="No matches"):
+        add_task("some_task", task_args={}, model=None, request_id=None, dry_run=True)
+    assert cap_no_match.enqueued == []
 
 
 # ---------------------------------------------------------------------------

@@ -1080,6 +1080,8 @@ async def _eval_async_inner(
             enqueue=enqueuer.enqueue_resolved,
             eval_set=eval_set_id is not None,
             run_epochs=eval_config.epochs,
+            run_limit=eval_config.limit,
+            run_sample_id=eval_config.sample_id,
         )
         register_add_task(add_capability)
 
