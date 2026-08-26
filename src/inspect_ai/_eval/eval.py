@@ -1109,13 +1109,15 @@ async def _eval_async_inner(
                 # The one place eval_run is invoked for a batch of tasks. The
                 # initial tasks run as the first loop iteration below; tasks
                 # added during the run (via `enqueue_task` or a `TaskSource`)
-                # feed later iterations, all under this run_id. `debug_errors`
-                # is passed only on the parallel==1 path (the multi-task path
-                # never set it — preserved asymmetry).
+                # feed later iterations, all under this run_id. `source` is
+                # the TaskSource whose completion callbacks (sample_complete /
+                # task_complete) the batch's tasks fire — the run body passes
+                # the run's source, park sessions pass None (see run_session).
                 async def run_batch(
                     tasks: list[ResolvedTask],
                     debug: bool,
                     inject: TaskInjection | None = None,
+                    source: TaskSource | None = None,
                 ) -> list[EvalLog]:
                     return await eval_run(
                         eval_set_id=eval_set_id,
@@ -1136,7 +1138,7 @@ async def _eval_async_inner(
                         score=score,
                         debug_errors=debug,
                         task_retry_attempts=task_retry_attempts,
-                        task_source=task_source,
+                        task_source=source,
                         inject=inject,
                         **kwargs,
                     )
@@ -1223,7 +1225,11 @@ async def _eval_async_inner(
                             for t in pending
                             if t.sequence == sequence
                         ]
-                        batch_logs = await run_batch(ordered, debug_errors is True)
+                        batch_logs = await run_batch(
+                            ordered,
+                            debug_errors is True,
+                            source=task_source if use_source else None,
+                        )
                         results.extend(batch_logs)
 
                         # a cancelled batch ends the run
@@ -1272,7 +1278,10 @@ async def _eval_async_inner(
                     )
                     logs = EvalLogs(
                         await run_batch(
-                            resolved_tasks, debug_errors is True, inject=injection
+                            resolved_tasks,
+                            debug_errors is True,
+                            inject=injection,
+                            source=task_source,
                         )
                     )
                 else:
@@ -1320,7 +1329,11 @@ async def _eval_async_inner(
                     park only after its source completed (or a cancelled
                     batch ended the run, which should not quietly resume its
                     source), and re-polling a source that may block
-                    indefinitely would hang the park. Wraps itself in
+                    indefinitely would hang the park. Source-free covers the
+                    completion callbacks too — session batches run with
+                    ``source=None``, so an added task's sample_complete /
+                    task_complete never fire on the original source and its
+                    return values cannot resurrect it. Wraps itself in
                     scan_context with the run's same scan_id — scan_init
                     resumes the existing scan dir and scan_finalize
                     re-compacts at session end — so added tasks are scanned
@@ -1386,6 +1399,14 @@ async def _eval_async_inner(
                     # an add accepted between the drain above and this wait
                     # is never a lost wake)
                     await _ctl_server.wait_for_release_or_add(enqueuer.has_pending)
+
+            # the park is over (or was never entered): nothing will drain the
+            # enqueuer again, so stop accepting adds before the control server
+            # tears down — no await separates the park's last intent check (or
+            # the skipped gate) from this close, so a late `keep` + `task add`
+            # pair served during teardown gets the 409 rather than a false
+            # `applied: true`
+            add_capability.close()
 
         # cleanup sample buffers if required
         await cleanup_sample_buffers(log_dir)

@@ -559,3 +559,118 @@ async def test_task_add_park_restart_runs_added_task(tmp_path) -> None:
     assert sorted(log.eval.task for log in logs) == ["park_added", "park_parent"]
     assert all(log.status == "success" for log in logs)
     assert len({log.eval.run_id for log in logs}) == 1
+
+
+@skip_if_trio
+async def test_task_add_park_session_is_source_free(tmp_path, monkeypatch) -> None:
+    """A task added while parked never fires callbacks on the run's TaskSource.
+
+    Park sessions run their batches with no task_source (``run_session`` is
+    source-free): the added task's completion must not fire sample_complete /
+    task_complete on the run's original source — a source whose run ended
+    must not be resurrected by an unrelated add-while-parked whose callback
+    returns follow-up tasks.
+    """
+    from inspect_ai import TaskSource
+    from inspect_ai._control.discovery import list_discovered_servers
+    from inspect_ai._control.eval_state import get_eval_states
+    from inspect_ai._control.server import ControlServer
+    from inspect_ai._eval.eval import eval_async
+
+    task_file = tmp_path / "park_added_task.py"
+    task_file.write_text(
+        "from inspect_ai import Task, task\n"
+        "from inspect_ai.dataset import Sample\n"
+        "from inspect_ai.solver import generate\n"
+        "\n"
+        "@task\n"
+        "def park_added():\n"
+        '    return Task(dataset=[Sample(input="hi")], solver=[generate()],'
+        ' name="park_added")\n'
+    )
+
+    parent = Task(
+        dataset=[Sample(input="hi", target="ok")],
+        solver=[generate()],
+        name="park_parent",
+    )
+
+    completed: list[str] = []
+
+    async def on_task_complete(log: Any) -> list[Task] | None:
+        completed.append(log.eval.task)
+        if log.eval.task == "park_added":
+            # only reachable if a park session leaked the source: the
+            # follow-up would resurrect it after its run ended
+            return [
+                Task(
+                    dataset=[Sample(input="hi")],
+                    solver=[generate()],
+                    name="resurrected",
+                )
+            ]
+        return None
+
+    source = TaskSource.from_tasks([parent], task_complete=on_task_complete)
+
+    # deterministic park signal: the park loop calls wait_for_release_or_add
+    # only once the body is over and the add buffer is empty. An add POSTed
+    # merely after the parent *completed* could still drain into the live
+    # run — where source callbacks do fire, by design — making the test
+    # race-dependent.
+    parked = anyio.Event()
+    orig_wait = ControlServer.wait_for_release_or_add
+
+    async def wait_and_signal(self: Any, pending: Any) -> None:
+        parked.set()
+        await orig_wait(self, pending)
+
+    monkeypatch.setattr(ControlServer, "wait_for_release_or_add", wait_and_signal)
+
+    logs: list[Any] = []
+
+    async def run_eval() -> None:
+        logs.extend(
+            await eval_async(
+                source,
+                model="mockllm/model",
+                ctl_server="keep",
+                log_dir=str(tmp_path / "logs"),
+            )
+        )
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(run_eval)
+
+        with anyio.fail_after(30):
+            await parked.wait()
+
+        servers = [s for s in list_discovered_servers() if s.pid == os.getpid()]
+        assert len(servers) == 1
+        transport = httpx.AsyncHTTPTransport(uds=str(servers[0].socket_path))
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://localhost", timeout=10.0
+        ) as client:
+            response = await client.post(
+                "/tasks", json={"spec": f"{task_file}@park_added"}
+            )
+            assert response.status_code == 200, response.text
+
+            def added_finished() -> bool:
+                return any(
+                    s.task == "park_added" and s.completed_at is not None
+                    for s in get_eval_states()
+                )
+
+            with anyio.fail_after(30):
+                while not added_finished():
+                    await anyio.sleep(0.05)
+
+            release = await client.post("/release")
+            assert release.status_code == 200
+
+    # the source saw only its own run's task: the added task completed
+    # without firing task_complete, so no "resurrected" task ever ran
+    assert completed == ["park_parent"]
+    assert sorted(log.eval.task for log in logs) == ["park_added", "park_parent"]
+    assert all(log.status == "success" for log in logs)
