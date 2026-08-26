@@ -229,6 +229,42 @@ def test_add_task_dry_run_bypasses_request_id_map() -> None:
     assert len(cap.enqueued) == 1
 
 
+def test_add_task_request_id_map_is_bounded() -> None:
+    """The request_id map evicts oldest-first past its cap.
+
+    A long-lived keep-alive-parked worker accrues one entry per accepted add;
+    the cap bounds that. A replay of an evicted id is a fresh attempt (it
+    enqueues again) while a still-recorded id keeps echoing.
+    """
+    from inspect_ai._control.add_task import SEEN_REQUEST_IDS_MAX
+
+    request_keep_alive()
+    cap = _Capability()
+    register_add_task(cap.capability)
+    for i in range(SEEN_REQUEST_IDS_MAX + 1):
+        result = add_task(
+            f"task_{i}", task_args={}, model=None, request_id=f"rid-{i}", dry_run=False
+        )
+        assert result["ok"] is True and result["changed"] is True
+    assert len(cap.capability._seen) == SEEN_REQUEST_IDS_MAX
+    # the newest id still echoes...
+    newest = add_task(
+        f"task_{SEEN_REQUEST_IDS_MAX}",
+        task_args={},
+        model=None,
+        request_id=f"rid-{SEEN_REQUEST_IDS_MAX}",
+        dry_run=False,
+    )
+    assert newest["ok"] is True and newest["changed"] is False
+    # ...while the evicted oldest gets a genuine re-add
+    enqueues_before = len(cap.enqueued)
+    oldest = add_task(
+        "task_0", task_args={}, model=None, request_id="rid-0", dry_run=False
+    )
+    assert oldest["ok"] is True and oldest["changed"] is True
+    assert len(cap.enqueued) == enqueues_before + 1
+
+
 def test_add_task_rejections_are_not_recorded() -> None:
     """A caller who fixes the condition and retries the same id gets a real add."""
     cap = _Capability()
@@ -267,13 +303,13 @@ def _app() -> Any:
 
 @skip_if_trio
 async def test_add_route_rejects_non_object_body() -> None:
-    """A missing or non-object body 400s with the channel's error shape."""
+    """A missing, malformed, or non-object body 400s with the channel's error shape."""
     request_keep_alive()
     cap = _Capability()
     register_add_task(cap.capability)
     transport = httpx.ASGITransport(app=_app())
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        for content in (None, b"[1, 2]", b'"spec"'):
+        for content in (None, b"[1, 2]", b'"spec"', b"not json {"):
             response = await client.post(
                 "/tasks",
                 content=content,
@@ -684,3 +720,113 @@ async def test_task_add_park_session_is_source_free(tmp_path, monkeypatch) -> No
     assert completed == ["park_parent"]
     assert sorted(log.eval.task for log in logs) == ["park_added", "park_parent"]
     assert all(log.status == "success" for log in logs)
+
+
+async def _run_add_while_source_blocked(tmp_path: Any, max_tasks: int) -> None:
+    """An add dispatched while the source poll blocks must not be starved.
+
+    Runs a real `eval_async(..., ctl_server="keep")` whose TaskSource's
+    `next_tasks()` parks on an event, waits until the poll is genuinely in
+    flight (the run fully idle, `next_tasks()` entered), POSTs an add over
+    the eval's control socket, and requires the added task to complete while
+    the poll is still blocked — pre-race an accepted add sat in the buffer
+    until `next_tasks()` returned (which here never would), so this wait
+    hung. `max_tasks` selects the poll shape under test: the dispatcher's
+    `feed.next()` race (`parallel > 1`) or `run_batches`' follow-up-batch
+    race (`parallel == 1`).
+    """
+    from inspect_ai import TaskSource
+    from inspect_ai._control.discovery import list_discovered_servers
+    from inspect_ai._control.eval_state import get_eval_states
+    from inspect_ai._eval.eval import eval_async
+
+    task_file = tmp_path / "blocked_poll_added.py"
+    task_file.write_text(
+        "from inspect_ai import Task, task\n"
+        "from inspect_ai.dataset import Sample\n"
+        "from inspect_ai.solver import generate\n"
+        "\n"
+        "@task\n"
+        "def blocked_poll_added():\n"
+        '    return Task(dataset=[Sample(input="hi")], solver=[generate()],'
+        ' name="blocked_poll_added")\n'
+    )
+
+    poll_entered = anyio.Event()
+    source_release = anyio.Event()
+
+    class _BlockedSource(TaskSource):
+        def initial_tasks(self) -> list[Task]:
+            return [
+                Task(dataset=[Sample(input="hi")], solver=[generate()], name="seed")
+            ]
+
+        async def next_tasks(self) -> list[Task] | None:
+            poll_entered.set()
+            with anyio.fail_after(30):
+                await source_release.wait()
+            return None
+
+    logs: list[Any] = []
+
+    async def run_eval() -> None:
+        logs.extend(
+            await eval_async(
+                _BlockedSource(),
+                model="mockllm/model",
+                max_tasks=max_tasks,
+                ctl_server="keep",
+                log_dir=str(tmp_path / "logs"),
+            )
+        )
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(run_eval)
+
+        with anyio.fail_after(30):
+            await poll_entered.wait()
+
+        servers = [s for s in list_discovered_servers() if s.pid == os.getpid()]
+        assert len(servers) == 1
+        transport = httpx.AsyncHTTPTransport(uds=str(servers[0].socket_path))
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://localhost", timeout=10.0
+        ) as client:
+            response = await client.post(
+                "/tasks", json={"spec": f"{task_file}@blocked_poll_added"}
+            )
+            assert response.status_code == 200, response.text
+
+            def added_finished() -> bool:
+                return any(
+                    s.task == "blocked_poll_added" and s.completed_at is not None
+                    for s in get_eval_states()
+                )
+
+            with anyio.fail_after(30):
+                while not added_finished():
+                    await anyio.sleep(0.05)
+            # the added task ran to completion with the poll still blocked
+            assert not source_release.is_set()
+
+            # exhaust the source (the blocked poll returns None), then
+            # release the keep-alive park
+            source_release.set()
+            release = await client.post("/release")
+            assert release.status_code == 200
+
+    assert sorted(log.eval.task for log in logs) == ["blocked_poll_added", "seed"]
+    assert all(log.status == "success" for log in logs)
+    assert len({log.eval.run_id for log in logs}) == 1
+
+
+@skip_if_trio
+async def test_task_add_runs_while_source_poll_blocked_parallel(tmp_path) -> None:
+    """Dispatcher shape (`parallel > 1`): the add dispatches on free capacity."""
+    await _run_add_while_source_blocked(tmp_path, max_tasks=2)
+
+
+@skip_if_trio
+async def test_task_add_runs_while_source_poll_blocked_serial(tmp_path) -> None:
+    """`run_batches` shape (`parallel == 1`): the add runs as a follow-up batch."""
+    await _run_add_while_source_blocked(tmp_path, max_tasks=1)

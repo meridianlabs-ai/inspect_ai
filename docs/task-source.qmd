@@ -157,6 +157,8 @@ The same buffer backs the control channel's `inspect ctl task add`, which submit
 
 Any run executing tasks concurrently (`max_tasks` above 1) is live: a task added mid-run — by a `TaskSource`, `enqueue_task()`, or `inspect ctl task add` — starts as soon as there is free capacity, rather than waiting for a batch boundary. (With `max_tasks` of 1, additions run as a follow-up batch after the in-flight batch completes, preserving task ordering.)
 
+A blocked `next_tasks()` does not hold additions back: a task added while the poll is blocked starts anyway (at `max_tasks` of 1, as the next follow-up batch), with the poll continuing underneath. This means `next_tasks()` can resolve concurrently with running tasks, rather than only while the run is otherwise idle.
+
 Capacity is bounded by `max_tasks` (the number of concurrent task × model units). If the seed fills every slot, a follow-up waits until a slot frees, so to run follow-ups alongside the seed, set `max_tasks` above the number of seed units. A seed of two tasks across two models is four units, so `--max-tasks 6` leaves room:
 
 ```bash

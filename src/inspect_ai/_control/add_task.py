@@ -129,6 +129,7 @@ class AddTaskCapability:
     # accepted request_ids -> (canonical body key, original result). Only
     # accepted adds are recorded: a rejection enqueued nothing, so a caller
     # who fixes the condition and retries the same id gets a real attempt.
+    # Bounded to SEEN_REQUEST_IDS_MAX entries (oldest evicted first).
     _seen: dict[str, tuple[str, AddTaskAccepted]] = field(default_factory=dict)
 
     def close(self) -> None:
@@ -144,6 +145,13 @@ class AddTaskCapability:
         """
         self._closed = False
 
+
+# Bound the request_id map: a keep-alive-parked worker fed adds for its whole
+# lifetime would otherwise accrue one entry per accepted add, and the
+# idempotency window only needs to outlive one client's transport retries —
+# past the cap the oldest ids are evicted (a replay of an evicted id gets a
+# fresh attempt, same as an id never seen).
+SEEN_REQUEST_IDS_MAX = 256
 
 # The active run's capability. Process-global (module-level) rather than a
 # ContextVar because the control server task is not a child of the eval's
@@ -282,4 +290,6 @@ def add_task(
     capability.enqueue(resolved)
     if request_id is not None:
         capability._seen[request_id] = (key, result)
+        while len(capability._seen) > SEEN_REQUEST_IDS_MAX:
+            del capability._seen[next(iter(capability._seen))]
     return result
