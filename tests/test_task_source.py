@@ -6,6 +6,7 @@ via `sample_complete` / `task_complete`, and produces the next batch from
 """
 
 from pathlib import Path
+from typing import Any
 
 import anyio
 import pytest
@@ -403,6 +404,38 @@ def test_task_source_load_from_file(tmp_path: Path) -> None:
         tasks=f"{src.as_posix()}@my_source", model="mockllm/model", display="none"
     )
     assert [log.eval.task for log in logs] == ["seed"]
+
+
+def test_source_failure_records_real_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    # next_tasks() runs on a background poll task; its failure (raising, or
+    # yielding a task that fails to resolve) must re-raise in the run body so
+    # the run-end record (read by --detach/--json done-record consumers)
+    # carries the real error, not the poll's collateral cancellation
+    import inspect_ai.hooks._hooks as hooks_module
+
+    recorded: list[BaseException | None] = []
+    orig_emit = hooks_module.emit_run_end
+
+    async def capture(
+        eval_set_id: str | None,
+        run_id: str,
+        logs: Any,
+        exception: BaseException | None = None,
+    ) -> None:
+        recorded.append(exception)
+        await orig_emit(eval_set_id, run_id, logs, exception)
+
+    monkeypatch.setattr(hooks_module, "emit_run_end", capture)
+
+    class _Exploding(_Generations):
+        async def next_tasks(self) -> list[Task] | None:
+            raise ValueError("source exploded")
+
+    with pytest.raises(ValueError, match="source exploded"):
+        eval(tasks=_Exploding(2), model="mockllm/model", display="none")
+
+    assert len(recorded) == 1
+    assert isinstance(recorded[0], ValueError)
 
 
 def test_task_source_rejected_outside_eval() -> None:

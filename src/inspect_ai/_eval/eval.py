@@ -1153,32 +1153,44 @@ async def _eval_async_inner(
                 # as a later batch (additions-first ordering preserved).
                 source_wake = Wake()
                 source_yields: list[list[ResolvedTask]] = []
+                source_error: Exception | None = None
                 source_polling = False
                 source_done = False
                 source_poll_scope: anyio.CancelScope | None = None
 
                 async def poll_source() -> None:
                     nonlocal source_polling, source_done, source_poll_scope
+                    nonlocal source_error
                     assert task_source is not None
                     with anyio.CancelScope() as scope:
                         source_poll_scope = scope
                         try:
                             more = await task_source.next_tasks()
+                            if more:
+                                source_yields.append(resolve_added_tasks(more))
+                            else:
+                                source_done = True
+                        except Exception as ex:
+                            # stash for next_source_batch to re-raise in the
+                            # run body: raising out of this task would cancel
+                            # the sibling run(), so the run-end record would
+                            # carry that cancellation instead of the real
+                            # error (as it did when resolution ran inline)
+                            source_error = ex
                         finally:
                             source_polling = False
-                        if more:
-                            source_yields.append(resolve_added_tasks(more))
-                        else:
-                            source_done = True
                         source_wake.set()
 
                 async def next_source_batch() -> list[ResolvedTask] | None:
                     """The next follow-up batch: additions first, else the source.
 
                     ``None`` ends the run (no additions buffered and the
-                    source is exhausted). The enqueue wake is claimed only
-                    inside this wait (no feed is wired at ``parallel == 1``,
-                    so the slot is otherwise free) and restored on exit.
+                    source is exhausted). A source failure (``next_tasks()``
+                    raising, or its yield failing to resolve) re-raises here
+                    once buffered work has been delivered. The enqueue wake
+                    is claimed only inside this wait (no feed is wired at
+                    ``parallel == 1``, so the slot is otherwise free) and
+                    restored on exit.
                     """
                     nonlocal source_polling
                     prev_wake = enqueuer.on_enqueue
@@ -1190,6 +1202,8 @@ async def _eval_async_inner(
                                 return drained
                             if source_yields:
                                 return source_yields.pop(0)
+                            if source_error is not None:
+                                raise source_error
                             if source_done:
                                 return None
                             if not source_polling:

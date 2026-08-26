@@ -337,7 +337,9 @@ async def test_add_route_maps_resolution_error_to_400() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_absolute_spec_absolutizes_paths_only() -> None:
+def test_absolute_spec_absolutizes_paths_only(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from inspect_ai._cli.ctl._task import _absolute_spec
 
     # registry / package names pass through
@@ -350,8 +352,16 @@ def test_absolute_spec_absolutizes_paths_only() -> None:
         _absolute_spec("evals/arc.py@arc_easy")
         == f"{os.path.abspath('evals/arc.py')}@arc_easy"
     )
-    # an existing directory absolutizes too
+    # explicitly path-shaped directory spellings absolutize
     assert _absolute_spec(".") == os.path.abspath(".")
+    assert _absolute_spec("evals/") == os.path.abspath("evals")
+    assert _absolute_spec("./evals") == os.path.abspath("evals")
+    # a bare name passes through even when a same-named local path exists:
+    # the server resolves registry-first (inspect eval parity), so the
+    # client's cwd must not shadow a registry task name
+    (tmp_path / "arc_easy").mkdir()
+    monkeypatch.chdir(tmp_path)
+    assert _absolute_spec("arc_easy") == "arc_easy"
 
 
 def test_cli_task_add_sends_body_and_renders(

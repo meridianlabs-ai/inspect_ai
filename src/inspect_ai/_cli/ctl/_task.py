@@ -497,16 +497,27 @@ def _absolute_spec(spec: str) -> str:
 
     The server's cwd is the launch cwd, not this client's, so a relative
     path would silently resolve against the wrong directory (or fail
-    confusingly). Registry/package names (including `hf/` specs) pass
-    through untouched — only specs that name a local path (an existing
-    path, or a `.py` file/glob) are absolutized, `@task` selector preserved.
+    confusingly). Only unambiguously path-shaped specs absolutize (a `.py`
+    file/glob, `.`/`..`, an explicit `./`- or `~`-style prefix, an absolute
+    path, or a trailing-slash directory), `@task` selector preserved.
+    Everything else — including a bare name that happens to exist as a
+    local path — passes through untouched, so the server's registry-first
+    resolution keeps `inspect eval`'s precedence (spell a directory
+    `./mytasks` or `mytasks/` to force path resolution).
     """
     file, sep, attr = spec.rpartition("@")
     candidate = file if sep else spec
     if not candidate or candidate.startswith("hf/"):
         return spec
-    if candidate.endswith(".py") or os.path.exists(candidate):
-        absolute = os.path.abspath(candidate)
+    path_shaped = (
+        candidate.endswith(".py")
+        or candidate in (".", "..")
+        or candidate.endswith("/")
+        or candidate.startswith(("./", "../", "~"))
+        or os.path.isabs(candidate)
+    )
+    if path_shaped:
+        absolute = os.path.abspath(os.path.expanduser(candidate))
         return f"{absolute}@{attr}" if sep else absolute
     return spec
 
