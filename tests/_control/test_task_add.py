@@ -22,6 +22,7 @@ from inspect_ai._control.add_task import (
     AddTaskInvalid,
     add_task,
     clear_add_task,
+    close_add_task,
     register_add_task,
 )
 from inspect_ai._control.server import (
@@ -94,13 +95,20 @@ def test_add_task_rejects_without_capability() -> None:
 def test_add_task_rejects_closed_capability() -> None:
     request_keep_alive()
     cap = _Capability()
-    cap.capability.close()
     register_add_task(cap.capability)
+    # the teardown hook (fired at the start of the run's exception unwind)
+    close_add_task()
     result = add_task(
         "some_task", task_args={}, model=None, request_id=None, dry_run=False
     )
     assert result["ok"] is False
     assert cap.enqueued == []
+    # a contained park-session failure re-opens (the process is still addable)
+    cap.capability.reopen()
+    reopened = add_task(
+        "some_task", task_args={}, model=None, request_id=None, dry_run=False
+    )
+    assert reopened["ok"] is True
 
 
 def test_add_task_rejects_eval_set() -> None:
@@ -255,6 +263,25 @@ def _app() -> Any:
     from inspect_ai._control.server import ControlServer
 
     return ControlServer(run_id="test")._build_app()
+
+
+@skip_if_trio
+async def test_add_route_rejects_non_object_body() -> None:
+    """A missing or non-object body 400s with the channel's error shape."""
+    request_keep_alive()
+    cap = _Capability()
+    register_add_task(cap.capability)
+    transport = httpx.ASGITransport(app=_app())
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        for content in (None, b"[1, 2]", b'"spec"'):
+            response = await client.post(
+                "/tasks",
+                content=content,
+                headers={"content-type": "application/json"},
+            )
+            assert response.status_code == 400
+            assert "error" in response.json()
+    assert cap.enqueued == []
 
 
 @skip_if_trio

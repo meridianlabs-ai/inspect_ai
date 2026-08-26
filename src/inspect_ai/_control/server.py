@@ -441,7 +441,7 @@ class ControlServer:
         Imported lazily so module import doesn't pay the FastAPI cost
         when control is disabled.
         """
-        from fastapi import Depends, FastAPI, Request
+        from fastapi import Body, Depends, FastAPI, Request
         from fastapi.responses import JSONResponse
 
         from inspect_ai._control.disconnect import (
@@ -658,7 +658,7 @@ class ControlServer:
         # accepted add wakes the keep-alive park so a parked process
         # relaunches a session for it.
         @app.post("/tasks")
-        async def add_task_route(body: dict[str, Any]) -> Any:
+        async def add_task_route(body: Any = Body(default=None)) -> Any:
             from pydantic import ValidationError
 
             from inspect_ai._control.add_task import (
@@ -668,8 +668,14 @@ class ControlServer:
             )
 
             # validate here (rather than typing the route param as
-            # AddTaskBody) so failures use the channel's {"error": ...} 400
-            # contract instead of FastAPI's 422 detail shape
+            # AddTaskBody) so failures — a missing/non-object body included —
+            # use the channel's {"error": ...} 400 contract instead of
+            # FastAPI's 422 detail shape
+            if not isinstance(body, dict):
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "request body must be a JSON object"},
+                )
             try:
                 request = AddTaskBody.model_validate(body)
             except ValidationError as exc:

@@ -135,6 +135,15 @@ class AddTaskCapability:
         """Stop accepting adds (the run is tearing down — cancellation wins)."""
         self._closed = True
 
+    def reopen(self) -> None:
+        """Resume accepting adds after a *contained* session failure.
+
+        The keep-alive park catches a failed session (whose ``eval_run``
+        unwind closed the capability) and keeps running — the process is
+        still addable, so the close must not stick.
+        """
+        self._closed = False
+
 
 # The active run's capability. Process-global (module-level) rather than a
 # ContextVar because the control server task is not a child of the eval's
@@ -147,6 +156,20 @@ def register_add_task(capability: AddTaskCapability) -> None:
     """Install ``capability`` as the active run's task-add entry point."""
     global _capability
     _capability = capability
+
+
+def close_add_task() -> None:
+    """Close the active capability — the run is tearing down.
+
+    Called at the *start* of the eval's exception unwind (cancellation wins):
+    the park is skipped on that path, so an add accepted mid-unwind — the
+    shielded cleanups can take minutes — would return ``applied: true`` and
+    then be silently dropped. Closing rejects it with a 409 instead,
+    narrowing the design's accepted-then-cancelled race to the genuine
+    window. No-op when nothing is registered.
+    """
+    if _capability is not None:
+        _capability.close()
 
 
 def clear_add_task() -> None:

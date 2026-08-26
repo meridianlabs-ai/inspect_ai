@@ -15,6 +15,7 @@ from anyio.abc import TaskGroup
 from inspect_ai._control.add_task import (
     AddTaskCapability,
     clear_add_task,
+    close_add_task,
     register_add_task,
 )
 from inspect_ai._control.eval_state import reset_run_registries
@@ -1036,7 +1037,10 @@ async def _eval_async_inner(
             add_model: Model | None = None
             if model_name is not None:
                 add_models = resolve_models(
-                    model_name, model_base_url, model_args, GenerateConfig(**kwargs)
+                    model_name,
+                    model_base_url,
+                    _model_args_with_env_fallback(model_args),
+                    GenerateConfig(**kwargs),
                 )
                 if len(add_models) != 1:
                     raise ValueError(
@@ -1070,15 +1074,14 @@ async def _eval_async_inner(
                     )
             return resolved
 
-        register_add_task(
-            AddTaskCapability(
-                run_id=run_id,
-                resolve=resolve_add_spec,
-                enqueue=enqueuer.enqueue_resolved,
-                eval_set=eval_set_id is not None,
-                run_epochs=eval_config.epochs,
-            )
+        add_capability = AddTaskCapability(
+            run_id=run_id,
+            resolve=resolve_add_spec,
+            enqueue=enqueuer.enqueue_resolved,
+            eval_set=eval_set_id is not None,
+            run_epochs=eval_config.epochs,
         )
+        register_add_task(add_capability)
 
         async with (
             control_server(run_id=run_id, enabled=ctl.enabled) as _ctl_server,
@@ -1150,19 +1153,22 @@ async def _eval_async_inner(
                 source_yields: list[list[ResolvedTask]] = []
                 source_polling = False
                 source_done = False
+                source_poll_scope: anyio.CancelScope | None = None
 
                 async def poll_source() -> None:
-                    nonlocal source_polling, source_done
+                    nonlocal source_polling, source_done, source_poll_scope
                     assert task_source is not None
-                    try:
-                        more = await task_source.next_tasks()
-                    finally:
-                        source_polling = False
-                    if more:
-                        source_yields.append(resolve_added_tasks(more))
-                    else:
-                        source_done = True
-                    source_wake.set()
+                    with anyio.CancelScope() as scope:
+                        source_poll_scope = scope
+                        try:
+                            more = await task_source.next_tasks()
+                        finally:
+                            source_polling = False
+                        if more:
+                            source_yields.append(resolve_added_tasks(more))
+                        else:
+                            source_done = True
+                        source_wake.set()
 
                 async def next_source_batch() -> list[ResolvedTask] | None:
                     """The next follow-up batch: additions first, else the source.
@@ -1272,6 +1278,14 @@ async def _eval_async_inner(
                 else:
                     logs = await run_batches(resolved_tasks)
 
+                # the body is over (a cancelled batch may have ended it with
+                # the source unexhausted) — cancel a still-blocked source
+                # poll so it can't resolve user code, or crash the outer
+                # task group, during the keep-alive park (park sessions are
+                # source-free and never consult it again)
+                if source_poll_scope is not None:
+                    source_poll_scope.cancel()
+
             # keep-alive: after the body, park while the control / ACP
             # servers are still up so `inspect ctl` can read state and
             # request shutdown. (Standalone eval parks here, inside the
@@ -1350,6 +1364,11 @@ async def _eval_async_inner(
                                 "Task(s) added to the parked eval failed to "
                                 f"run: {exception_message(ex)}"
                             )
+                            # the failed session's eval_run unwind closed the
+                            # capability (it assumes an exception ends the
+                            # run); this park contained the failure and the
+                            # process is still addable
+                            add_capability.reopen()
                         # re-check: adds may have landed while running
                         continue
                     if not keep_alive_intent():
@@ -1378,6 +1397,10 @@ async def _eval_async_inner(
         _eval_async_running = False
 
     except BaseException as e:
+        # stop accepting task adds immediately: the park is skipped on this
+        # path, so an add accepted during the (possibly long, shielded)
+        # unwind below would report applied and then be silently dropped
+        close_add_task()
         await emit_run_end(eval_set_id, run_id, EvalLogs([]), e)
         _eval_async_running = False
         raise e
@@ -1397,6 +1420,21 @@ async def _eval_async_inner(
 
     # return logs
     return logs
+
+
+def _model_args_with_env_fallback(model_args: dict[str, Any]) -> dict[str, Any]:
+    """``INSPECT_EVAL_MODEL_ARGS`` when no explicit model args were given.
+
+    The one fallback rule for constructing a run's models — used by
+    ``eval_init`` for the launch models and by the task-add resolve path for
+    an added task's explicit model, so the two cannot drift.
+    """
+    if len(model_args) == 0:
+        env_model_args = os.environ.get("INSPECT_EVAL_MODEL_ARGS", None)
+        if env_model_args:
+            args = [arg.strip() for arg in env_model_args.split(" ")]
+            return parse_cli_args(args)
+    return model_args
 
 
 def _resolve_enqueued_tasks(
@@ -2088,14 +2126,7 @@ def eval_init(
     )
 
     # resolve model and task args
-    model_args = resolve_args(model_args)
-
-    # resolve model args from environment if not specified
-    if len(model_args) == 0:
-        env_model_args = os.environ.get("INSPECT_EVAL_MODEL_ARGS", None)
-        if env_model_args:
-            args = [arg.strip() for arg in env_model_args.split(" ")]
-            model_args = parse_cli_args(args)
+    model_args = _model_args_with_env_fallback(resolve_args(model_args))
 
     # resolve and return models
     generate_config = GenerateConfig(**kwargs)

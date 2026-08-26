@@ -22,6 +22,7 @@ import anyio
 from anyio.abc import TaskGroup
 from typing_extensions import Unpack
 
+from inspect_ai._control.add_task import close_add_task
 from inspect_ai._control.eval_state import mark_eval_retry_pending
 from inspect_ai._control.max_tasks import (
     TaskDispatcherStats,
@@ -431,12 +432,45 @@ async def eval_run(
         feed: PreparedFeed | None = None
         if inject is not None:
 
+            async def prepare_batch(batch: list[ResolvedTask]) -> list[TaskRunOptions]:
+                """prepare_options with batch-scoped cleanup on failure.
+
+                A mid-batch prepare failure (or a cancellation landing
+                mid-prepare) leaves the batch's earlier tasks with inited
+                loggers on ``prepared_options``; the run-end cleanup there
+                only fires on the run's own exception path, so a *contained*
+                batch failure would leak them for the rest of the run — tear
+                down exactly this batch's entries (keyed by task_id: other
+                batches may be preparing concurrently) before re-raising.
+                """
+                batch_ids = {t.id for t in batch}
+                try:
+                    return await prepare_options(batch)
+                except BaseException:
+                    with anyio.CancelScope(shield=True):
+                        failed = [
+                            o
+                            for o in prepared_options
+                            if o.logger.eval.task_id in batch_ids
+                        ]
+                        for options in failed:
+                            prepared_options.remove(options)
+                            try:
+                                await options.logger.cleanup()
+                            except Exception as cleanup_ex:
+                                log.warning(
+                                    "Error cleaning up logger of task that "
+                                    "failed to prepare: "
+                                    f"{exception_message(cleanup_ex)}"
+                                )
+                    raise
+
             async def feed_drain() -> list[TaskRunOptions]:
                 batch = inject.drain()
                 if not batch:
                     return []
                 try:
-                    return await prepare_options(batch)
+                    return await prepare_batch(batch)
                 except Exception as ex:
                     # contain a bad injected batch (a sandbox image that
                     # fails to pull, log storage rejecting the header write):
@@ -444,8 +478,7 @@ async def eval_run(
                     # exception would unwind the run's task group and cancel
                     # every in-flight sibling — acceptable at launch (nothing
                     # is running yet), not for one bad add against a live
-                    # run. Tasks whose loggers initialized before the failure
-                    # are torn down at run end via prepared_options.
+                    # run.
                     if debug_errors:
                         raise
                     names = ", ".join(sorted({t.task.name for t in batch}))
@@ -458,7 +491,7 @@ async def eval_run(
 
             async def feed_next() -> list[TaskRunOptions] | None:
                 more = await inject.next()
-                return await prepare_options(more) if more else None
+                return await prepare_batch(more) if more else None
 
             feed = PreparedFeed(
                 drain=feed_drain, next=feed_next, set_wake=inject.set_wake
@@ -477,6 +510,12 @@ async def eval_run(
         )
 
     except BaseException:
+        # stop accepting control-channel task adds before the (possibly
+        # minutes-long) shielded cleanups below: an exception here ends the
+        # run without its keep-alive park, so an add accepted mid-unwind
+        # would report applied and then be dropped. A park session whose
+        # failure is contained re-opens the capability (see eval.py).
+        close_add_task()
         # cleanup() awaits any in-flight stale flush to stop; shield so that a
         # cancellation triggering this handler doesn't interrupt that wait and
         # leave realtime flush timers running against torn-down logging state.
