@@ -1361,9 +1361,7 @@ def _stub_httpx(
         def post(self, path: str, params: object = None, json: object = None) -> _Resp:
             return _next("posts", self.uds)
 
-        def patch(
-            self, path: str, params: object = None, json: object = None
-        ) -> _Resp:
+        def patch(self, path: str, params: object = None, json: object = None) -> _Resp:
             return _next("patches", self.uds)
 
         def request(
