@@ -735,20 +735,13 @@ def reflect_companion_loops() -> None:
         item, stage = anchor
         if stage not in ("Agent", "Review"):
             continue
-        comments = gh_json(
-            "api",
-            "--paginate",
-            f"repos/{TS_MONO}/issues/{cpr['number']}/comments?per_page=100",
-            "--jq",
-            "[.[] | {body: .body, ts: .created_at}]",
-        )
-        # --paginate concatenates arrays as JSON streams only for objects;
-        # normalize: gh emits one array per page back-to-back
-        if isinstance(comments, dict):
-            comments = [comments]
+        try:
+            comments = issue_comments(TS_MONO, cpr["number"])
+        except (RuntimeError, ValueError):
+            continue
         go_ts, stop_ts = "", ""
-        for c in comments if isinstance(comments, list) else []:
-            body, ts = c.get("body") or "", c.get("ts") or ""
+        for c in comments:
+            body, ts = c.get("body") or "", c.get("created_at") or ""
             if (
                 "auto-handoff" in body
                 or "auto-converged" in body
@@ -775,21 +768,62 @@ def reflect_companion_loops() -> None:
             )
 
 
+def issue_comments(repo: str, num: int) -> list:
+    """All comments on an issue/PR, pagination-safe.
+
+    `--paginate` emits one JSON document PER PAGE (with or without
+    `--jq`), so json.loads breaks past 100 comments; `--slurp` wraps the
+    pages in an outer array we flatten here.
+    """
+    pages = gh_json(
+        "api",
+        "--paginate",
+        "--slurp",
+        f"repos/{repo}/issues/{num}/comments?per_page=100",
+    )
+    return [c for page in pages for c in page]
+
+
+def pr_has_live_run(title: str) -> bool:
+    """True when a queued or in-progress agent run matches this PR's title.
+
+    Verdict consumers post no created-comment ack, and fix rounds
+    routinely outlive any fixed threshold — a live run means a consumer
+    exists and revival would race it into concurrent duplicate rounds.
+    """
+    for status in ("in_progress", "queued"):
+        n = gh_json(
+            "api",
+            f"repos/{FORK}/actions/runs?status={status}&per_page=50",
+            "--jq",
+            "[.workflow_runs[] | .display_title]",
+        )
+        if any(title and title in t for t in n):
+            return True
+    return False
+
+
 def retrigger_stale_handbacks() -> None:
     """Revive auto-loop hand-backs whose consumer run died before starting.
 
     A hand-back is a comment the loop expects an agent run to consume: a
-    bare re-review trigger (the reviewer runs) or a suggestions verdict
-    (a fix round runs). Runner-infra failures at "Set up job" kill the
+    re-review trigger (the reviewer runs) or a suggestions verdict (a
+    fix round runs). Runner-infra failures at "Set up job" kill the
     consumer before any of its own backstops exist — nothing posts, no
-    one is cc'd, the loop waits forever (observed: fork PR #324, whose
-    round-3 hand-back's review run died at job setup). Detection is
-    reconciler-shaped: on an open auto-labeled PR, if the last
-    non-counter comment is a continue signal older than STALE_MINUTES
-    with no agent activity after it (and no standing ⚠️, which means a
-    human was already told), post a fresh re-review trigger as the
-    machine account. Idempotent per stall: the reposted trigger becomes
-    the newest comment, and goes stale again only if its run also dies.
+    one is cc'd, the loop waits forever (observed: fork PR #324).
+    Detection is reconciler-shaped: on an open auto-labeled PR, if the
+    last non-counter comment is a continue signal older than
+    STALE_MINUTES (and no standing ⚠️ means a human was already told),
+    post a fresh re-review trigger as the machine account.
+
+    Guards against racing a slow-but-healthy consumer: a re-review
+    trigger bearing the reviewer's startup ack (eyes reaction) has a
+    consumer that genuinely started — its in-job backstops own any
+    later failure (the dead-at-setup run never acks) — and a PR with a
+    queued or in-progress run matching its title is left alone. The
+    revival comment starts with the trigger token, so it is itself a
+    continue signal and gets revived again if ITS run also dies —
+    infra outages are correlated.
     """
     STALE_MINUTES = 45
     try:
@@ -805,7 +839,7 @@ def retrigger_stale_handbacks() -> None:
             "--limit",
             "200",
             "--json",
-            "number",
+            "number,title",
         )
     except RuntimeError as e:
         print(f"::warning::stale-handback check: pr list failed: {e}")
@@ -814,19 +848,11 @@ def retrigger_stale_handbacks() -> None:
     for pr in prs:
         num = pr["number"]
         try:
-            comments = gh_json(
-                "api",
-                "--paginate",
-                f"repos/{FORK}/issues/{num}/comments?per_page=100",
-                "--jq",
-                "[.[] | {body: .body, ts: .created_at, who: .user.login}]",
-            )
-        except RuntimeError:
+            comments = issue_comments(FORK, num)
+        except (RuntimeError, ValueError):
             continue
-        if isinstance(comments, dict):
-            comments = [comments]
         last = None
-        for c in comments if isinstance(comments, list) else []:
+        for c in comments:
             body = c.get("body") or ""
             if "auto-fix-attempts" in body or "auto-review-rounds" in body:
                 continue  # sticky counters, created mid-round — not signals
@@ -834,16 +860,33 @@ def retrigger_stale_handbacks() -> None:
         if last is None:
             continue
         body = last.get("body") or ""
-        is_continue = (
-            body.strip() == "@" + "review"
-            or "claude-review-verdict:suggestions" in body
-        )
+        is_trigger = body.strip().startswith("@" + "review")
+        is_continue = is_trigger or "claude-review-verdict:suggestions" in body
         if not is_continue or "⚠️" in body:
             continue
-        ts = datetime.fromisoformat((last.get("ts") or "").replace("Z", "+00:00"))
+        ts = datetime.fromisoformat(
+            (last.get("created_at") or "").replace("Z", "+00:00")
+        )
         age_min = (now - ts).total_seconds() / 60
         if age_min < STALE_MINUTES:
             continue
+        if is_trigger and last.get("id"):
+            try:
+                acked = gh_json(
+                    "api",
+                    f"repos/{FORK}/issues/comments/{last['id']}/reactions",
+                    "--jq",
+                    '[.[] | select(.content == "eyes")] | length',
+                )
+                if int(acked or 0) > 0:
+                    continue  # consumer started; in-job backstops own it
+            except (RuntimeError, ValueError):
+                pass  # unreadable reactions: fall through to the run check
+        try:
+            if pr_has_live_run(pr.get("title") or ""):
+                continue
+        except (RuntimeError, ValueError):
+            continue  # can't tell — racing a live consumer is worse
         comment(
             num,
             "@" + "review — re-triggered by the Atlas sync: the previous "
