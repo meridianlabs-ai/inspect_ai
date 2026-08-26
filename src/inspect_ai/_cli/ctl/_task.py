@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import json as json_lib
+import os
 import time
+import uuid as uuid_lib
 from typing import Any, Literal, cast
 
 import click
 
+from inspect_ai._cli.util import parse_cli_args
 from inspect_ai._control.cancel import TaskCancelAction
+from inspect_ai._control.discovery import DiscoveredControlServer
 
 # Patch seam: tests monkeypatch functions on their defining module
 # (e.g. `inspect_ai._cli.ctl._http._request_json`), so cross-module
@@ -16,7 +20,7 @@ from inspect_ai._control.cancel import TaskCancelAction
 # "simplify" to `from ._http import _request_json` (see
 # design/ctl/cli-refactor.md).
 from . import _fetch, _http
-from ._failure import _envelope_failures
+from ._failure import _envelope_failures, _fail
 from ._group import (
     _MUTATION_ENVELOPE_HELP,
     _echo_no_running_evals,
@@ -32,6 +36,7 @@ from ._group import (
     ctl_command,
 )
 from ._mutate import (
+    _ADD_ROUTE_MISSING,
     _CANCEL_ROUTE_MISSING,
     _HELD_CAVEAT,
     _PAUSE_ROUTE_MISSING,
@@ -61,7 +66,7 @@ def task_group(ctx: click.Context, /, **mirrored: Any) -> None:
     """Operate on the tasks of running evals (bare `task` lists them).
 
     Task ids are stable across retries and are the TASK selector other
-    commands take. `add` / `drain` are planned but not yet available.
+    commands take. `drain` is planned but not yet available.
     """
     if ctx.invoked_subcommand is None:
         ctx.invoke(task_list_command, **mirrored)
@@ -113,6 +118,71 @@ def task_log_flush_command(
     against several models.
     """
     _run_log_flush(task, as_json, terse=terse, model=model)
+
+
+@task_group.command("add")
+@click.argument("spec")
+@click.option(
+    "--model",
+    type=str,
+    help=(
+        "Model to run the added task against (must be resolvable in the "
+        "target process). Defaults to the run's launch model(s) — one added "
+        "task per model."
+    ),
+)
+@click.option(
+    "-T",
+    "task_arg",
+    multiple=True,
+    type=str,
+    help="One or more task arguments (e.g. -T arg=value), as `inspect eval -T`.",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Resolve and validate the spec without adding it.",
+)
+@click.option(
+    "--pid",
+    type=int,
+    help="Target process id (when several inspect processes are running).",
+)
+@_json_option(_MUTATION_ENVELOPE_HELP)
+@_terse_option()
+def task_add_command(
+    spec: str,
+    model: str | None,
+    task_arg: tuple[str, ...],
+    dry_run: bool,
+    pid: int | None,
+    as_json: bool,
+    terse: bool | None,
+) -> None:
+    """Add a task to a running eval.
+
+    SPEC uses the `inspect eval` spelling — a registry name, or a file path
+    with an optional `@task` selector — and resolves inside the target
+    process (a registry name must be importable there; file paths are sent
+    absolute). The added task runs under the same run id, logs to the run's
+    log directory, and appears in `inspect ctl task list` like any sibling.
+    Only an *addable* process accepts: one whose keep-alive intent is on
+    (launched with `--ctl-server=keep`, or `inspect ctl process keep` while
+    the eval runs). Applied means accepted and scheduled, not ran — track
+    progress with `inspect ctl task list`. The target is a process, not a
+    task: the sole running (or sole addable) process is the default, and
+    `--pid` disambiguates.
+    """
+    _run_task_add(
+        spec,
+        model=model,
+        task_arg=task_arg,
+        dry_run=dry_run,
+        pid=pid,
+        as_json=as_json,
+        terse=terse,
+    )
 
 
 @task_group.command("cancel")
@@ -420,6 +490,156 @@ def _run_task_cancel(
             _echo(_terse_line("cancel", target_label, f"no-op — {reason}"))
         else:
             _echo(f"Nothing to do: {reason}.")
+
+
+def _absolute_spec(spec: str) -> str:
+    """Absolutize a file-path spec client-side.
+
+    The server's cwd is the launch cwd, not this client's, so a relative
+    path would silently resolve against the wrong directory (or fail
+    confusingly). Registry/package names (including `hf/` specs) pass
+    through untouched — only specs that name a local path (an existing
+    path, or a `.py` file/glob) are absolutized, `@task` selector preserved.
+    """
+    file, sep, attr = spec.rpartition("@")
+    candidate = file if sep else spec
+    if not candidate or candidate.startswith("hf/"):
+        return spec
+    if candidate.endswith(".py") or os.path.exists(candidate):
+        absolute = os.path.abspath(candidate)
+        return f"{absolute}@{attr}" if sep else absolute
+    return spec
+
+
+def _resolve_addable_server(pid: int | None) -> DiscoveredControlServer:
+    """Pick the process a `task add` targets, or exit.
+
+    With `--pid` the matching process is used (error if none matches);
+    without it, the sole running process is the default, and among several
+    the sole *addable* one (live keep-alive intent, reported on the task
+    rows) wins — otherwise the choice is ambiguous and the error names the
+    candidate pids.
+    """
+    servers = _http.list_discovered_servers()
+    if not servers:
+        _fail("not_found", "No running inspect processes found.")
+    if pid is not None:
+        matching = [s for s in servers if s.pid == pid]
+        if not matching:
+            _fail("not_found", f"No running inspect process with pid {pid}.")
+        return matching[0]
+    if len(servers) == 1:
+        return servers[0]
+    summaries = _fetch._fetch_summaries(servers).summaries
+    addable_sockets = {
+        str(s.get("socket_path")) for s in summaries if s.get("keep_alive")
+    }
+    addable = [s for s in servers if str(s.socket_path) in addable_sockets]
+    if len(addable) == 1:
+        return addable[0]
+    pids = ", ".join(str(s.pid) for s in servers)
+    _fail(
+        "ambiguous",
+        f"Multiple inspect processes are running (pids: {pids}). "
+        "Pass --pid to disambiguate.",
+    )
+
+
+@_envelope_failures
+def _run_task_add(
+    spec: str,
+    *,
+    model: str | None,
+    task_arg: tuple[str, ...],
+    dry_run: bool,
+    pid: int | None,
+    as_json: bool,
+    terse: bool | None = None,
+) -> None:
+    server = _resolve_addable_server(pid)
+
+    # -T values parse with the same YAML-ish parse `inspect eval -T` uses,
+    # so the two surfaces can't drift
+    task_args = parse_cli_args(task_arg)
+    body: dict[str, Any] = {
+        "spec": _absolute_spec(spec),
+        # always sent, minted per invocation: makes this command's
+        # transport-level retries (retry_mutation below) safe by construction
+        "request_id": str(uuid_lib.uuid4()),
+    }
+    if task_args:
+        body["task_args"] = task_args
+    if model is not None:
+        body["model"] = model
+    if dry_run:
+        body["dry_run"] = True
+
+    result = _http._request_json(
+        str(server.socket_path),
+        "/tasks",
+        json_body=body,
+        what=f"task add of '{spec}'",
+        # POST /tasks never answers an entity 404 — a 404 here is the stock
+        # router one from a pre-URL-realignment server (the 405 sibling is
+        # handled by the same not_found_missing_route hook)
+        not_found=_ADD_ROUTE_MISSING,
+        not_found_missing_route=_ADD_ROUTE_MISSING,
+        mutate="post",
+        retry_mutation=True,
+        pid=server.pid,
+    )
+
+    if as_json:
+        target: dict[str, Any] = {"pid": server.pid, "spec": spec}
+        _echo_raw(
+            json_lib.dumps(
+                _mutation_envelope(target, result, dry_run=dry_run), indent=2
+            )
+        )
+        return
+
+    rows = list(result.get("tasks") or [])
+    changed = bool(result.get("changed"))
+
+    def row_line(row: dict[str, Any]) -> str:
+        name = _sanitize_line(str(row.get("task_name") or "?"))
+        row_model = _sanitize_line(str(row.get("model") or "?"))
+        samples = int(row.get("samples", 0) or 0)
+        epochs = int(row.get("epochs", 1) or 1)
+        shape = f"{samples} sample{'' if samples == 1 else 's'}"
+        if epochs > 1:
+            shape += f" x {epochs} epochs"
+        return f"{name} ({row_model}) — task_id {row.get('task_id')}, {shape}"
+
+    if _use_terse(terse):
+        noun = f"{len(rows)} task{'' if len(rows) == 1 else 's'}"
+        if not changed:
+            outcome = f"no-op — this request was already accepted ({noun} queued)"
+        elif dry_run:
+            outcome = f"dry-run — would add {noun}"
+        else:
+            outcome = f"applied — {noun} queued"
+        if len(rows) == 1:
+            outcome += f": {row_line(rows[0])}"
+        _echo(_terse_line("add", spec, outcome))
+        return
+
+    if not changed:
+        _echo(
+            "Nothing to do: this request was already accepted "
+            f"({len(rows)} task{'' if len(rows) == 1 else 's'} queued)."
+        )
+    elif dry_run:
+        _echo(f"Would add {len(rows)} task{'' if len(rows) == 1 else 's'}:")
+    else:
+        _echo(
+            f"Added {len(rows)} task{'' if len(rows) == 1 else 's'} to the "
+            f"running eval (pid {server.pid}):"
+        )
+    for row in rows:
+        _echo(f"  {row_line(row)}")
+    if changed and not dry_run:
+        _echo("Track progress with `inspect ctl task list`.")
 
 
 def _still_held_note(held: list[str]) -> str:

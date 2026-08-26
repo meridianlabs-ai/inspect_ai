@@ -51,17 +51,32 @@ class TaskEnqueuer:
     def enqueue(self, tasks: "Tasks") -> list["ResolvedTask"]:
         """Resolve ``tasks`` and queue them to run; returns the resolved tasks."""
         resolved = self._resolve(tasks)
+        self.enqueue_resolved(resolved)
+        return resolved
+
+    def enqueue_resolved(self, resolved: list["ResolvedTask"]) -> None:
+        """Queue already-resolved tasks to run (fires the enqueue wake).
+
+        The entry point for callers that resolve before enqueueing — the
+        control channel's task-add accept path resolves once and buffers the
+        exact ``ResolvedTask``s whose ids it reported, where resolve-then-
+        ``enqueue()`` would re-resolve and mint different ids.
+        """
         with self._lock:
             self._pending.extend(resolved)
         if self.on_enqueue is not None:
             self.on_enqueue()
-        return resolved
 
     def drain(self) -> list["ResolvedTask"]:
         """Remove and return all currently-buffered tasks (empty if none)."""
         with self._lock:
             batch, self._pending = self._pending, []
         return batch
+
+    def has_pending(self) -> bool:
+        """Whether any buffered tasks are awaiting a drain (non-destructive)."""
+        with self._lock:
+            return bool(self._pending)
 
 
 # The active run's enqueuer, scoped to the run's async context. The ``run_id``
@@ -95,9 +110,10 @@ def enqueue_task(tasks: "Tasks", *, run_id: str | None = None) -> None:
     ``eval_id``/``task_id`` each, their own log files), resolved against the
     run's models and config.
 
-    When the run is driven by a :class:`~inspect_ai.TaskSource`, added tasks are
-    *live*: they start as soon as there is free capacity. Otherwise they run as a
-    follow-up batch, after the in-flight batch of tasks completes.
+    When the run executes tasks concurrently (``max_tasks`` > 1), added tasks
+    are *live*: they start as soon as there is free capacity. Otherwise (one
+    task at a time) they run as a follow-up batch, after the in-flight batch
+    of tasks completes.
 
     Args:
         tasks: A ``Task`` (or list of tasks) to add to the running eval.

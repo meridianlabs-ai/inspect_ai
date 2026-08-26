@@ -17,6 +17,7 @@
 - Control Channel: A runaway polling client can no longer starve the eval by piling up queued requests — excess concurrent connections are rejected as busy, and `inspect ctl` retries them shortly.
 - Control Channel: Read requests whose client has already hung up (timed out or killed mid-request) are no longer served, so stale queued polls stop stealing time from running samples.
 - Control Channel: Task-selecting `inspect ctl` commands now take a `--model` disambiguator, so one task run against several models can be selected by name (e.g. `inspect ctl task cancel my_task --model gpt-5`).
+- Control Channel: New `inspect ctl task add` runs an additional task inside a running (or keep-alive-parked) `--ctl-server=keep` eval process under the same run id, without paying a new process launch.
 
 ## 0.3.260 (21 August 2026)
 

@@ -432,7 +432,29 @@ async def eval_run(
         if inject is not None:
 
             async def feed_drain() -> list[TaskRunOptions]:
-                return await prepare_options(inject.drain())
+                batch = inject.drain()
+                if not batch:
+                    return []
+                try:
+                    return await prepare_options(batch)
+                except Exception as ex:
+                    # contain a bad injected batch (a sandbox image that
+                    # fails to pull, log storage rejecting the header write):
+                    # prepare runs inside the dispatcher's drain, where an
+                    # exception would unwind the run's task group and cancel
+                    # every in-flight sibling — acceptable at launch (nothing
+                    # is running yet), not for one bad add against a live
+                    # run. Tasks whose loggers initialized before the failure
+                    # are torn down at run end via prepared_options.
+                    if debug_errors:
+                        raise
+                    names = ", ".join(sorted({t.task.name for t in batch}))
+                    log.error(
+                        f"Task(s) added to the running eval failed to "
+                        f"prepare and will not run ({names}): "
+                        f"{exception_message(ex)}"
+                    )
+                    return []
 
             async def feed_next() -> list[TaskRunOptions] | None:
                 more = await inject.next()
@@ -708,6 +730,33 @@ async def run_task_retry_attempts(
             add_dispatch_waker(wake.set)
             register_task_dispatcher(dispatcher_stats)
             async with anyio.create_task_group() as tg:
+                # Fully-idle source poll, run as a background task racing the
+                # dispatch waker: feed.next() (a TaskSource's next_tasks())
+                # may block indefinitely, and a task enqueued while it blocks
+                # must dispatch immediately — inside a plain
+                # `await feed.next()` the enqueue wake would have no waiter.
+                # On an enqueue-won wake the poll continues underneath (so
+                # next_tasks() can resolve concurrently with running tasks);
+                # its eventual yield is buffered here and dispatched on the
+                # wake its completion fires — neither dropped nor
+                # double-polled. At most one poll is in flight (`polling`).
+                polling = False
+                poll_yields: list[list[TaskRunOptions]] = []
+                poll_scope: anyio.CancelScope | None = None
+
+                async def poll_feed_next() -> None:
+                    nonlocal polling, source_done, poll_scope
+                    with anyio.CancelScope() as scope:
+                        poll_scope = scope
+                        try:
+                            more = await feed.next()
+                        finally:
+                            polling = False
+                        if more is None:
+                            source_done = True
+                        else:
+                            poll_yields.append(more)
+                        wake.set()
 
                 async def run_one(item: PendingTask) -> None:
                     nonlocal in_flight, cancelled
@@ -810,10 +859,13 @@ async def run_task_retry_attempts(
                     wake.set()
 
                 while True:
-                    # pick up tasks buffered since the last cycle (non-blocking)
+                    # pick up tasks buffered since the last cycle (non-blocking):
+                    # enqueued injections, then any batch the source poll yielded
                     injected = await feed.drain()
                     if injected:
                         add(injected)
+                    while poll_yields:
+                        add(poll_yields.pop(0))
 
                     # dispatch up to the concurrency cap (model-balanced),
                     # re-reading the live `ctl config --max-tasks` override
@@ -842,15 +894,20 @@ async def run_task_retry_attempts(
                         await wake.wait()
                         continue
 
-                    # fully idle: ask the source for more (may block) and finish
-                    # when it is exhausted
+                    # fully idle: ask the source for more (in the background,
+                    # racing the dispatch waker — see poll_feed_next) and
+                    # finish when it is exhausted
                     if source_done:
                         break
-                    more = await feed.next()
-                    if more is None:
-                        source_done = True
-                    else:
-                        add(more)
+                    if not polling:
+                        polling = True
+                        tg.start_soon(poll_feed_next)
+                    await wake.wait()
+
+                # the run is over — cancel a still-blocked source poll so the
+                # task group can close (the source is not consulted again)
+                if poll_scope is not None:
+                    poll_scope.cancel()
         # exceptions can escape when debug_errors is True and that's okay
         except ExceptionGroup as ex:
             if debug_errors:
