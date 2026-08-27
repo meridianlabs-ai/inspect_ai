@@ -889,3 +889,109 @@ async def test_task_add_runs_while_source_poll_blocked_parallel(tmp_path) -> Non
 async def test_task_add_runs_while_source_poll_blocked_serial(tmp_path) -> None:
     """`run_batches` shape (`parallel == 1`): the add runs as a follow-up batch."""
     await _run_add_while_source_blocked(tmp_path, max_tasks=1)
+
+
+@skip_if_trio
+async def test_buffered_add_runs_after_release_despite_cancelled_batch(
+    tmp_path, monkeypatch
+) -> None:
+    """An accepted add still runs when a release and a cancelled batch end the run.
+
+    Exercises the park gate's obligation arm end to end: the add is accepted
+    while the run is live (keep intent on), a release then flips intent off,
+    and the batch ends cancelled — so `run_batches` breaks without draining
+    and the gate is reached with intent off and the accepted add still
+    buffered. Acceptance is an obligation senior to release, so the add must
+    run — on the very path where plain `enqueue_task` leftovers are dropped
+    (`test_cancelled_run_drops_buffered_additions`).
+    """
+    from inspect_ai._control.discovery import list_discovered_servers
+    from inspect_ai._eval.eval import eval_async
+    from inspect_ai._eval.task.run import task_run as original_task_run
+    from inspect_ai.solver import Generate, TaskState, solver
+
+    task_file = tmp_path / "park_added_task.py"
+    task_file.write_text(
+        "from inspect_ai import Task, task\n"
+        "from inspect_ai.dataset import Sample\n"
+        "from inspect_ai.solver import generate\n"
+        "\n"
+        "@task\n"
+        "def park_added():\n"
+        '    return Task(dataset=[Sample(input="hi")], solver=[generate()],'
+        ' name="park_added")\n'
+    )
+
+    async def cancelling_task_run(options: Any, task_cancel: Any = None) -> Any:
+        # emulate external cancellation of the parent batch (a cancelled log,
+        # no exception) so the run reaches the park gate via the break path
+        result = await original_task_run(options, task_cancel=task_cancel)
+        if options.task.name == "gate_parent":
+            result.status = "cancelled"
+        return result
+
+    monkeypatch.setattr("inspect_ai._eval.run.task_run", cancelling_task_run)
+
+    proceed = anyio.Event()
+
+    @solver
+    def hold_until_posted():
+        async def solve(state: TaskState, generate: Generate) -> TaskState:
+            with anyio.fail_after(30):
+                await proceed.wait()
+            return state
+
+        return solve
+
+    parent = Task(
+        dataset=[Sample(input="hi", target="ok")],
+        solver=[hold_until_posted()],
+        name="gate_parent",
+    )
+
+    logs: list[Any] = []
+
+    async def run_eval() -> None:
+        logs.extend(
+            await eval_async(
+                parent,
+                model="mockllm/model",
+                ctl_server="keep",
+                log_dir=str(tmp_path / "logs"),
+            )
+        )
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(run_eval)
+
+        def our_servers() -> list[Any]:
+            return [s for s in list_discovered_servers() if s.pid == os.getpid()]
+
+        with anyio.fail_after(30):
+            while not our_servers():
+                await anyio.sleep(0.05)
+        servers = our_servers()
+        assert len(servers) == 1
+        transport = httpx.AsyncHTTPTransport(uds=str(servers[0].socket_path))
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://localhost", timeout=10.0
+        ) as client:
+            response = await client.post(
+                "/tasks", json={"spec": f"{task_file}@park_added"}
+            )
+            assert response.status_code == 200, response.text
+            release = await client.post("/release")
+            assert release.status_code == 200
+            proceed.set()
+
+    # the parent's batch ended cancelled and the release was honored — after
+    # the buffered add ran (never re-parking, so the eval returned on its own)
+    assert sorted(log.eval.task for log in logs) == ["gate_parent", "park_added"]
+    assert (
+        next(log.status for log in logs if log.eval.task == "gate_parent")
+        == "cancelled"
+    )
+    assert (
+        next(log.status for log in logs if log.eval.task == "park_added") == "success"
+    )
+    assert len({log.eval.run_id for log in logs}) == 1

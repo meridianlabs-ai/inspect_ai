@@ -242,3 +242,62 @@ def test_enqueue_task_does_not_leak_active_model() -> None:
 def test_enqueue_task_outside_run_raises() -> None:
     with pytest.raises(RuntimeError, match="while an eval is running"):
         enqueue_task(child())
+
+
+def test_enqueuer_marks_obligations_distinctly() -> None:
+    """Obligation entries are tracked apart from plain ones; drain clears both.
+
+    The keep-alive park gate keys on ``has_pending_obligation()`` — buffered
+    control-channel adds (accepted-means-will-run) open the park even with
+    keep intent off, where plain ``enqueue_task`` leftovers must not.
+    """
+    from typing import Any, cast
+
+    from inspect_ai._eval.task.enqueue import create_task_enqueuer
+
+    enqueuer = create_task_enqueuer("run-1", lambda tasks: [])
+    plain = cast(Any, object())
+    enqueuer.enqueue_resolved([plain])
+    assert enqueuer.has_pending()
+    assert not enqueuer.has_pending_obligation()
+    enqueuer.enqueue_resolved([plain], obligation=True)
+    assert enqueuer.has_pending_obligation()
+    assert len(enqueuer.drain()) == 2
+    assert not enqueuer.has_pending()
+    assert not enqueuer.has_pending_obligation()
+
+
+def test_cancelled_run_drops_buffered_additions(monkeypatch) -> None:
+    """A run ended by a cancelled batch drops plain enqueue_task() leftovers.
+
+    Regression: the keep-alive park gate widened to honor buffered
+    control-channel adds; keyed on the whole enqueuer buffer, it resurrected
+    an ``enqueue_task()`` follow-up after a cancellation in a process that
+    never asked for keep-alive. The gate keys on obligations now, so the
+    leftover is dropped exactly as before the widening.
+    """
+    from typing import Any
+
+    from inspect_ai._eval.task.run import task_run as original_task_run
+
+    async def cancelling_task_run(options: Any, task_cancel: Any = None) -> Any:
+        # emulate external cancellation of the batch (the shape the display's
+        # cancel binding produces): the log reports cancelled but no exception
+        # unwinds the run, so the eval proceeds to the keep-alive park gate
+        result = await original_task_run(options, task_cancel=task_cancel)
+        result.status = "cancelled"
+        return result
+
+    monkeypatch.setattr("inspect_ai._eval.run.task_run", cancelling_task_run)
+
+    parent = Task(
+        dataset=[Sample(input="hi", target="ok")],
+        solver=[enqueue_child()],
+        name="parent",
+    )
+    logs = eval(parent, model="mockllm/model", display="none")
+
+    # the buffered child never ran: a cancelled run without keep-alive intent
+    # exits instead of executing leftover additions
+    assert [log.eval.task for log in logs] == ["parent"]
+    assert logs[0].status == "cancelled"

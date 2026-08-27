@@ -1078,7 +1078,7 @@ async def _eval_async_inner(
         add_capability = AddTaskCapability(
             run_id=run_id,
             resolve=resolve_add_spec,
-            enqueue=enqueuer.enqueue_resolved,
+            enqueue=functools.partial(enqueuer.enqueue_resolved, obligation=True),
             eval_set=eval_set_id is not None,
             run_epochs=eval_config.epochs,
             run_limit=eval_config.limit,
@@ -1324,13 +1324,17 @@ async def _eval_async_inner(
             # control-channel task add is buffered: an accepted add is an
             # obligation senior to release, so the gate widens to drain it
             # (the loop below honors the release once the buffer is dry).
+            # The gate keys on buffered *obligations* specifically, not any
+            # pending entry: plain enqueue_task leftovers (buffered when a
+            # cancelled batch ended the run) must not resurrect post-cancel
+            # in a process that never asked for keep-alive.
             # The park sits deliberately outside scan_cm (scanning spans
             # sessions by *resuming* — see run_session) so the scan dir is
             # finalized and readable whenever the process is parked.
             if (
                 eval_set_id is None
                 and _ctl_server is not None
-                and (keep_alive_intent() or enqueuer.has_pending())
+                and (keep_alive_intent() or enqueuer.has_pending_obligation())
             ):
                 import rich
 
