@@ -360,6 +360,7 @@ async def eval_run(
                     dataset=task.dataset,
                     scorer=eval_scorer_specs,
                     metrics=eval_metrics,
+                    headline_metric=task.headline_metric,
                     sandbox=resolved_task.sandbox,
                     task_attribs=task.attribs,
                     task_args=getattr(
@@ -797,6 +798,31 @@ async def run_task_retry_attempts(
                             poll_yields.append(more)
                         wake.set()
 
+                # Run-scoped periodic [Throughput] trace reporter (see
+                # design/model-throughput.md §4). Its own cancel scope: the
+                # dispatch loop below exits by `break` while the task group
+                # waits for children, so the reporter must be cancelled
+                # explicitly then (exceptions/cancellation tear down the
+                # whole group, reporter included).
+                reporter_scope = anyio.CancelScope()
+
+                async def throughput_reporter() -> None:
+                    from inspect_ai.model._throughput import (
+                        report_throughput_periodically,
+                    )
+
+                    with reporter_scope:
+                        # the reporter is observability only — a bug in it
+                        # must never propagate into the task group and take
+                        # down the run (cancellation passes through: it's a
+                        # BaseException, not Exception)
+                        try:
+                            await report_throughput_periodically()
+                        except Exception as ex:
+                            log.warning(f"Throughput reporter failed: {ex}")
+
+                tg.start_soon(throughput_reporter)
+
                 async def run_one(item: PendingTask) -> None:
                     nonlocal in_flight, cancelled
                     options = item.options
@@ -943,10 +969,13 @@ async def run_task_retry_attempts(
                         tg.start_soon(poll_feed_next)
                     await wake.wait()
 
-                # the run is over — cancel a still-blocked source poll so the
-                # task group can close (the source is not consulted again)
+                # dispatch complete (only the `break` paths reach here) —
+                # cancel a still-blocked source poll (the source is not
+                # consulted again) and stop the reporter so the task group
+                # can close
                 if poll_scope is not None:
                     poll_scope.cancel()
+                reporter_scope.cancel()
         # exceptions can escape when debug_errors is True and that's okay
         except ExceptionGroup as ex:
             if debug_errors:
