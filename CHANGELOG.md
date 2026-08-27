@@ -1,5 +1,6 @@
 ## Unreleased
 
+- Eval Set: A selection document's operational overrides gain a dataset `limit` and `max_sandboxes`.
 - Scoring: Skip Score.unscored() / NaN-at-root sentinels in aggregate() metric. (#5008)
 - Scoring: Return inf on OverflowError in perplexity_per_token() and perplexity_per_seq() metrics. (#5028)
 - Analysis: Ensure ColumnError.path is a string rather than a JSONPath object on record import errors. (#5006)
@@ -32,6 +33,7 @@
 - Control Channel: New `inspect ctl task add` runs an additional task inside a running (or keep-alive-parked) `--ctl-server=keep` eval process under the same run id, without paying a new process launch.
 - Eval: On runs executing tasks concurrently (`max_tasks` > 1), `enqueue_task()` additions now start as soon as there is free capacity instead of after the in-flight batch, and `--debug-errors` is now honored (a task error unwinds the run).
 - Model roles can now be bound to a list of models (e.g. `model_roles={"grader": [...]}`), with model-graded scorers grading by majority vote across the list.
+- Checkpointing: Sandbox snapshots now support selectable strategies (per sandbox, settable at the sample, task, or eval layer) — incremental restic (default) or self-contained per-checkpoint archives captured with in-image tools only.
 
 ## 0.3.260 (21 August 2026)
 
