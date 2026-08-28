@@ -245,6 +245,7 @@ async def _get_response_with_retry_async(
     path: str,
     *,
     params: dict[str, Any] | None = None,
+    json_body: dict[str, Any] | None = None,
     what: str,
     method: Literal["get", "post", "patch"] = "get",
     raise_on_busy: bool = False,
@@ -312,7 +313,9 @@ async def _get_response_with_retry_async(
                 base_url="http://localhost",
                 timeout=_REQUEST_TIMEOUT,
             ) as client:
-                response = await client.request(method, path, params=params or {})
+                response = await client.request(
+                    method, path, params=params or {}, json=json_body
+                )
         except httpx.TimeoutException as exc:
             last_timeout = exc
             timeouts += 1
@@ -404,6 +407,7 @@ def _get_response_with_retry(
     path: str,
     *,
     params: dict[str, Any] | None = None,
+    json_body: dict[str, Any] | None = None,
     what: str,
     method: Literal["get", "post", "patch"] = "get",
     raise_on_busy: bool = False,
@@ -417,6 +421,7 @@ def _get_response_with_retry(
             socket_path,
             path,
             params=params,
+            json_body=json_body,
             what=what,
             method=method,
             raise_on_busy=raise_on_busy,
@@ -477,6 +482,7 @@ def _request_json(
     not_found: str,
     not_found_missing_route: str | None = None,
     params: dict[str, Any] | None = None,
+    json_body: dict[str, Any] | None = None,
     mutate: Literal["post", "patch"] | None = None,
     retry_mutation: bool = False,
     pid: int | None = None,
@@ -502,7 +508,15 @@ def _request_json(
     process is running an older inspect — prints it instead of ``not_found``,
     which then only ever means the endpoint answered "entity not found".
     Without it every 404 prints ``not_found``, which must therefore hedge
-    both meanings; new endpoints should pass it rather than hedge.
+    both meanings; new endpoints should pass it rather than hedge. A stock
+    **405** is treated the same way when the caller passes it: it means the
+    path matched but the method has no route (a new method on an existing
+    path — e.g. ``POST /tasks`` against a server whose ``/tasks`` is
+    GET-only), which is version skew just as definitively as the router 404.
+
+    ``json_body`` sends the request with a JSON body (the body-carried
+    mutations, e.g. task add — ``-T`` args are an open map query params
+    can't carry).
 
     ``pid`` scopes the retry-exhaustion escalation pointer to the target
     process (see :func:`_get_response_with_retry`) — pass it when the caller
@@ -534,6 +548,7 @@ def _request_json(
                 socket_path,
                 path,
                 params=params,
+                json_body=json_body,
                 what=f"Updating {what}",
                 method=mutate,
                 pid=pid,
@@ -546,9 +561,9 @@ def _request_json(
                 timeout=httpx.Timeout(_MUTATION_TIMEOUT, connect=_CONNECT_TIMEOUT),
             ) as client:
                 if mutate == "post":
-                    response = client.post(path, params=params)
+                    response = client.post(path, params=params, json=json_body)
                 else:
-                    response = client.patch(path, params=params)
+                    response = client.patch(path, params=params, json=json_body)
         else:
             response = _get_response_with_retry(
                 socket_path, path, params=params, what=f"Reading {what}", pid=pid
@@ -562,6 +577,16 @@ def _request_json(
                     missing_route=True,
                 )
             fail("not_found", not_found, status=404)
+        if response.status_code == 405 and not_found_missing_route is not None:
+            # a method with no route on an existing path — version skew, the
+            # 405 sibling of the stock 404 above (no control endpoint answers
+            # 405 itself)
+            fail(
+                "not_found",
+                not_found_missing_route,
+                status=405,
+                missing_route=True,
+            )
         if response.status_code == 400:
             fail(
                 "invalid_request",

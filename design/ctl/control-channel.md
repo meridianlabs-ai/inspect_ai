@@ -359,7 +359,7 @@ The URL scheme has one rule — **three scopes, three roots**: process-scoped op
 | Eval-wide transcript fan-in (push only) | `GET /evals/<id>/samples/events` (SSE) | 4 |
 | Flush buffered samples to the log | `POST /tasks/<task-id>/log-flush` | 3 ✅ |
 | Read / modify retunable config (concurrency limits, buffer params) | `GET`+`PATCH /config` (process) and `/tasks/<task-id>/config` (task) | 3 ✅ (max-samples / max-sandboxes / max-subprocesses / max-connections / named `concurrency()` keys via `--key` / log-buffer / log-shared) |
-| Add a task to a running eval | `POST /tasks` (task spec → new sibling eval under this run) | 3 |
+| Add a task to a running eval | `POST /tasks` (task spec → new sibling eval under this run) | 3 ✅ (see `task-add.md`) |
 | Cancel task | `POST /tasks/<task-id>/cancel?action=cancel\|score\|error` | 3 ✅ |
 | Cancel sample | `POST /evals/<id>/sample/cancel?sample_id=<sid>&epoch=<n>&action=score\|error\|cancel` | 3 ✅ |
 | Pause / resume task | `POST /tasks/<task-id>/pause` / `…/resume` | 3 ✅ (see `design/ctl/pause-resume.md`) |
@@ -876,6 +876,8 @@ The `concurrency()` registry is a public API, and per-knob CLI flags will never 
 - **Version skew.** A pre-strict server ignored the unknown query params and would return 200 with the key silently unapplied, so the knob rode the then-current version gate ("Version skew" above): it shipped as since-2 in `_KNOB_SINCE`, with `CONTROL_API_VERSION` bumped to 2 in the same PR, so the CLI refused a `--key` against an older process *before* sending the PATCH (the gate has since been retired — issue #67; strict servers now 400 unknown knobs).
 
 #### Add a task to a running eval
+
+> **Designed and implemented in [`task-add.md`](task-add.md)**, which owns the semantics and supersedes this sketch where they differ — notably the response returns **`task_id`s, not `eval_id`s** (minted at resolution, and the selector the ctl surface takes), and no worker pool is pre-started (the post-merge dispatcher injects on free capacity). The sketch below is kept for the original rationale.
 
 `POST /tasks` (CLI: `inspect ctl task add SPEC [...]`) submits a **task spec** that runs in the target process under the same `run_id`, appearing as a new sibling eval in `task list` / `sample list` / `sample events`. Returns the new `eval_id`.
 

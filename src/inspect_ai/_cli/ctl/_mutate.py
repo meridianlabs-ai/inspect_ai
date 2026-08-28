@@ -110,6 +110,12 @@ _PAUSE_ROUTE_MISSING = (
 )
 
 
+_ADD_ROUTE_MISSING = (
+    "This process is running an older inspect without the task add "
+    "endpoint; restart the eval to pick up the current version."
+)
+
+
 def _terse_held_suffix(held: list[str]) -> str:
     """The still-held latches folded into a terse `task resume` line.
 

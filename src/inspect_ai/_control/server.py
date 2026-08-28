@@ -25,17 +25,19 @@ plus ``POST /release`` / ``POST /keep`` for keep-alive control
 and the first phase-3 directives: the config/log-flush mutations,
 ``POST /tasks/{id}/cancel`` / ``POST /evals/{id}/sample/cancel``,
 ``POST /evals/{id}/sample/cancel-tool-call``,
-``POST /evals/{id}/sample/requeue``, and
+``POST /evals/{id}/sample/requeue``, ``POST /tasks`` (task add — see
+``design/ctl/task-add.md``), and
 the pause/resume latches (``POST /tasks/{id}/pause`` / ``…/resume``,
 process-scoped ``POST /pause`` / ``POST /resume``, and model-scoped
 ``POST /models/pause`` / ``…/resume``).
-The remaining directives (drain / add-task) and SSE push land
+The remaining directives (drain) and SSE push land
 with the rest of phases 3-4.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -46,6 +48,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     AsyncIterator,
+    Callable,
     Literal,
     NamedTuple,
     cast,
@@ -409,11 +412,29 @@ class ControlServer:
             while keep_alive_intent():
                 await self._park_cond.wait()
 
-    async def notify_park_change(self) -> None:
-        """Wake :meth:`wait_for_release` so it re-checks the keep-alive intent.
+    async def wait_for_release_or_add(self, pending_adds: Callable[[], bool]) -> None:
+        """Park until keep-alive is released or a task add is buffered.
 
-        Only ``POST /release`` needs this — the park exits on a transition to
-        OFF, so a keep (which sets the intent ON) has nothing to wake.
+        The widened :meth:`wait_for_release` for a park that can relaunch a
+        session (see ``design/ctl/task-add.md``): returns when the intent is
+        off *or* ``pending_adds()`` reports buffered tasks. Both conditions
+        are re-checked under the park's condition variable before sleeping,
+        so an add accepted between the caller's empty drain and this wait is
+        never a lost wake.
+        """
+        async with self._park_cond:
+            while keep_alive_intent() and not pending_adds():
+                await self._park_cond.wait()
+
+    async def notify_park_change(self) -> None:
+        """Wake the park waits so they re-check their conditions.
+
+        Fired by ``POST /release`` (the park exits on a transition to OFF —
+        a keep, which sets the intent ON, has nothing to wake) and by every
+        accepted ``POST /tasks`` add (harmless while the queue is open —
+        nothing is waiting on it — and it avoids contending for the
+        enqueuer's single ``on_enqueue`` slot, which the injection feed owns
+        while a session runs).
         """
         async with self._park_cond:
             self._park_cond.notify_all()
@@ -433,6 +454,7 @@ class ControlServer:
         )
         from inspect_ai._control.strict import (
             UnknownQueryParamsError,
+            raw_request_body,
             reject_unknown_query_params,
         )
 
@@ -629,6 +651,66 @@ class ControlServer:
                 # window when this listing is still empty).
                 summary["api_version"] = CONTROL_API_VERSION
             return summaries
+
+        # Add a task to the running eval (phase 3 — see design/ctl/task-add.md):
+        # a spec (registry name / file path + task args + optional model)
+        # resolved in-process and run under the same run_id as a new sibling
+        # eval. The creation verb on the collection GET /tasks lists — and,
+        # uniquely among the mutations, a JSON body: the -T task args are an
+        # open map query params can't carry (the body model's extra="forbid"
+        # keeps the strict fail-loud contract). Only an *addable* run (live
+        # keep-alive intent) accepts; resolution failures are 400s. An
+        # accepted add wakes the keep-alive park so a parked process
+        # relaunches a session for it.
+        @app.post("/tasks")
+        async def add_task_route(raw_body: bytes = Depends(raw_request_body)) -> Any:
+            from pydantic import ValidationError
+
+            from inspect_ai._control.add_task import (
+                AddTaskBody,
+                AddTaskInvalid,
+                add_task,
+            )
+
+            # parse and validate here (rather than typing the route param as
+            # AddTaskBody or Body(...)) so every failure — malformed JSON and
+            # a missing/non-object body included — uses the channel's
+            # {"error": ...} 400 contract instead of FastAPI's 422 detail
+            # shape
+            try:
+                body = json.loads(raw_body or b"null")
+            except ValueError:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "request body must be valid JSON"},
+                )
+            if not isinstance(body, dict):
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "request body must be a JSON object"},
+                )
+            try:
+                request = AddTaskBody.model_validate(body)
+            except ValidationError as exc:
+                return JSONResponse(status_code=400, content={"error": str(exc)})
+            try:
+                result = add_task(
+                    request.spec,
+                    task_args=request.task_args,
+                    model=request.model,
+                    request_id=request.request_id,
+                    dry_run=request.dry_run,
+                )
+            except AddTaskInvalid as exc:
+                # covers spec-resolution failures too (add_task wraps them),
+                # and only pre-enqueue failures: a fault after the add was
+                # applied propagates as a 500 rather than a lying 400
+                return JSONResponse(status_code=400, content={"error": str(exc)})
+            if result["ok"] is False:
+                return JSONResponse(status_code=409, content={"error": result["error"]})
+            if result["changed"] and not request.dry_run:
+                await self.notify_park_change()
+            return result
 
         @app.get("/evals/{eval_id}/samples", dependencies=skip_disconnected)
         async def list_eval_samples(

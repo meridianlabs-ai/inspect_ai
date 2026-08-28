@@ -44,6 +44,7 @@ class TaskEnqueuer:
     run_id: str
     _resolve: ResolveTasksFn
     _pending: list["ResolvedTask"] = field(default_factory=list)
+    _obligated: bool = False
     _lock: Lock = field(default_factory=Lock)
     on_enqueue: Callable[[], None] | None = None
     """Fired after tasks are buffered — used by a live run to wake dispatch."""
@@ -51,17 +52,49 @@ class TaskEnqueuer:
     def enqueue(self, tasks: "Tasks") -> list["ResolvedTask"]:
         """Resolve ``tasks`` and queue them to run; returns the resolved tasks."""
         resolved = self._resolve(tasks)
+        self.enqueue_resolved(resolved)
+        return resolved
+
+    def enqueue_resolved(
+        self, resolved: list["ResolvedTask"], *, obligation: bool = False
+    ) -> None:
+        """Queue already-resolved tasks to run (fires the enqueue wake).
+
+        The entry point for callers that resolve before enqueueing — the
+        control channel's task-add accept path resolves once and buffers the
+        exact ``ResolvedTask``s whose ids it reported, where resolve-then-
+        ``enqueue()`` would re-resolve and mint different ids.
+
+        ``obligation`` marks entries whose acceptance promised they will run
+        (a control-channel add, accepted only under keep-alive intent): the
+        eval loop's park gate honors a buffered obligation even when the run
+        ends with intent off (a release raced the accept), where plain
+        ``enqueue_task`` leftovers — e.g. buffered when a cancelled batch
+        ended the run — are dropped with the run as they always were.
+        """
         with self._lock:
             self._pending.extend(resolved)
+            if obligation and resolved:
+                self._obligated = True
         if self.on_enqueue is not None:
             self.on_enqueue()
-        return resolved
 
     def drain(self) -> list["ResolvedTask"]:
         """Remove and return all currently-buffered tasks (empty if none)."""
         with self._lock:
             batch, self._pending = self._pending, []
+            self._obligated = False
         return batch
+
+    def has_pending(self) -> bool:
+        """Whether any buffered tasks are awaiting a drain (non-destructive)."""
+        with self._lock:
+            return bool(self._pending)
+
+    def has_pending_obligation(self) -> bool:
+        """Whether the buffer holds tasks whose acceptance promised a run."""
+        with self._lock:
+            return self._obligated
 
 
 # The active run's enqueuer, scoped to the run's async context. The ``run_id``
@@ -95,9 +128,10 @@ def enqueue_task(tasks: "Tasks", *, run_id: str | None = None) -> None:
     ``eval_id``/``task_id`` each, their own log files), resolved against the
     run's models and config.
 
-    When the run is driven by a :class:`~inspect_ai.TaskSource`, added tasks are
-    *live*: they start as soon as there is free capacity. Otherwise they run as a
-    follow-up batch, after the in-flight batch of tasks completes.
+    When the run executes tasks concurrently (``max_tasks`` > 1), added tasks
+    are *live*: they start as soon as there is free capacity. Otherwise (one
+    task at a time) they run as a follow-up batch, after the in-flight batch
+    of tasks completes.
 
     Args:
         tasks: A ``Task`` (or list of tasks) to add to the running eval.

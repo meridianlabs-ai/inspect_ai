@@ -45,6 +45,8 @@
 - Control Channel: A runaway polling client can no longer starve the eval by piling up queued requests — excess concurrent connections are rejected as busy, and `inspect ctl` retries them shortly.
 - Control Channel: Read requests whose client has already hung up (timed out or killed mid-request) are no longer served, so stale queued polls stop stealing time from running samples.
 - Control Channel: Task-selecting `inspect ctl` commands now take a `--model` disambiguator, so one task run against several models can be selected by name (e.g. `inspect ctl task cancel my_task --model gpt-5`).
+- Control Channel: New `inspect ctl task add` runs an additional task inside a running (or keep-alive-parked) `--ctl-server=keep` eval process under the same run id, without paying a new process launch.
+- Eval: On runs executing tasks concurrently (`max_tasks` > 1), `enqueue_task()` additions now start as soon as there is free capacity instead of after the in-flight batch, and `--debug-errors` is now honored (a task error unwinds the run).
 - Model roles can now be bound to a list of models (e.g. `model_roles={"grader": [...]}`), with model-graded scorers grading by majority vote across the list.
 - Checkpointing: Sandbox snapshots now support selectable strategies (per sandbox, settable at the sample, task, or eval layer) — incremental restic (default) or self-contained per-checkpoint archives captured with in-image tools only.
 - Bugfix: Resuming a sample from a checkpoint no longer restarts its token, cost, turn, time, and working budgets from zero.

@@ -69,6 +69,20 @@ class UnknownQueryParamsError(Exception):
         )
 
 
+async def raw_request_body(request: Request) -> bytes:
+    """The unparsed request body, for routes that own their JSON decoding.
+
+    Typing a route's body param (or using ``Body(...)``) hands parsing to
+    FastAPI, whose failures — malformed JSON included — surface as 422s in
+    its ``detail`` shape, escaping the channel's ``{"error": ...}`` 400
+    contract. A route that instead depends on this and decodes the bytes
+    itself keeps every malformed-body failure on the contract. Defined here
+    rather than in ``server.py`` for the module-scope ``Request`` annotation
+    (see the module docstring).
+    """
+    return await request.body()
+
+
 async def reject_unknown_query_params(request: Request) -> None:
     """Fail closed on query params the matched route doesn't declare.
 

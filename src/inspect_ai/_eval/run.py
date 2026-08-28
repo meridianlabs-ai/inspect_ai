@@ -22,6 +22,7 @@ import anyio
 from anyio.abc import TaskGroup
 from typing_extensions import Unpack
 
+from inspect_ai._control.add_task import close_add_task
 from inspect_ai._control.eval_state import mark_eval_retry_pending
 from inspect_ai._control.max_tasks import (
     TaskDispatcherStats,
@@ -432,12 +433,66 @@ async def eval_run(
         feed: PreparedFeed | None = None
         if inject is not None:
 
+            async def prepare_batch(batch: list[ResolvedTask]) -> list[TaskRunOptions]:
+                """prepare_options with batch-scoped cleanup on failure.
+
+                A mid-batch prepare failure (or a cancellation landing
+                mid-prepare) leaves the batch's earlier tasks with inited
+                loggers on ``prepared_options``; the run-end cleanup there
+                only fires on the run's own exception path, so a *contained*
+                batch failure would leak them for the rest of the run — tear
+                down exactly this batch's entries (keyed by task_id: other
+                batches may be preparing concurrently) before re-raising.
+                """
+                batch_ids = {t.id for t in batch}
+                try:
+                    return await prepare_options(batch)
+                except BaseException:
+                    with anyio.CancelScope(shield=True):
+                        failed = [
+                            o
+                            for o in prepared_options
+                            if o.logger.eval.task_id in batch_ids
+                        ]
+                        for options in failed:
+                            prepared_options.remove(options)
+                            try:
+                                await options.logger.cleanup()
+                            except Exception as cleanup_ex:
+                                log.warning(
+                                    "Error cleaning up logger of task that "
+                                    "failed to prepare: "
+                                    f"{exception_message(cleanup_ex)}"
+                                )
+                    raise
+
             async def feed_drain() -> list[TaskRunOptions]:
-                return await prepare_options(inject.drain())
+                batch = inject.drain()
+                if not batch:
+                    return []
+                try:
+                    return await prepare_batch(batch)
+                except Exception as ex:
+                    # contain a bad injected batch (a sandbox image that
+                    # fails to pull, log storage rejecting the header write):
+                    # prepare runs inside the dispatcher's drain, where an
+                    # exception would unwind the run's task group and cancel
+                    # every in-flight sibling — acceptable at launch (nothing
+                    # is running yet), not for one bad add against a live
+                    # run.
+                    if debug_errors:
+                        raise
+                    names = ", ".join(sorted({t.task.name for t in batch}))
+                    log.error(
+                        f"Task(s) added to the running eval failed to "
+                        f"prepare and will not run ({names}): "
+                        f"{exception_message(ex)}"
+                    )
+                    return []
 
             async def feed_next() -> list[TaskRunOptions] | None:
                 more = await inject.next()
-                return await prepare_options(more) if more else None
+                return await prepare_batch(more) if more else None
 
             feed = PreparedFeed(
                 drain=feed_drain, next=feed_next, set_wake=inject.set_wake
@@ -456,6 +511,12 @@ async def eval_run(
         )
 
     except BaseException:
+        # stop accepting control-channel task adds before the (possibly
+        # minutes-long) shielded cleanups below: an exception here ends the
+        # run without its keep-alive park, so an add accepted mid-unwind
+        # would report applied and then be dropped. A park session whose
+        # failure is contained re-opens the capability (see eval.py).
+        close_add_task()
         # cleanup() awaits any in-flight stale flush to stop; shield so that a
         # cancellation triggering this handler doesn't interrupt that wait and
         # leave realtime flush timers running against torn-down logging state.
@@ -709,6 +770,34 @@ async def run_task_retry_attempts(
             add_dispatch_waker(wake.set)
             register_task_dispatcher(dispatcher_stats)
             async with anyio.create_task_group() as tg:
+                # Fully-idle source poll, run as a background task racing the
+                # dispatch waker: feed.next() (a TaskSource's next_tasks())
+                # may block indefinitely, and a task enqueued while it blocks
+                # must dispatch immediately — inside a plain
+                # `await feed.next()` the enqueue wake would have no waiter.
+                # On an enqueue-won wake the poll continues underneath (so
+                # next_tasks() can resolve concurrently with running tasks);
+                # its eventual yield is buffered here and dispatched on the
+                # wake its completion fires — neither dropped nor
+                # double-polled. At most one poll is in flight (`polling`).
+                polling = False
+                poll_yields: list[list[TaskRunOptions]] = []
+                poll_scope: anyio.CancelScope | None = None
+
+                async def poll_feed_next() -> None:
+                    nonlocal polling, source_done, poll_scope
+                    with anyio.CancelScope() as scope:
+                        poll_scope = scope
+                        try:
+                            more = await feed.next()
+                        finally:
+                            polling = False
+                        if more is None:
+                            source_done = True
+                        else:
+                            poll_yields.append(more)
+                        wake.set()
+
                 # Run-scoped periodic [Throughput] trace reporter (see
                 # design/model-throughput.md §4). Its own cancel scope: the
                 # dispatch loop below exits by `break` while the task group
@@ -835,10 +924,13 @@ async def run_task_retry_attempts(
                     wake.set()
 
                 while True:
-                    # pick up tasks buffered since the last cycle (non-blocking)
+                    # pick up tasks buffered since the last cycle (non-blocking):
+                    # enqueued injections, then any batch the source poll yielded
                     injected = await feed.drain()
                     if injected:
                         add(injected)
+                    while poll_yields:
+                        add(poll_yields.pop(0))
 
                     # dispatch up to the concurrency cap (model-balanced),
                     # re-reading the live `ctl config --max-tasks` override
@@ -867,18 +959,22 @@ async def run_task_retry_attempts(
                         await wake.wait()
                         continue
 
-                    # fully idle: ask the source for more (may block) and finish
-                    # when it is exhausted
+                    # fully idle: ask the source for more (in the background,
+                    # racing the dispatch waker — see poll_feed_next) and
+                    # finish when it is exhausted
                     if source_done:
                         break
-                    more = await feed.next()
-                    if more is None:
-                        source_done = True
-                    else:
-                        add(more)
+                    if not polling:
+                        polling = True
+                        tg.start_soon(poll_feed_next)
+                    await wake.wait()
 
                 # dispatch complete (only the `break` paths reach here) —
-                # stop the reporter so the task group can exit
+                # cancel a still-blocked source poll (the source is not
+                # consulted again) and stop the reporter so the task group
+                # can close
+                if poll_scope is not None:
+                    poll_scope.cancel()
                 reporter_scope.cancel()
         # exceptions can escape when debug_errors is True and that's okay
         except ExceptionGroup as ex:

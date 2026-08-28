@@ -1442,16 +1442,18 @@ def _stub_httpx(
         def __exit__(self, *args: object) -> None:
             pass
 
-        def get(self, path: str, params: object = None) -> _Resp:
+        def get(self, path: str, params: object = None, json: object = None) -> _Resp:
             return _next("gets", self.uds)
 
-        def post(self, path: str, params: object = None) -> _Resp:
+        def post(self, path: str, params: object = None, json: object = None) -> _Resp:
             return _next("posts", self.uds)
 
-        def patch(self, path: str, params: object = None) -> _Resp:
+        def patch(self, path: str, params: object = None, json: object = None) -> _Resp:
             return _next("patches", self.uds)
 
-        def request(self, method: str, path: str, params: object = None) -> _Resp:
+        def request(
+            self, method: str, path: str, params: object = None, json: object = None
+        ) -> _Resp:
             return _next(count_key[method], self.uds)
 
     class _AsyncClient:
@@ -1466,7 +1468,9 @@ def _stub_httpx(
         async def __aexit__(self, *args: object) -> None:
             pass
 
-        async def request(self, method: str, path: str, params: object = None) -> _Resp:
+        async def request(
+            self, method: str, path: str, params: object = None, json: object = None
+        ) -> _Resp:
             return _next(count_key[method], self.uds)
 
     monkeypatch.setattr("inspect_ai._cli.ctl._http.httpx.Client", _Client)
