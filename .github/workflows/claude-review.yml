@@ -23,19 +23,34 @@ jobs:
   review:
     # Run on PR events, or on a PR comment containing @review. `@review` does
     # not collide with the dev agent's `@claude` trigger.
+    # The comment gates exclude the reviewer's own comments — ones that
+    # backtick the trigger token or carry the claude-review-comment marker
+    # the reusable prompts the reviewer to stamp. Without this, a reviewer
+    # summary mentioning the token spawns a run whose newest-wins
+    # concurrency cancels the run that posted the summary before the
+    # verdict marker posts, and the loop never engages (agents#37;
+    # observed on agents#20/#36). Keep in sync with
+    # agents:examples/claude-review-stub.yml.
     if: >
       github.event_name == 'pull_request' ||
       (github.event.issue.pull_request != null &&
-       contains(github.event.comment.body, '@review')) ||
+       contains(github.event.comment.body, '@review') &&
+       !contains(github.event.comment.body, '`@review`') &&
+       !contains(github.event.comment.body, '<!-- claude-review-comment -->')) ||
       (github.event.issue.pull_request == null &&
        contains(github.event.issue.labels.*.name, 'External') &&
-       contains(github.event.comment.body, '@review'))
+       contains(github.event.comment.body, '@review') &&
+       !contains(github.event.comment.body, '`@review`') &&
+       !contains(github.event.comment.body, '<!-- claude-review-comment -->'))
     uses: meridianlabs-ai/agents/.github/workflows/claude-review.yml@main
     # Machine-account PAT for the deterministic ack/stage steps only (eyes
     # reaction + board stage); never handed to the review agent, which stays
     # read-only. Absent -> those steps no-op.
     secrets:
       MARVIN_TOKEN: ${{ secrets.MARVIN_TOKEN }}
+      # codex engine (design/codex-engine.md in the agents repo):
+      # consumed only on items labeled engine:codex; optional.
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
     permissions:
       contents: read
       pull-requests: write
