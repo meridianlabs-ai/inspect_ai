@@ -55,7 +55,9 @@ async def install_human_agent(
         await checked_exec(["chown", user, HUMAN_AGENT_DIR], user="root")
 
     # setup installation directory
-    await checked_exec(framework_directory_command(INSTALL_DIR), user="root")
+    await checked_exec(
+        framework_directory_command(INSTALL_DIR, mode=0o755), user="root"
+    )
     # generate task.py
     task_py = human_agent_commands(commands)
     await checked_write_file(
@@ -73,8 +75,8 @@ async def install_human_agent(
     await checked_write_file(
         f"{INSTALL_DIR}/{INSTALL_SH}", install_sh, executable=True, user="root"
     )
-    await checked_exec(["bash", f"./{INSTALL_SH}"], cwd=INSTALL_DIR, user="root")
-    await checked_exec(["rm", "-rf", INSTALL_DIR])
+    await checked_exec(["bash", f"./{INSTALL_SH}"], cwd=INSTALL_DIR, user=user)
+    await checked_exec(["rm", "-rf", INSTALL_DIR], user="root")
 
 
 def human_agent_commands(commands: list[HumanAgentCommand]) -> str:

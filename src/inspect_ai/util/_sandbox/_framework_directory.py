@@ -1,8 +1,9 @@
+import os
 from pathlib import PurePosixPath
 
 
 def framework_directory_command(
-    path: str | PurePosixPath,
+    path: str | os.PathLike[str],
     *,
     mode: int = 0o700,
     report_creation: bool = False,
@@ -32,10 +33,13 @@ def framework_directory_command(
         f"stat -f '%u %Lp' {directory} 2>/dev/null"
     )
     mode_check = (
-        f"chmod {mode_text} -- {directory} && set -- $({stat_values}) && "
-        if repair_mode
-        else ""
-    ) + f'test "$2" = {mode_text}'
+        (
+            f"chmod {mode_text} -- {directory} && set -- $({stat_values}) && "
+            if repair_mode
+            else ""
+        )
+        + f'test "$2" = {mode_text}'
+    )
     script = (
         f"umask 077; if mkdir -m {mode_text} -- {directory} 2>/dev/null; "
         f"then {created}; else test -d {directory} && test ! -L {directory} && "

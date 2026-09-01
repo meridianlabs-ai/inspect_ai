@@ -24,8 +24,8 @@ from inspect_ai._util.package import get_package_direct_url
 from inspect_ai._util.trace import trace_message
 from inspect_ai.util import input_screen
 from inspect_ai.util._concurrency import concurrency
-from inspect_ai.util._sandbox._framework_directory import framework_directory_command
 from inspect_ai.util._sandbox._cli import SANDBOX_CLI, SANDBOX_TOOLS_DIR
+from inspect_ai.util._sandbox._framework_directory import framework_directory_command
 from inspect_ai.util._sandbox.context import (
     SandboxInjectable,
     sandbox_with_injection,

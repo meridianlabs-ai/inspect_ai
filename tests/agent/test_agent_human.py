@@ -57,6 +57,8 @@ async def test_human_agent_reuses_directory_owned_by_selected_user(
         if cmd[:2] == ["sh", "-c"] and human_install.HUMAN_AGENT_DIR in cmd[2]
     ]
     assert directory_checks == ["root", "root", "agent"]
+    assert (["bash", f"./{human_install.INSTALL_SH}"], "agent") in fake.calls
+    assert (["rm", "-rf", human_install.INSTALL_DIR], "root") in fake.calls
 
 
 @pytest.mark.parametrize(

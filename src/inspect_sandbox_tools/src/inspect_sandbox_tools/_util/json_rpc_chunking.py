@@ -356,7 +356,10 @@ def _release_chunk(handle: str) -> None:
             candidate = os.stat(
                 filename, dir_fd=directory_fd, follow_symlinks=False
             )
-            if candidate.st_ino == status.st_ino and candidate.st_dev == status.st_dev:
+            if (
+                candidate.st_ino == status.st_ino
+                and candidate.st_dev == status.st_dev
+            ):
                 os.unlink(filename, dir_fd=directory_fd)
     except (FileNotFoundError, OSError):
         pass
