@@ -46,6 +46,7 @@ logger = getLogger(__name__)
 
 TRACE_SANDBOX_TOOLS = "Sandbox Tools"
 _SANDBOX_TOOLS_GENERATION_FILE = f"{SANDBOX_TOOLS_DIR}/.generation"
+_SANDBOX_TOOLS_CHUNK_DIR = f"{SANDBOX_TOOLS_DIR}-json-rpc-chunks"
 
 
 class SandboxInjectionError(Exception):
@@ -126,6 +127,7 @@ async def _inject_container_tools_code(sandbox: SandboxEnvironment) -> None:
                     f"Failed to create or verify sandbox tools dir: {result.stderr}"
                 )
 
+        await _reset_chunk_dir(sandbox, sandbox._tools_user)
         await _clear_tools_dir(sandbox, sandbox._tools_user)
         await _extract_tools_tree(sandbox, name, gz_bytes, sandbox._tools_user)
         await _write_tools_generation(sandbox, sandbox._tools_user)
@@ -295,6 +297,19 @@ async def _clear_tools_dir(
     )
     if not result.success:
         raise RuntimeError(f"Failed to clear sandbox tools dir: {result.stderr}")
+
+
+async def _reset_chunk_dir(
+    sandbox: SandboxEnvironment, user: str | None
+) -> None:
+    """Remove pre-injection spill state so the new launcher creates it safely."""
+    result = await sandbox.exec(
+        ["rm", "-rf", "--", _SANDBOX_TOOLS_CHUNK_DIR], user=user
+    )
+    if not result.success:
+        raise RuntimeError(
+            f"Failed to reset sandbox tools response chunk dir: {result.stderr}"
+        )
 
 
 async def _write_tools_generation(

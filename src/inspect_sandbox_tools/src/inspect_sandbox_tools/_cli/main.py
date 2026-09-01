@@ -3,10 +3,13 @@ import asyncio
 import fcntl
 import json
 import os
+import shutil
 import socket
+import stat
 import subprocess
 import sys
 import time
+import uuid
 from typing import Literal
 
 import aiohttp
@@ -79,6 +82,7 @@ def main() -> None:
 
 def start_server() -> None:
     """Start the sandbox tools server and validate it is responsive."""
+    ensure_json_rpc_response_chunk_dir()
     _ensure_server_is_running()
     healthcheck()
 
@@ -177,7 +181,6 @@ async def _exec(request: str | None) -> None:
                     f"_run_as_user must be a string, got {type(run_as_user).__name__}"
                 )
             request_json_str = json.dumps(request_data)
-            ensure_json_rpc_response_chunk_dir()
             switch_user(run_as_user)
             os.environ["HOME"] = get_home_dir(run_as_user)
 
@@ -205,10 +208,37 @@ _SERVER_START_LOCK_PATH = SERVER_DIR / "server-start.lock"
 
 def _ensure_server_is_running() -> None:
     """Start one server for this directory, waiting for a concurrent starter."""
+    _migrate_legacy_server_directory()
     ensure_framework_directory(SERVER_DIR, owner_uid=os.getuid())
     with _SERVER_START_LOCK_PATH.open("a+") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         _ensure_server_is_running_locked()
+
+
+def _migrate_legacy_server_directory() -> None:
+    """Replace a non-private legacy state directory without adopting its children."""
+    try:
+        status = SERVER_DIR.lstat()
+    except FileNotFoundError:
+        return
+
+    if (
+        stat.S_ISDIR(status.st_mode)
+        and status.st_uid == os.getuid()
+        and stat.S_IMODE(status.st_mode) == 0o700
+    ):
+        return
+    if not stat.S_ISDIR(status.st_mode) or status.st_uid != os.getuid():
+        raise RuntimeError(f"Unsafe sandbox-tools server directory: {SERVER_DIR}")
+
+    displaced = SERVER_DIR.with_name(f"{SERVER_DIR.name}.legacy-{uuid.uuid4().hex}")
+    SERVER_DIR.rename(displaced)
+    try:
+        ensure_framework_directory(SERVER_DIR, owner_uid=os.getuid())
+    except Exception:
+        displaced.rename(SERVER_DIR)
+        raise
+    shutil.rmtree(displaced)
 
 
 def _ensure_server_is_running_locked() -> None:

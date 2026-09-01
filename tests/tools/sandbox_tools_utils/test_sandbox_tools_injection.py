@@ -101,6 +101,10 @@ async def test_inject_container_tools_falls_back_when_root_probe_raises(
         ["find", sandbox_tools.SANDBOX_TOOLS_DIR, "-mindepth", "1", "-delete"],
         None,
     ) in sandbox.exec_calls
+    assert (
+        ["rm", "-rf", "--", sandbox_tools._SANDBOX_TOOLS_CHUNK_DIR],
+        None,
+    ) in sandbox.exec_calls
     generation_calls = [
         cmd
         for cmd, user in sandbox.exec_calls

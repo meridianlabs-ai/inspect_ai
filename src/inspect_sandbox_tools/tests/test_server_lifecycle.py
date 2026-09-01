@@ -5,6 +5,7 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -677,3 +678,17 @@ async def test_exec_hides_server_directory_from_in_process_tools(
     monkeypatch.setattr(main_module, "_dispatch_local_method", dispatch)
 
     await main_module._exec('{"jsonrpc":"2.0","method":"in_process","id":1}')
+
+
+def test_legacy_server_directory_is_recreated_without_children(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    server_dir = tmp_path / "sandbox-tools"
+    server_dir.mkdir(mode=0o777)
+    (server_dir / "server-start.lock").symlink_to(tmp_path / "victim")
+    monkeypatch.setattr(main_module, "SERVER_DIR", server_dir)
+
+    main_module._migrate_legacy_server_directory()
+
+    assert stat.S_IMODE(server_dir.stat().st_mode) == 0o700
+    assert list(server_dir.iterdir()) == []

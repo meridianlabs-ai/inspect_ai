@@ -55,6 +55,21 @@ SERVICE_REQUEST_READ_OUTPUT_LIMIT = 150 * 1024**2
 SandboxServiceMethod = Callable[..., Awaitable[JsonValue]]
 
 
+def _root_owned_shared_services_dir_command() -> list[str]:
+    """Verify the safe root-owned form of the shared services directory."""
+    stat_values = (
+        f"stat -c '%u %a' -- {SERVICES_DIR} 2>/dev/null || "
+        f"stat -f '%u %Lp' {SERVICES_DIR} 2>/dev/null"
+    )
+    return [
+        "sh",
+        "-c",
+        f'test -d {SERVICES_DIR} && test ! -L {SERVICES_DIR} && '
+        f'set -- $({stat_values}) && test "$1" = 0 && '
+        f'test "$2" = {SERVICES_DIR_MODE}',
+    ]
+
+
 def _is_service_name(value: object) -> bool:
     return isinstance(value, str) and SERVICE_NAME_PATTERN.fullmatch(value) is not None
 
@@ -605,12 +620,18 @@ class SandboxService:
                     "it must be owned by root with mode 1777."
                 )
             parent_result = await self._sandbox.exec(
-                command, timeout=600, concurrency=False
+                _root_owned_shared_services_dir_command(),
+                timeout=600,
+                concurrency=False,
             )
+            if not parent_result.success:
+                parent_result = await self._sandbox.exec(
+                    command, timeout=600, concurrency=False
+                )
         if not parent_result.success:
             raise PrerequisiteError(
                 f"Shared sandbox services directory '{SERVICES_DIR}' is unsafe: "
-                "it must be owned by the sandbox default user with mode 1777."
+                "it must be owned by root or the sandbox default user with mode 1777."
             )
 
         service_dir = self._service_dir.as_posix()

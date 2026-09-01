@@ -23,6 +23,7 @@ from inspect_ai.util._sandbox.service import (
     SERVICE_REQUEST_READ_OUTPUT_LIMIT,
     SERVICES_DIR,
     SandboxService,
+    _root_owned_shared_services_dir_command,
     sandbox_service,
 )
 from inspect_ai.util._subprocess import ExecResult
@@ -277,6 +278,7 @@ async def test_ensure_service_dir_falls_back_after_failed_root_exec_result() -> 
         results=[
             FakeExecResult(success=False, returncode=1),
             FakeExecResult(success=False, returncode=1),
+            FakeExecResult(success=False, returncode=1),
             FakeExecResult(),
         ]
     )
@@ -290,7 +292,28 @@ async def test_ensure_service_dir_falls_back_after_failed_root_exec_result() -> 
 
     assert fake.calls[0]["user"] == "root"
     assert fake.calls[1] == {"cmd": ["id", "-u"], "user": "root"}
-    assert fake.calls[2]["user"] is None
+    assert fake.calls[2]["cmd"] == _root_owned_shared_services_dir_command()
+    assert fake.calls[3]["user"] is None
+
+
+async def test_ensure_service_dir_accepts_root_owned_sticky_parent_rootlessly() -> None:
+    fake = FakeSandboxEnvironment(
+        results=[
+            FakeExecResult(success=False, returncode=1),
+            FakeExecResult(success=False, returncode=1),
+            FakeExecResult(),
+        ]
+    )
+    service = SandboxService(
+        name="root_owned_parent",
+        sandbox=cast(SandboxEnvironment, fake),
+        user="agent",
+    )
+
+    await service.start()
+
+    assert fake.calls[2]["cmd"] == _root_owned_shared_services_dir_command()
+    assert len(fake.calls) == 4
 
 
 async def test_ensure_service_dir_raises_prereq_when_parent_unwritable() -> None:
