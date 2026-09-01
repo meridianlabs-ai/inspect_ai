@@ -44,13 +44,25 @@ def test_framework_directory_rejects_non_directory(
     assert run_framework_directory(directory).returncode != 0
 
 
-def test_framework_directory_rejects_insecure_mode(tmp_path: Path) -> None:
+def test_framework_directory_migrates_legacy_secure_mode(tmp_path: Path) -> None:
     directory = tmp_path / "framework"
     directory.mkdir(mode=0o755)
     os.chmod(directory, 0o755)
 
+    assert run_framework_directory(directory).returncode == 0
+    assert directory.stat().st_mode & 0o777 == 0o700
+
+
+@pytest.mark.parametrize("mode", [0o720, 0o702, 0o777])
+def test_framework_directory_rejects_writable_legacy_mode(
+    tmp_path: Path, mode: int
+) -> None:
+    directory = tmp_path / "framework"
+    directory.mkdir(mode=mode)
+    os.chmod(directory, mode)
+
     assert run_framework_directory(directory).returncode != 0
-    assert directory.stat().st_mode & 0o777 == 0o755
+    assert directory.stat().st_mode & 0o777 == mode
 
 
 @pytest.mark.parametrize("mode", [0o720, 0o702, 0o1000])

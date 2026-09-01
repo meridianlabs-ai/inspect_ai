@@ -1,3 +1,4 @@
+import base64
 import gzip
 import os
 import subprocess
@@ -27,7 +28,6 @@ from inspect_ai.util._sandbox._cli import SANDBOX_CLI, SANDBOX_TOOLS_DIR
 from inspect_ai.util._sandbox._framework_directory import framework_directory_command
 from inspect_ai.util._sandbox.context import (
     SandboxInjectable,
-    sandbox_file_detector,
     sandbox_with_injection,
 )
 from inspect_ai.util._sandbox.environment import SandboxEnvironment
@@ -179,16 +179,26 @@ async def _sandbox_tools_detector(sandbox: SandboxEnvironment) -> bool:
             if not await _tools_dir_is_verified(sandbox, "root"):
                 return False
             sandbox._tools_user = "root"
-            return (
-                await sandbox.exec(["test", "-x", SANDBOX_CLI], user="root")
-            ).success
+            return await _sandbox_cli_is_valid(sandbox, "root")
     except Exception:
         pass
 
     if not await _tools_dir_is_verified(sandbox, None):
         return False
     sandbox._tools_user = None
-    return await sandbox_file_detector(SANDBOX_CLI)(sandbox)
+    return await _sandbox_cli_is_valid(sandbox, None)
+
+
+async def _sandbox_cli_is_valid(
+    sandbox: SandboxEnvironment, user: str | None
+) -> bool:
+    """Return whether the launcher is a regular executable for ``user``."""
+    return (
+        await sandbox.exec(
+            ["sh", "-c", 'test -f "$1" && test -x "$1"', "sh", SANDBOX_CLI],
+            user=user,
+        )
+    ).success
 
 
 async def _extract_tools_tree(
@@ -196,16 +206,16 @@ async def _extract_tools_tree(
 ) -> None:
     """Extract the gzipped onedir tar into SANDBOX_TOOLS_DIR.
 
-    The artifact is staged to a temp file via write_file (which base64-encodes binary
-    content reliably; raw binary stdin through exec is not safe) and then extracted.
+    The artifact is streamed as base64 to a file inside the verified install tree,
+    using the extraction identity. Raw binary stdin through exec is not safe.
 
     Optimistic path: ship the compressed artifact and extract with `tar xzf`. If the
     container's `tar` lacks gzip support, fall back to injecting an uncompressed tar,
     which only needs plain `tar xf` (the broadest assumption). The uncompressed tar is
     cached in the binaries dir so we decompress at most once per artifact.
     """
-    gz_tmp = f"{SANDBOX_TOOLS_DIR}.pkg.tgz"
-    await sandbox.write_file(gz_tmp, gz_bytes)
+    gz_tmp = f"{SANDBOX_TOOLS_DIR}/.pkg.tgz"
+    await _write_archive(sandbox, gz_tmp, gz_bytes, user)
     result = await sandbox.exec(
         ["tar", "xzf", gz_tmp, "-C", SANDBOX_TOOLS_DIR], user=user
     )
@@ -219,14 +229,30 @@ async def _extract_tools_tree(
         TRACE_SANDBOX_TOOLS,
         f"tar xzf failed ({result.stderr.strip()}); retrying with uncompressed tar",
     )
-    tar_tmp = f"{SANDBOX_TOOLS_DIR}.pkg.tar"
-    await sandbox.write_file(tar_tmp, _uncompressed_tar_bytes(name, gz_bytes))
+    tar_tmp = f"{SANDBOX_TOOLS_DIR}/.pkg.tar"
+    await _write_archive(
+        sandbox, tar_tmp, _uncompressed_tar_bytes(name, gz_bytes), user
+    )
     result = await sandbox.exec(
         ["tar", "xf", tar_tmp, "-C", SANDBOX_TOOLS_DIR], user=user
     )
     await sandbox.exec(["rm", "-f", tar_tmp], user=user)
     if not result.success:
         raise RuntimeError(f"Failed to extract sandbox tools: {result.stderr}")
+
+
+async def _write_archive(
+    sandbox: SandboxEnvironment, path: str, contents: bytes, user: str | None
+) -> None:
+    """Write an archive inside the verified tree as the extraction identity."""
+    result = await sandbox.exec(
+        ["sh", "-c", 'base64 -d > "$1"', "sh", path],
+        input=base64.b64encode(contents).decode("ascii"),
+        user=user,
+        timeout=600,
+    )
+    if not result.success:
+        raise RuntimeError(f"Failed to stage sandbox tools archive: {result.stderr}")
 
 
 def _uncompressed_tar_bytes(name: str, gz_bytes: bytes) -> bytes:

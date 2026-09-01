@@ -9,7 +9,8 @@ def framework_directory_command(
     """Build a command that securely creates or adopts a framework directory.
 
     Creation binds the leaf atomically. An existing entry is accepted only when
-    it is a real directory owned by the effective user with the requested mode.
+    it is a real directory owned by the effective user. A legacy directory with
+    no group or other write bits is migrated to the requested mode.
     Callers must choose a parent that prevents other users from replacing an
     accepted leaf.
 
@@ -45,6 +46,8 @@ def framework_directory_command(
     script = (
         f"umask 077; if mkdir -m {mode_text} -- {directory} 2>/dev/null; "
         f"then :; else test -d {directory} && test ! -L {directory} && "
+        f'set -- $({stat_values}) && test "$1" = "$(id -u)" && '
+        f'test $((0$2 & 022)) -eq 0 && chmod {mode_text} -- {directory} && '
         f'set -- $({stat_values}) && test "$1" = "$(id -u)" && '
         f'test "$2" = {mode_text}; fi'
     )

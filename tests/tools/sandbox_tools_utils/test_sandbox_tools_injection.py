@@ -1,5 +1,6 @@
 """Tests for sandbox tools injection."""
 
+import base64
 from contextlib import asynccontextmanager
 from io import BytesIO
 from typing import AsyncIterator, BinaryIO, Literal, overload
@@ -19,6 +20,7 @@ class RootProbeRaisesSandbox(SandboxEnvironment):
     def __init__(self) -> None:
         super().__init__()
         self.exec_calls: list[tuple[list[str], str | None]] = []
+        self.exec_inputs: list[str | bytes | None] = []
         self.extracted_as_user: str | None | object = object()
 
     async def exec(
@@ -33,6 +35,7 @@ class RootProbeRaisesSandbox(SandboxEnvironment):
         concurrency: bool = True,
     ) -> ExecResult[str]:
         self.exec_calls.append((cmd, user))
+        self.exec_inputs.append(input)
         if cmd == ["id", "-u"] and user == "root":
             raise RuntimeError("runuser: may not be used by non-root users")
         return ExecResult(success=True, returncode=0, stdout="", stderr="")
@@ -97,3 +100,32 @@ async def test_inject_container_tools_falls_back_when_root_probe_raises(
     assert sandbox.extracted_as_user is None
     assert (["id", "-u"], "root") in sandbox.exec_calls
     assert (sandbox_tools._ensure_tools_dir_command(), None) in sandbox.exec_calls
+
+
+async def test_write_archive_stages_inside_tools_dir_as_extraction_user() -> None:
+    sandbox = RootProbeRaisesSandbox()
+    archive_path = f"{sandbox_tools.SANDBOX_TOOLS_DIR}/.pkg.tgz"
+
+    await sandbox_tools._write_archive(sandbox, archive_path, b"archive", "root")
+
+    assert sandbox.exec_calls[-1] == (
+        ["sh", "-c", 'base64 -d > "$1"', "sh", archive_path],
+        "root",
+    )
+    assert base64.b64decode(str(sandbox.exec_inputs[-1])) == b"archive"
+
+
+async def test_launcher_validator_requires_regular_executable() -> None:
+    sandbox = RootProbeRaisesSandbox()
+
+    assert await sandbox_tools._sandbox_cli_is_valid(sandbox, None)
+    assert sandbox.exec_calls[-1] == (
+        [
+            "sh",
+            "-c",
+            'test -f "$1" && test -x "$1"',
+            "sh",
+            sandbox_tools.SANDBOX_CLI,
+        ],
+        None,
+    )
