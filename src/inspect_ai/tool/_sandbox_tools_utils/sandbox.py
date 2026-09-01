@@ -216,8 +216,14 @@ while ! mkdir -m 700 -- "$2" 2>/dev/null; do
     safe_lock_dir || exit 18
     if safe_owner_file; then
         owner=$(cat -- "$owner_file")
-        case "$owner" in ''|*[!0-9]*) exit 18;; esac
-        if ! kill -0 "$owner" 2>/dev/null; then
+        case "$owner" in *[!0-9]*) exit 18;; esac
+        if test -z "$owner"; then
+            if test "$i" -ge 10; then
+                rm -f -- "$owner_file"
+                rmdir -- "$lock_dir" 2>/dev/null || exit 18
+                continue
+            fi
+        elif ! kill -0 "$owner" 2>/dev/null; then
             rm -f -- "$owner_file"
             rmdir -- "$lock_dir" 2>/dev/null || exit 18
             continue
@@ -230,12 +236,12 @@ while ! mkdir -m 700 -- "$2" 2>/dev/null; do
     fi
     sleep .1
 done
-printf '%s\n' "$$" > "$owner_file"
-chmod 600 -- "$owner_file"
+umask 077
 trap cleanup_lock EXIT
 trap 'cleanup_lock; exit 129' HUP
 trap 'cleanup_lock; exit 130' INT
 trap 'cleanup_lock; exit 143' TERM
+printf '%s\n' "$$" > "$owner_file"
 if test -e "$3" || test -L "$3"; then exit 17; fi
 source_id=$(stat -c '%d:%i' -- "$1" 2>/dev/null || stat -f '%d:%i' "$1")
 mv -- "$1" "$3"

@@ -1,8 +1,8 @@
 """Tests for sandbox tools injection."""
 
 import os
-import signal
 import shutil
+import signal
 import subprocess
 import time
 from contextlib import asynccontextmanager
@@ -416,6 +416,71 @@ def test_publish_command_recovers_stale_lock(tmp_path: os.PathLike[str]) -> None
     with open(os.path.join(lock, "owner"), "w") as owner:
         owner.write("999999999\n")
     os.chmod(os.path.join(lock, "owner"), 0o600)
+    command = sandbox_tools._publish_tools_command(staging)
+    command[5] = lock
+    command[6] = destination
+
+    result = subprocess.run(command, check=False, capture_output=True, text=True)
+
+    assert result.returncode == 0
+    assert os.path.isdir(destination)
+    assert not os.path.exists(lock)
+
+
+def test_publish_command_creates_owner_with_restrictive_mode(
+    tmp_path: os.PathLike[str],
+) -> None:
+    base = os.fspath(tmp_path)
+    staging = os.path.join(base, "staging")
+    destination = os.path.join(base, "tools")
+    lock = os.path.join(base, "lock")
+    bin_dir = os.path.join(base, "bin")
+    os.mkdir(staging)
+    os.mkdir(bin_dir)
+    mv_wrapper = os.path.join(bin_dir, "mv")
+    with open(mv_wrapper, "w") as wrapper:
+        wrapper.write("#!/bin/sh\nsleep 30\n")
+    os.chmod(mv_wrapper, 0o700)
+    command = sandbox_tools._publish_tools_command(staging)
+    command[5] = lock
+    command[6] = destination
+
+    def permissive_umask() -> None:
+        os.umask(0o002)
+
+    process = subprocess.Popen(
+        command,
+        env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
+        start_new_session=True,
+        preexec_fn=permissive_umask,
+    )
+    owner_file = os.path.join(lock, "owner")
+    try:
+        for _ in range(100):
+            if os.path.exists(owner_file):
+                break
+            assert process.poll() is None
+            time.sleep(0.01)
+        assert os.stat(owner_file).st_mode & 0o777 == 0o600
+    finally:
+        os.killpg(process.pid, signal.SIGTERM)
+        process.wait(timeout=5)
+
+
+def test_publish_command_recovers_empty_owner_file(
+    tmp_path: os.PathLike[str],
+) -> None:
+    base = os.fspath(tmp_path)
+    staging = os.path.join(base, "staging")
+    destination = os.path.join(base, "tools")
+    lock = os.path.join(base, "lock")
+    os.mkdir(staging)
+    os.mkdir(lock)
+    os.chmod(lock, 0o700)
+    owner_file = os.path.join(lock, "owner")
+    with open(owner_file, "w"):
+        pass
+    os.chmod(owner_file, 0o600)
     command = sandbox_tools._publish_tools_command(staging)
     command[5] = lock
     command[6] = destination
