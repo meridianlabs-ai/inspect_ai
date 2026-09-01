@@ -324,6 +324,38 @@ def _reassemble(
     )
 
 
+def test_continuation_reads_verified_inode_after_path_swap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = json.dumps({"result": "original" * 200})
+    first = _chunk_metadata(
+        chunk_json_rpc_response_if_needed({"id": 1}, response, 512)
+    )
+    user_dir = chunking._CHUNK_DIR / str(os.getuid())
+    chunk_path = user_dir / f"{first['handle']}.jsonrpc"
+    replacement = user_dir / "replacement"
+    replacement.write_text('"attacker replacement"')
+    real_pread = os.pread
+
+    def swap_then_read(fd: int, size: int, offset: int) -> bytes:
+        moved = chunk_path.with_suffix(".moved")
+        chunk_path.rename(moved)
+        chunk_path.symlink_to(replacement)
+        return real_pread(fd, size, offset)
+
+    monkeypatch.setattr(chunking.os, "pread", swap_then_read)
+
+    continued = _chunk_metadata(
+        handle_json_rpc_response_chunk_request(
+            {"id": 2, "params": {"handle": first["handle"], "offset": 0}}, 512
+        )
+    )
+
+    returned = base64.b64decode(continued["chunk"])
+    assert b"attacker replacement" not in returned
+    assert returned == response.encode()[: len(returned)]
+
+
 def _chunk_metadata(response: str) -> dict[str, Any]:
     payload = cast(dict[str, Any], json.loads(response))
     return cast(dict[str, Any], payload[JSON_RPC_RESPONSE_CHUNK_FIELD])

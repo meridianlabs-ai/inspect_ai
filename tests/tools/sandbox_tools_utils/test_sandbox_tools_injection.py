@@ -146,3 +146,33 @@ async def test_stop_installed_tools_server_before_replacement() -> None:
             None,
         ),
     ]
+
+
+async def test_versionless_tools_without_stop_server_are_preserved() -> None:
+    class LegacySandbox(RootProbeRaisesSandbox):
+        async def exec(
+            self,
+            cmd: list[str],
+            input: str | bytes | None = None,
+            cwd: str | None = None,
+            env: dict[str, str] | None = None,
+            user: str | None = None,
+            timeout: int | None = None,
+            timeout_retry: bool = True,
+            concurrency: bool = True,
+        ) -> ExecResult[str]:
+            self.exec_calls.append((cmd, user))
+            if cmd == [sandbox_tools.SANDBOX_CLI, "stop-server"]:
+                return ExecResult(False, 2, "", "unknown command")
+            if cmd == ["test", "-r", sandbox_tools._SANDBOX_TOOLS_VERSION_FILE]:
+                return ExecResult(False, 1, "", "")
+            return ExecResult(True, 0, "", "")
+
+    sandbox = LegacySandbox()
+
+    await sandbox_tools._stop_installed_tools_server(sandbox, None)
+
+    assert any(
+        cmd[:2] == ["sh", "-c"] and ".legacy.$$" in cmd[2]
+        for cmd, _ in sandbox.exec_calls
+    )

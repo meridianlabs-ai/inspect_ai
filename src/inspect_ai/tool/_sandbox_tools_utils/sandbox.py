@@ -1,6 +1,7 @@
 import base64
 import gzip
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -228,7 +229,30 @@ async def _stop_installed_tools_server(
         return
     result = await sandbox.exec([SANDBOX_CLI, "stop-server"], user=user)
     if not result.success:
-        raise RuntimeError(f"Failed to stop prior sandbox tools server: {result.stderr}")
+        version = await sandbox.exec(
+            ["test", "-r", _SANDBOX_TOOLS_VERSION_FILE], user=user
+        )
+        if version.success:
+            raise RuntimeError(
+                f"Failed to stop prior sandbox tools server: {result.stderr}"
+            )
+        # Versionless bundles can predate stop-server. Keep their tree intact
+        # for any live legacy daemon while the new server starts from a fresh
+        # install and socket directory.
+        tools_dir = shlex.quote(SANDBOX_TOOLS_DIR)
+        result = await sandbox.exec(
+            [
+                "sh",
+                "-c",
+                f'd={tools_dir}; q="$d.legacy.$$"; '
+                'mv -- "$d" "$q" && mkdir -m 700 -- "$d"',
+            ],
+            user=user,
+        )
+        if not result.success:
+            raise RuntimeError(
+                f"Failed to preserve legacy sandbox tools: {result.stderr}"
+            )
     # v28 used a 0777 default server directory. Retire the now-stopped directory
     # so v29 creates trusted state from scratch and cannot reuse poisoned entries.
     result = await sandbox.exec(

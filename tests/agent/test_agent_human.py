@@ -65,6 +65,37 @@ async def test_install_human_agent_falls_back_when_root_exec_raises(
     assert calls == ["root", "agent"]
 
 
+async def test_recording_install_rootless_fallback_never_retries_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str | None] = []
+
+    class FakeSandbox:
+        async def exec(
+            self, cmd: list[str], *, user: str | None = None, **kwargs: object
+        ) -> ExecResult[str]:
+            calls.append(user)
+            if user == "root":
+                raise PermissionError("root execution unavailable")
+            return ExecResult(True, 0, "existing\n", "")
+
+    monkeypatch.setattr(install, "sandbox", lambda: FakeSandbox())
+
+    await install.install_human_agent("agent", [], None, True)
+
+    assert calls[0] == "root"
+    assert all(user != "root" for user in calls[1:])
+
+
+def test_human_agent_install_replaces_managed_bashrc_block() -> None:
+    script = install.human_agent_install_sh("agent")
+
+    deletion = f"/{install.BASHRC_BLOCK_BEGIN}$/,/^{install.BASHRC_BLOCK_END}$/d"
+    assert deletion in script
+    assert "/^### Inspect Human Agent Setup /,/^task start$/d" in script
+    assert script.index("sed -i") < script.index(f"cat {install.BASHRC}")
+
+
 async def test_existing_recording_install_is_migrated(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

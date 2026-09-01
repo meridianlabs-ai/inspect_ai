@@ -15,6 +15,8 @@ WELCOME_FILE = "welcome.txt"
 WELCOME_LOGIN_FILE = "welcome_login.txt"
 INSTRUCTIONS_FILE = "instructions.txt"
 RECORD_SESSION_DIR = "/var/tmp/user-sessions"
+BASHRC_BLOCK_BEGIN = "### BEGIN INSPECT HUMAN AGENT SETUP"
+BASHRC_BLOCK_END = "### END INSPECT HUMAN AGENT SETUP"
 
 
 async def install_human_agent(
@@ -32,11 +34,13 @@ async def install_human_agent(
         HUMAN_AGENT_DIR, report_creation=True, repair_mode=True
     )
     root_directory_command[2] = 'test "$(id -u)" = 0 && ' + root_directory_command[2]
+    installed_as_root = False
     try:
         install_result = await sandbox().exec(
             root_directory_command,
             user="root",
         )
+        installed_as_root = install_result.success
     except Exception:
         install_result = None
     if (install_result is None or not install_result.success) and user != "root":
@@ -52,7 +56,7 @@ async def install_human_agent(
     if existing_install and not record_session:
         return
 
-    if user != "root":
+    if installed_as_root and user != "root":
         await checked_exec(["chown", user, HUMAN_AGENT_DIR], user="root")
 
     # setup installation directory
@@ -254,7 +258,17 @@ def human_agent_bashrc(
     """).lstrip()
 
     # return .bashrc
-    return "\n".join([TERMINAL_CHECK, COMMANDS, RECORDING, INSTRUCTIONS, CLOCK])
+    return "\n".join(
+        [
+            BASHRC_BLOCK_BEGIN,
+            TERMINAL_CHECK,
+            COMMANDS,
+            RECORDING,
+            INSTRUCTIONS,
+            CLOCK,
+            BASHRC_BLOCK_END,
+        ]
+    )
 
 
 def human_agent_install_sh(user: str | None) -> str:
@@ -273,7 +287,11 @@ def human_agent_install_sh(user: str | None) -> str:
     fi
     USER_HOME=$(getent passwd $USER | cut -d: -f6)
 
-    # append to user's .bashrc
+    # Replace the block managed by Inspect, preserving user-owned content.
+    sed -i \
+        -e '/^{BASHRC_BLOCK_BEGIN}$/,/^{BASHRC_BLOCK_END}$/d' \
+        -e '/^### Inspect Human Agent Setup /,/^task start$/d' \
+        $USER_HOME/{BASHRC}
     cat {BASHRC} >> $USER_HOME/{BASHRC}
     """)
 
