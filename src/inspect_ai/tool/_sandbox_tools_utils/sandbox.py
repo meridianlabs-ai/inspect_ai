@@ -121,12 +121,6 @@ async def _inject_container_tools_code(sandbox: SandboxEnvironment) -> None:
 
 async def _inject_container_tools_code_impl(sandbox: SandboxEnvironment) -> None:
     """Stage tools independently and atomically publish into the sandbox."""
-    info = await detect_sandbox_os(sandbox)
-    musl = info.get("libc") == "musl"
-
-    async with _open_executable_for_arch(info["architecture"], musl) as (name, f):
-        gz_bytes = f.read()  # gzipped tar of the PyInstaller --onedir tree
-
     tools_dir = _sandbox_tools_dir(sandbox)
     if await _tools_dir_exists(sandbox, tools_dir):
         if await _sandbox_tools_detector(sandbox):
@@ -135,6 +129,12 @@ async def _inject_container_tools_code_impl(sandbox: SandboxEnvironment) -> None
             "Existing sandbox tools installation is unsafe; recreate the sandbox "
             "rather than replacing a potentially active installation"
         )
+
+    info = await detect_sandbox_os(sandbox)
+    musl = info.get("libc") == "musl"
+
+    async with _open_executable_for_arch(info["architecture"], musl) as (name, f):
+        gz_bytes = f.read()  # gzipped tar of the PyInstaller --onedir tree
 
     install_tmp = f"{tools_dir}.install-{os.urandom(16).hex()}"
     published = False
@@ -256,10 +256,12 @@ async def _create_tools_dir_as_root(
 ) -> bool:
     try:
         probe = await sandbox.exec(["id", "-u"], user="root")
+    except SandboxUnavailableError:
+        raise
     except Exception as ex:
         # Broad catch is deliberate: providers signal "cannot exec as root" by
         # raising provider-specific exception types, so no narrower type is
-        # available. Trade-off: any probe failure selects the rootless install.
+        # available. Sandbox unavailability remains a terminal typed failure.
         trace_message(
             logger,
             TRACE_SANDBOX_TOOLS,

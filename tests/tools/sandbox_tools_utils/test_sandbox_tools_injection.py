@@ -268,6 +268,59 @@ async def test_injection_preserves_sandbox_unavailable_error() -> None:
         await sandbox_tools._inject_container_tools_code(UnavailableSandbox())
 
 
+async def test_injection_preserves_unavailability_during_root_staging_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class UnavailableDuringStagingSandbox(RootProbeRaisesSandbox):
+        def __init__(self) -> None:
+            super().__init__()
+            self.root_probes = 0
+
+        async def exec(
+            self,
+            cmd: list[str],
+            input: str | bytes | None = None,
+            cwd: str | None = None,
+            env: dict[str, str] | None = None,
+            user: str | None = None,
+            timeout: int | None = None,
+            timeout_retry: bool = True,
+            concurrency: bool = True,
+        ) -> ExecResult[str]:
+            if cmd == ["id", "-u"] and user == "root":
+                self.root_probes += 1
+                if self.root_probes == 2:
+                    raise SandboxUnavailableError("sandbox stopped during staging")
+            return await super().exec(
+                cmd, input, cwd, env, user, timeout, timeout_retry, concurrency
+            )
+
+    @asynccontextmanager
+    async def fake_open_executable_for_arch(
+        _arch: Architecture,
+        _musl: bool,
+    ) -> AsyncIterator[tuple[str, BinaryIO]]:
+        yield "inspect-sandbox-tools", BytesIO(b"binary")
+
+    async def fake_detect_sandbox_os(
+        _sandbox: SandboxEnvironment,
+    ) -> SupportedContainerOSInfo:
+        return {"architecture": "amd64", "libc": "glibc"}
+
+    monkeypatch.setattr(sandbox_tools, "detect_sandbox_os", fake_detect_sandbox_os)
+    monkeypatch.setattr(
+        sandbox_tools, "_open_executable_for_arch", fake_open_executable_for_arch
+    )
+
+    sandbox = UnavailableDuringStagingSandbox()
+    with pytest.raises(
+        SandboxUnavailableError, match="sandbox stopped during staging"
+    ):
+        await sandbox_tools._inject_container_tools_code(sandbox)
+
+    assert sandbox.root_probes == 2
+
+
 def test_local_sandbox_tools_install_is_namespaced_per_os_user() -> None:
     sandbox = LocalSandboxEnvironment()
     try:
@@ -635,7 +688,9 @@ async def test_extract_cancellation_removes_uploaded_archive() -> None:
         if command[:3] == ["rm", "-f", "--"] and user == "root"
     ]
     assert len(cleanup_calls) == 1
-    assert cleanup_calls[0][-1] == "/protected/install/archive.tgz"
+    cleanup_paths = cleanup_calls[0][3:]
+    assert sandbox.writes[0][0] in cleanup_paths
+    assert "/protected/install/archive.tgz" in cleanup_paths
 
 
 async def test_injection_staging_is_concurrent_across_sandbox_instances(
