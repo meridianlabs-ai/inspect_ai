@@ -2,7 +2,10 @@ import asyncio
 import base64
 import json
 import os
+import pwd
 import stat
+import subprocess
+import sys
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, NamedTuple, cast
@@ -124,6 +127,45 @@ def test_json_rpc_response_chunks_use_private_uid_directory(
         {"id": 3, "params": {"handle": chunk["handle"], "release": True}},
         512,
     )
+
+
+@pytest.mark.skipif(os.getuid() != 0, reason="requires switching to another uid")
+def test_non_root_user_chunks_through_root_owned_non_readable_parent(
+    tmp_path: Path,
+) -> None:
+    unprivileged_user = pwd.getpwnam("nobody")
+    tmp_path.chmod(0o755)
+    chunk_dir = tmp_path / "chunks"
+    chunk_dir.mkdir(mode=0o1733)
+
+    script = """
+import json
+from pathlib import Path
+
+import inspect_sandbox_tools._util.json_rpc_chunking as chunking
+
+chunking._CHUNK_DIR = Path({chunk_dir!r})
+response = json.dumps({{"jsonrpc": "2.0", "id": 1, "result": "x" * 2000}})
+chunked = chunking.chunk_json_rpc_response_if_needed({{"id": 1}}, response, 512)
+assert chunking.JSON_RPC_RESPONSE_CHUNK_FIELD in json.loads(chunked)
+""".format(chunk_dir=str(chunk_dir))
+
+    def switch_to_unprivileged_user() -> None:
+        os.setgid(unprivileged_user.pw_gid)
+        os.setuid(unprivileged_user.pw_uid)
+
+    subprocess.run(
+        [sys.executable, "-c", script],
+        check=True,
+        env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
+        preexec_fn=switch_to_unprivileged_user,
+        timeout=10,
+    )
+
+    user_dir = chunk_dir / str(unprivileged_user.pw_uid)
+    assert user_dir.stat().st_uid == unprivileged_user.pw_uid
+    assert stat.S_IMODE(user_dir.stat().st_mode) == 0o700
+    assert next(user_dir.iterdir()).stat().st_uid == unprivileged_user.pw_uid
 
 
 def test_frozen_chunk_dir_uses_hidden_sibling_of_tools_dir(
