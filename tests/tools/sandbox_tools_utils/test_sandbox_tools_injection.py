@@ -43,7 +43,10 @@ class RootProbeRaisesSandbox(SandboxEnvironment):
     ) -> ExecResult[str]:
         self.exec_calls.append((cmd, user))
         self.exec_inputs.append(input)
-        if cmd == ["id", "-u"] and user == "root":
+        if user == "root" and (
+            cmd == ["id", "-u"]
+            or (cmd[:2] == ["sh", "-c"] and "validate_owned()" in cmd[2])
+        ):
             raise RuntimeError("runuser: may not be used by non-root users")
         if cmd[:2] == ["sh", "-c"] and 'test -e "$1"' in cmd[2]:
             return ExecResult(
@@ -70,6 +73,13 @@ class RootProbeRaisesSandbox(SandboxEnvironment):
                 success=success,
                 returncode=0 if success else 1,
                 stdout="",
+                stderr="",
+            )
+        if cmd[:2] == ["sh", "-c"] and "validate_owned()" in cmd[2]:
+            return ExecResult(
+                success=self.tools_dir_exists,
+                returncode=0 if self.tools_dir_exists else 1,
+                stdout="1000\n" if self.tools_dir_exists else "",
                 stderr="",
             )
         return ExecResult(success=True, returncode=0, stdout="", stderr="")
@@ -134,7 +144,7 @@ async def test_inject_container_tools_falls_back_when_root_probe_raises(
 
     assert sandbox._tools_user is None
     assert sandbox.extracted_as_user is None
-    assert (["id", "-u"], "root") in sandbox.exec_calls
+    assert any(user == "root" for _, user in sandbox.exec_calls)
     start_index = sandbox.exec_calls.index(([SANDBOX_CLI, "start-server"], None))
     validation_index = next(
         index
@@ -179,6 +189,32 @@ async def test_injection_accepts_trusted_installation_appearing_late(
     await sandbox_tools._inject_container_tools_code(sandbox)
 
     assert all(command != ["id", "-u"] for command, _ in sandbox.exec_calls)
+
+
+async def test_detector_validates_root_installation_in_one_exec() -> None:
+    class TrustedRootSandbox(RootProbeRaisesSandbox):
+        async def exec(
+            self,
+            cmd: list[str],
+            input: str | bytes | None = None,
+            cwd: str | None = None,
+            env: dict[str, str] | None = None,
+            user: str | None = None,
+            timeout: int | None = None,
+            timeout_retry: bool = True,
+            concurrency: bool = True,
+        ) -> ExecResult[str]:
+            self.exec_calls.append((cmd, user))
+            return ExecResult(success=True, returncode=0, stdout="0\n", stderr="")
+
+    sandbox = TrustedRootSandbox()
+
+    assert await sandbox_tools._sandbox_tools_detector(sandbox)
+    assert sandbox._tools_user == "root"
+    assert len(sandbox.exec_calls) == 1
+    command, user = sandbox.exec_calls[0]
+    assert user == "root"
+    assert "validate_owned()" in command[2]
 
 
 def test_publish_command_rejects_destination_created_during_move(

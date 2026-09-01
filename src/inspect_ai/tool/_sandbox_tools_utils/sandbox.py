@@ -157,13 +157,7 @@ async def _inject_container_tools_code_impl(sandbox: SandboxEnvironment) -> None
             raise RuntimeError(
                 f"Failed to publish sandbox tools installation: {result.stderr}"
             )
-        tools_dir_is_verified = await _tools_dir_is_verified(
-            sandbox, sandbox._tools_user
-        )
-        sandbox_cli_is_trusted = await _sandbox_cli_is_trusted(
-            sandbox, sandbox._tools_user
-        )
-        if not tools_dir_is_verified or not sandbox_cli_is_trusted:
+        if not await _sandbox_tools_detector(sandbox):
             raise RuntimeError("Published sandbox tools installation failed validation")
         published = True
 
@@ -241,33 +235,34 @@ async def _tools_dir_exists(sandbox: SandboxEnvironment) -> bool:
     ).success
 
 
-async def _tools_dir_is_verified(sandbox: SandboxEnvironment, user: str | None) -> bool:
-    script = """\
-test -d "$1" && test ! -L "$1" || exit 1
-set -- $(stat -c '%u %a' -- "$1" 2>/dev/null || stat -f '%u %Lp' "$1" 2>/dev/null) || exit 1
-test "$1" = "$(id -u)" && test $((0$2 & 022)) -eq 0
-"""
-    return (
-        await sandbox.exec(["sh", "-c", script, "sh", SANDBOX_TOOLS_DIR], user=user)
-    ).success
-
-
 async def _sandbox_tools_detector(sandbox: SandboxEnvironment) -> bool:
-    """Authorize reuse only when both the install root and launcher are trusted."""
-    try:
-        probe = await sandbox.exec(["id", "-u"], user="root")
-        if probe.success and probe.stdout.strip() == "0":
-            if not await _tools_dir_is_verified(sandbox, "root"):
-                return False
-            sandbox._tools_user = "root"
-            return await _sandbox_cli_is_trusted(sandbox, "root")
-    except Exception:
-        pass
+    """Authorize reuse and select the identity that owns a trusted install."""
+    command = _sandbox_tools_validation_command()
+    for user in ("root", None):
+        try:
+            result = await sandbox.exec(command, user=user, timeout_retry=False)
+        except Exception:
+            continue
+        if result.success:
+            sandbox._tools_user = "root" if result.stdout.strip() == "0" else None
+            return True
+    return False
 
-    if not await _tools_dir_is_verified(sandbox, None):
-        return False
-    sandbox._tools_user = None
-    return await _sandbox_cli_is_trusted(sandbox, None)
+
+def _sandbox_tools_validation_command() -> list[str]:
+    """Build one command that validates the install root and launcher."""
+    script = """\
+validate_owned() {
+    test "$1" "$2" && test ! -L "$2" || return 1
+    set -- $(stat -c '%u %a' -- "$2" 2>/dev/null || stat -f '%u %Lp' "$2" 2>/dev/null) || return 1
+    test "$1" = "$(id -u)" && test $((0$2 & 022)) -eq 0
+}
+validate_owned -d "$1"
+validate_owned -f "$2"
+test -x "$2"
+id -u
+"""
+    return ["sh", "-c", script, "sh", SANDBOX_TOOLS_DIR, SANDBOX_CLI]
 
 
 def _sandbox_cli_validation_command() -> list[str]:
@@ -304,7 +299,7 @@ async def _extract_tools_tree(
     user: str | None,
     tools_dir: str,
 ) -> None:
-    """Extract the gzipped onedir tar into SANDBOX_TOOLS_DIR.
+    """Extract the gzipped onedir tar into tools_dir.
 
     The provider stages the artifact at a unique path outside the protected install
     tree. The extraction identity then reads it into the tree.

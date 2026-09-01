@@ -38,11 +38,14 @@ Linux executables are built via PyInstaller `--onedir` and packaged as a gzipped
 When a tool needs to run in a container, the system automatically injects the appropriate executable:
 
 1. Tool requests a sandbox via `sandbox_with_injected_tools()`
-2. System checks if `/var/tmp/.da7be258e003d428/inspect-sandbox-tools` exists in the container
-3. If missing, the injection process:
+2. System verifies that the private installation directory and launcher are owned
+   by the execution identity, are not symlinks, and are not group/world-writable
+3. If no trusted installation exists, the injection process:
    - Detects container architecture (amd64/arm64) and libc (glibc/musl)
    - Selects the matching pre-built artifact from local binaries, S3, or a local Docker build
-   - Writes the gzipped onedir tar into the container and extracts it into `/var/tmp/.da7be258e003d428`
+   - Writes the gzipped onedir tar into the container, extracts it into an isolated
+     staging directory, validates it, and atomically publishes it as
+     `/var/tmp/.da7be258e003d428`
    - Restricts the extracted tree to root when Inspect can run commands as root. A
      root-owned 0700 tree prevents access by other, non-root users in the sandbox;
      it is not a boundary against a process running in the sandbox as root.
