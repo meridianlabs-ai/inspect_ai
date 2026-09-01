@@ -173,9 +173,7 @@ async def _inject_container_tools_code_impl(sandbox: SandboxEnvironment) -> None
             raise RuntimeError("Published sandbox tools installation failed validation")
         published = True
 
-        result = await sandbox.exec(
-            [SANDBOX_CLI, "start-server"], user=tools_user
-        )
+        result = await sandbox.exec([SANDBOX_CLI, "start-server"], user=tools_user)
         if not result.success:
             raise RuntimeError(f"Failed to start sandbox tools server: {result.stderr}")
     except BaseException:
@@ -389,9 +387,7 @@ async def _extract_tools_tree(
     try:
         await _write_archive(sandbox, upload_tmp, gz_bytes)
         await _secure_archive(sandbox, upload_tmp, gz_tmp, gz_bytes, user)
-        result = await sandbox.exec(
-            ["tar", "xzf", gz_tmp, "-C", tools_dir], user=user
-        )
+        result = await sandbox.exec(["tar", "xzf", gz_tmp, "-C", tools_dir], user=user)
     finally:
         await _cleanup_paths(sandbox, user, upload_tmp, gz_tmp, recursive=False)
     if result.success:
@@ -408,9 +404,7 @@ async def _extract_tools_tree(
     try:
         await _write_archive(sandbox, upload_tmp, tar_bytes)
         await _secure_archive(sandbox, upload_tmp, tar_tmp, tar_bytes, user)
-        result = await sandbox.exec(
-            ["tar", "xf", tar_tmp, "-C", tools_dir], user=user
-        )
+        result = await sandbox.exec(["tar", "xf", tar_tmp, "-C", tools_dir], user=user)
     finally:
         await _cleanup_paths(sandbox, user, upload_tmp, tar_tmp, recursive=False)
     if not result.success:
@@ -470,7 +464,9 @@ rm -f -- "$1"
         ["sh", "-c", script, "sh", upload_path, protected_path, digest], user=user
     )
     if not result.success:
-        raise RuntimeError(f"Sandbox tools archive failed secure staging: {result.stderr}")
+        raise RuntimeError(
+            f"Sandbox tools archive failed secure staging: {result.stderr}"
+        )
 
 
 def _uncompressed_tar_bytes(name: str, gz_bytes: bytes) -> bytes:

@@ -313,9 +313,7 @@ async def test_injection_preserves_unavailability_during_root_staging_probe(
     )
 
     sandbox = UnavailableDuringStagingSandbox()
-    with pytest.raises(
-        SandboxUnavailableError, match="sandbox stopped during staging"
-    ):
+    with pytest.raises(SandboxUnavailableError, match="sandbox stopped during staging"):
         await sandbox_tools._inject_container_tools_code(sandbox)
 
     assert sandbox.root_probes == 2
@@ -385,9 +383,7 @@ async def test_cancelled_root_staging_creation_cleans_up_as_root(
     ) -> bool:
         return False
 
-    async def cancelled_root_creation(
-        _sandbox: SandboxEnvironment, _path: str
-    ) -> bool:
+    async def cancelled_root_creation(_sandbox: SandboxEnvironment, _path: str) -> bool:
         creation_started.set()
         await anyio.sleep_forever()
         raise AssertionError("sleep_forever returned")
