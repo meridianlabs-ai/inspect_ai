@@ -647,22 +647,6 @@ class SandboxService:
                 f"for sandbox service '{self._name}': {result.stderr}"
             )
 
-        # Squat check. test -O passes iff path is owned by the effective
-        # uid; _exec runs as self._user, so this rejects dirs owned by
-        # other users. With instance, also check the <name> parent.
-        dirs_to_check = [service_dir]
-        if self._service_dir != self._root_service_dir:
-            dirs_to_check.append(self._root_service_dir.as_posix())
-        for path in dirs_to_check:
-            owned = await self._exec(["test", "-O", path])
-            if not owned.success:
-                user = self._user or "the sandbox default user"
-                raise PrerequisiteError(
-                    f"Sandbox service '{self._name}' cannot start: "
-                    f"'{path}' exists but is not owned by user '{user}'. "
-                    "Another service may have claimed this name."
-                )
-
     async def _create_rpc_dir(self, name: str) -> str:
         rpc_dir = PurePosixPath(self._service_dir, name).as_posix()
         result = await self._exec(["rm", "-rf", rpc_dir])

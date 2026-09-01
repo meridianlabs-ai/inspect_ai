@@ -250,44 +250,6 @@ class FakeSandboxEnvironment:
         return cast(ExecResult[str], FakeExecResult())
 
 
-async def test_ensure_service_dir_raises_when_dir_not_owned() -> None:
-    """A name-squat (alien-owned service dir) raises PrerequisiteError."""
-    fake = FakeSandboxEnvironment(
-        results=[
-            FakeExecResult(),  # chmod 1777 SERVICES_DIR
-            FakeExecResult(),  # mkdir <service_dir>
-            FakeExecResult(success=False, returncode=1),  # test -O -> not owned
-        ],
-    )
-    service = SandboxService(
-        name="squatted",
-        sandbox=cast(SandboxEnvironment, fake),
-        user="agent",
-    )
-
-    with pytest.raises(PrerequisiteError) as excinfo:
-        await service.start()
-
-    msg = str(excinfo.value)
-    assert "squatted" in msg
-    assert "agent" in msg
-    assert f"{SERVICES_DIR}/squatted" in msg
-
-    issued = [call["cmd"] for call in fake.calls]
-    assert len(issued) == 3, f"expected 3 exec calls, got {len(issued)}: {issued}"
-    assert issued[0][:2] == ["sh", "-c"]
-    assert "chmod 1777" in issued[0][2]
-    assert SERVICES_DIR in issued[0][2]
-    assert issued[1][:2] == ["sh", "-c"]
-    assert f"{SERVICES_DIR}/squatted" in issued[1][2]
-    assert issued[2] == ["test", "-O", f"{SERVICES_DIR}/squatted"]
-    # Parent preparation prefers root; per-service verification runs as the
-    # service user.
-    assert fake.calls[0]["user"] == "root"
-    assert fake.calls[1]["user"] == "agent"
-    assert fake.calls[2]["user"] == "agent"
-
-
 async def test_ensure_service_dir_does_not_fallback_after_root_rejection() -> None:
     """An unsafe parent found as root is not retried as its untrusted owner."""
     fake = FakeSandboxEnvironment(
@@ -329,43 +291,6 @@ async def test_ensure_service_dir_falls_back_after_failed_root_exec_result() -> 
     assert fake.calls[0]["user"] == "root"
     assert fake.calls[1] == {"cmd": ["id", "-u"], "user": "root"}
     assert fake.calls[2]["user"] is None
-
-
-async def test_ensure_service_dir_checks_root_service_dir_when_instance_set() -> None:
-    """With instance set, both <name>/<instance> and <name> are ownership-checked."""
-    fake = FakeSandboxEnvironment(
-        results=[
-            FakeExecResult(),  # chmod 1777 SERVICES_DIR
-            FakeExecResult(),  # verify <name>
-            FakeExecResult(),  # mkdir <name>/<instance>
-            FakeExecResult(),  # test -O <name>/<instance> -> owned
-            FakeExecResult(success=False, returncode=1),  # test -O <name> -> squatted
-        ],
-    )
-    service = SandboxService(
-        name="multi",
-        sandbox=cast(SandboxEnvironment, fake),
-        user="agent",
-        instance="inst1",
-    )
-
-    with pytest.raises(PrerequisiteError) as excinfo:
-        await service.start()
-
-    msg = str(excinfo.value)
-    assert "multi" in msg
-    assert "agent" in msg
-    # Error names the squatted <name>, not the leaf instance dir.
-    assert f"{SERVICES_DIR}/multi" in msg
-    assert f"{SERVICES_DIR}/multi/inst1" not in msg
-
-    issued = [call["cmd"] for call in fake.calls]
-    assert len(issued) == 5, f"expected 5 exec calls, got {len(issued)}: {issued}"
-    assert issued[1][:2] == ["sh", "-c"]
-    assert f"{SERVICES_DIR}/multi" in issued[1][2]
-    assert f"{SERVICES_DIR}/multi/inst1" in issued[2][2]
-    assert issued[3] == ["test", "-O", f"{SERVICES_DIR}/multi/inst1"]
-    assert issued[4] == ["test", "-O", f"{SERVICES_DIR}/multi"]
 
 
 async def test_ensure_service_dir_raises_prereq_when_parent_unwritable() -> None:

@@ -61,6 +61,30 @@ async def test_human_agent_reuses_directory_owned_by_selected_user(
     assert (["rm", "-rf", human_install.INSTALL_DIR], "root") in fake.calls
 
 
+async def test_session_logs_are_read_as_selected_user(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    @dataclass
+    class SessionSandbox:
+        calls: list[tuple[list[str], str | None]] = field(default_factory=list)
+
+        async def exec(
+            self, cmd: list[str], *, user: str | None = None, **kwargs: Any
+        ) -> ExecResult[str]:
+            self.calls.append((cmd, user))
+            if cmd[0] == "ls":
+                return ExecResult(True, 0, "agent_session.output\n", "")
+            return ExecResult(True, 0, "session contents", "")
+
+    fake = SessionSandbox()
+    monkeypatch.setattr(submit, "sandbox", lambda: cast(SandboxEnvironment, fake))
+
+    logs = await SubmitCommand(True, "agent")._read_session_logs()
+
+    assert logs == {"agent_session.output": "session contents"}
+    assert [user for _, user in fake.calls] == ["agent", "agent"]
+
+
 @pytest.mark.parametrize(
     ("command", "args", "expected_calls"),
     [
