@@ -32,7 +32,9 @@ def framework_directory_command(
         f"stat -f '%u %Lp' {directory} 2>/dev/null"
     )
     mode_check = (
-        f"chmod {mode_text} -- {directory} && " if repair_mode else ""
+        f"chmod {mode_text} -- {directory} && set -- $({stat_values}) && "
+        if repair_mode
+        else ""
     ) + f'test "$2" = {mode_text}'
     script = (
         f"umask 077; if mkdir -m {mode_text} -- {directory} 2>/dev/null; "

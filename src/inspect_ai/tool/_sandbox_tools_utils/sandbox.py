@@ -1,3 +1,4 @@
+import base64
 import gzip
 import os
 import subprocess
@@ -23,6 +24,7 @@ from inspect_ai._util.package import get_package_direct_url
 from inspect_ai._util.trace import trace_message
 from inspect_ai.util import input_screen
 from inspect_ai.util._concurrency import concurrency
+from inspect_ai.util._sandbox._framework_directory import framework_directory_command
 from inspect_ai.util._sandbox._cli import SANDBOX_CLI, SANDBOX_TOOLS_DIR
 from inspect_ai.util._sandbox.context import (
     SandboxInjectable,
@@ -165,18 +167,14 @@ def _ensure_tools_dir_command() -> list[str]:
     """Return the bootstrap adapter for the framework-directory contract.
 
     ``mkdir`` binds creation atomically. An existing entry is only adopted when
-    it is a non-symlink directory owned by the effective UID with exact mode
-    0700. Under sticky ``/var/tmp``, an unprivileged user cannot replace a
-    root-owned entry after this verification.
+    it is a non-symlink directory owned by the effective UID; legacy modes are
+    repaired to 0700. Under sticky ``/var/tmp``, an unprivileged user cannot
+    replace a root-owned entry after this verification.
     """
-    script = (
-        "umask 077; "
-        f"mkdir -m 700 -- {SANDBOX_TOOLS_DIR} 2>/dev/null || "
-        f"{{ test -d {SANDBOX_TOOLS_DIR} && test ! -L {SANDBOX_TOOLS_DIR} && "
-        f'test "$(stat -c %u -- {SANDBOX_TOOLS_DIR})" = "$(id -u)" && '
-        f'test "$(stat -c %a -- {SANDBOX_TOOLS_DIR})" = 700; }}'
+    return framework_directory_command(
+        SANDBOX_TOOLS_DIR,
+        repair_mode=True,
     )
-    return ["sh", "-c", script]
 
 
 async def _tools_dir_is_verified(sandbox: SandboxEnvironment, user: str | None) -> bool:
@@ -217,16 +215,16 @@ async def _extract_tools_tree(
 ) -> None:
     """Extract the gzipped onedir tar into SANDBOX_TOOLS_DIR.
 
-    The artifact is staged to a temp file via write_file (which base64-encodes binary
-    content reliably; raw binary stdin through exec is not safe) and then extracted.
+    The artifact is staged inside the verified tools directory by the extraction
+    identity. Base64 text avoids passing raw binary through sandbox exec.
 
     Optimistic path: ship the compressed artifact and extract with `tar xzf`. If the
     container's `tar` lacks gzip support, fall back to injecting an uncompressed tar,
     which only needs plain `tar xf` (the broadest assumption). The uncompressed tar is
     cached in the binaries dir so we decompress at most once per artifact.
     """
-    gz_tmp = f"{SANDBOX_TOOLS_DIR}.pkg.tgz"
-    await sandbox.write_file(gz_tmp, gz_bytes)
+    gz_tmp = f"{SANDBOX_TOOLS_DIR}/.pkg.tgz"
+    await _stage_archive(sandbox, gz_tmp, gz_bytes, user)
     result = await sandbox.exec(
         ["tar", "xzf", gz_tmp, "-C", SANDBOX_TOOLS_DIR], user=user
     )
@@ -240,14 +238,34 @@ async def _extract_tools_tree(
         TRACE_SANDBOX_TOOLS,
         f"tar xzf failed ({result.stderr.strip()}); retrying with uncompressed tar",
     )
-    tar_tmp = f"{SANDBOX_TOOLS_DIR}.pkg.tar"
-    await sandbox.write_file(tar_tmp, _uncompressed_tar_bytes(name, gz_bytes))
+    tar_tmp = f"{SANDBOX_TOOLS_DIR}/.pkg.tar"
+    await _stage_archive(
+        sandbox, tar_tmp, _uncompressed_tar_bytes(name, gz_bytes), user
+    )
     result = await sandbox.exec(
         ["tar", "xf", tar_tmp, "-C", SANDBOX_TOOLS_DIR], user=user
     )
     await sandbox.exec(["rm", "-f", tar_tmp], user=user)
     if not result.success:
         raise RuntimeError(f"Failed to extract sandbox tools: {result.stderr}")
+
+
+async def _stage_archive(
+    sandbox: SandboxEnvironment, path: str, contents: bytes, user: str | None
+) -> None:
+    result = await sandbox.exec(
+        [
+            "sh",
+            "-c",
+            "umask 077; "
+            "if base64 -d </dev/null >/dev/null 2>&1; then decoder='base64 -d'; "
+            "else decoder='base64 -D'; fi; $decoder > " + path,
+        ],
+        input=base64.b64encode(contents).decode("ascii"),
+        user=user,
+    )
+    if not result.success:
+        raise RuntimeError(f"Failed to stage sandbox tools archive: {result.stderr}")
 
 
 def _uncompressed_tar_bytes(name: str, gz_bytes: bytes) -> bytes:

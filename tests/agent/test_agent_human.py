@@ -18,7 +18,7 @@ from inspect_ai.agent._human.agent import human_cli
 from inspect_ai.agent._human.commands import submit
 from inspect_ai.agent._human.commands.submit import QuitCommand, SubmitCommand
 from inspect_ai.util import SandboxEnvironment
-from inspect_ai.util._sandbox.environment import ExecResult
+from inspect_ai.util._subprocess import ExecResult
 
 
 @dataclass

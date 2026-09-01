@@ -28,15 +28,26 @@ async def install_human_agent(
 
     # see if we have already installed
     install_result = await sandbox().exec(
-        framework_directory_command(HUMAN_AGENT_DIR, report_creation=True), user="root"
+        framework_directory_command(
+            HUMAN_AGENT_DIR, report_creation=True, repair_mode=True
+        ),
+        user="root",
     )
     if not install_result.success:
         install_result = await sandbox().exec(
-            framework_directory_command(HUMAN_AGENT_DIR, report_creation=True),
+            framework_directory_command(
+                HUMAN_AGENT_DIR, report_creation=True, repair_mode=True
+            ),
             user=user,
         )
         if not install_result.success or install_result.stdout.strip() != "existing":
             raise RuntimeError(f"Unsafe human-agent directory: {HUMAN_AGENT_DIR}")
+    if record_session:
+        await checked_exec(
+            framework_directory_command(RECORD_SESSION_DIR, repair_mode=True),
+            user=user,
+        )
+
     if install_result.stdout.strip() == "existing":
         return
 
@@ -45,26 +56,24 @@ async def install_human_agent(
 
     # setup installation directory
     await checked_exec(framework_directory_command(INSTALL_DIR), user="root")
-    if user != "root":
-        await checked_exec(["chown", user, INSTALL_DIR], user="root")
-
-    if record_session:
-        await checked_exec(framework_directory_command(RECORD_SESSION_DIR), user="root")
-        if user != "root":
-            await checked_exec(["chown", user, RECORD_SESSION_DIR], user="root")
-
     # generate task.py
     task_py = human_agent_commands(commands)
-    await checked_write_file(f"{INSTALL_DIR}/{TASK_PY}", task_py, executable=True)
+    await checked_write_file(
+        f"{INSTALL_DIR}/{TASK_PY}", task_py, executable=True, user="root"
+    )
 
     # generate .bashrc
     bash_rc = human_agent_bashrc(commands, bashrc_content, record_session)
-    await checked_write_file(f"{INSTALL_DIR}/{BASHRC}", bash_rc, executable=True)
+    await checked_write_file(
+        f"{INSTALL_DIR}/{BASHRC}", bash_rc, executable=True, user="root"
+    )
 
     # write and run installation script
     install_sh = human_agent_install_sh(user)
-    await checked_write_file(f"{INSTALL_DIR}/{INSTALL_SH}", install_sh, executable=True)
-    await checked_exec(["bash", f"./{INSTALL_SH}"], cwd=INSTALL_DIR)
+    await checked_write_file(
+        f"{INSTALL_DIR}/{INSTALL_SH}", install_sh, executable=True, user="root"
+    )
+    await checked_exec(["bash", f"./{INSTALL_SH}"], cwd=INSTALL_DIR, user="root")
     await checked_exec(["rm", "-rf", INSTALL_DIR])
 
 
@@ -238,7 +247,9 @@ def human_agent_install_sh(user: str | None) -> str:
     USER_HOME=$(getent passwd $USER | cut -d: -f6)
 
     # append to user's .bashrc
+    printf '\n' >> $USER_HOME/{BASHRC}
     cat {BASHRC} >> $USER_HOME/{BASHRC}
+    printf '\n' >> $USER_HOME/{BASHRC}
     """)
 
 
@@ -257,8 +268,8 @@ async def checked_exec(
 async def checked_write_file(
     file: str, contents: str, executable: bool = False, user: str | None = None
 ) -> None:
-    await checked_exec(["tee", "--", file], input=contents)
+    await checked_exec(["tee", "--", file], input=contents, user=user)
     if user:
         await checked_exec(["chown", user, file], user="root")
     if executable:
-        await checked_exec(["chmod", "+x", file])
+        await checked_exec(["chmod", "+x", file], user=user)

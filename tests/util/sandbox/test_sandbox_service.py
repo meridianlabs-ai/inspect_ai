@@ -16,6 +16,7 @@ from inspect_ai._util.error import PrerequisiteError
 from inspect_ai.solver import Generate, Solver, TaskState, solver
 from inspect_ai.util import sandbox
 from inspect_ai.util._background import background
+from inspect_ai.util._sandbox._framework_directory import framework_directory_command
 from inspect_ai.util._sandbox.environment import SandboxEnvironment
 from inspect_ai.util._sandbox.limits import OutputLimitExceededError
 from inspect_ai.util._sandbox.service import (
@@ -25,6 +26,21 @@ from inspect_ai.util._sandbox.service import (
     sandbox_service,
 )
 from inspect_ai.util._subprocess import ExecResult
+
+
+def test_framework_directory_command_repairs_legacy_mode(tmp_path: Path) -> None:
+    directory = tmp_path / "legacy"
+    directory.mkdir(mode=0o755)
+
+    result = subprocess.run(
+        framework_directory_command(directory, mode=0o700, repair_mode=True),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert directory.stat().st_mode & 0o7777 == 0o700
 
 
 @pytest.mark.slow
@@ -275,10 +291,13 @@ async def test_ensure_service_dir_raises_when_dir_not_owned() -> None:
 async def test_ensure_service_dir_does_not_fallback_after_root_rejection() -> None:
     """An unsafe parent found as root is not retried as its untrusted owner."""
     fake = FakeSandboxEnvironment(
-        results=[FakeExecResult(success=False, returncode=1)]
+        results=[
+            FakeExecResult(success=False, returncode=1),
+            FakeExecResult(stdout="0\n"),
+        ]
     )
     service = SandboxService(
-        name="squatted-parent",
+        name="squatted_parent",
         sandbox=cast(SandboxEnvironment, fake),
         user="agent",
     )
@@ -286,8 +305,30 @@ async def test_ensure_service_dir_does_not_fallback_after_root_rejection() -> No
     with pytest.raises(PrerequisiteError, match="unsafe"):
         await service.start()
 
-    assert len(fake.calls) == 1
+    assert len(fake.calls) == 2
     assert fake.calls[0]["user"] == "root"
+    assert fake.calls[1] == {"cmd": ["id", "-u"], "user": "root"}
+
+
+async def test_ensure_service_dir_falls_back_after_failed_root_exec_result() -> None:
+    fake = FakeSandboxEnvironment(
+        results=[
+            FakeExecResult(success=False, returncode=1),
+            FakeExecResult(success=False, returncode=1),
+            FakeExecResult(),
+        ]
+    )
+    service = SandboxService(
+        name="rootless",
+        sandbox=cast(SandboxEnvironment, fake),
+        user="agent",
+    )
+
+    await service.start()
+
+    assert fake.calls[0]["user"] == "root"
+    assert fake.calls[1] == {"cmd": ["id", "-u"], "user": "root"}
+    assert fake.calls[2]["user"] is None
 
 
 async def test_ensure_service_dir_checks_root_service_dir_when_instance_set() -> None:

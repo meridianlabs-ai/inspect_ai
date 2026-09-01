@@ -587,15 +587,23 @@ class SandboxService:
                 f"Timed out preparing shared services directory {SERVICES_DIR}"
             )
         except Exception:
+            parent_result = None
+        if parent_result is None or not parent_result.success:
             try:
                 root_probe = await self._sandbox.exec(
                     ["id", "-u"], user="root", timeout=600, concurrency=False
                 )
             except Exception:
                 root_probe = None
-            if root_probe is not None and root_probe.success:
-                if root_probe.stdout.strip() == "0":
-                    raise
+            if (
+                root_probe is not None
+                and root_probe.success
+                and root_probe.stdout.strip() == "0"
+            ):
+                raise PrerequisiteError(
+                    f"Shared sandbox services directory '{SERVICES_DIR}' is unsafe: "
+                    "it must be owned by root with mode 1777."
+                )
             parent_result = await self._sandbox.exec(
                 command, timeout=600, concurrency=False
             )
@@ -613,7 +621,9 @@ class SandboxService:
         )
         result = None
         for directory in directories:
-            result = await self._exec(framework_directory_command(directory))
+            result = await self._exec(
+                framework_directory_command(directory, repair_mode=True)
+            )
             if not result.success:
                 break
         assert result is not None
