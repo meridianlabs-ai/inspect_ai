@@ -681,3 +681,33 @@ async def test_exec_hides_server_directory_from_in_process_tools(
     monkeypatch.setattr(main_module, "_dispatch_local_method", dispatch)
 
     await main_module._exec('{"jsonrpc":"2.0","method":"in_process","id":1}')
+
+
+def test_exec_initializes_chunk_storage_before_switching_user(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(main_module, "load_tools", lambda _module: {"in_process"})
+    monkeypatch.setattr(
+        main_module,
+        "ensure_json_rpc_response_chunk_dir",
+        lambda: calls.append("ensure"),
+    )
+    monkeypatch.setattr(
+        main_module, "switch_user", lambda _user: calls.append("switch")
+    )
+    monkeypatch.setattr(main_module, "get_home_dir", lambda _user: "/home/alice")
+
+    async def dispatch(_request: str) -> str:
+        return '{"jsonrpc":"2.0","result":null,"id":1}'
+
+    monkeypatch.setattr(main_module, "_dispatch_local_method", dispatch)
+
+    asyncio.run(
+        main_module._exec(
+            '{"jsonrpc":"2.0","method":"in_process",'
+            '"params":{"_run_as_user":"alice"},"id":1}'
+        )
+    )
+
+    assert calls == ["ensure", "switch"]

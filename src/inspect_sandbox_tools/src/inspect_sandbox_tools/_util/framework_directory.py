@@ -1,3 +1,4 @@
+import fcntl
 import os
 import stat
 import uuid
@@ -28,6 +29,10 @@ def framework_directory(
     parent_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     directory_fd: int | None = None
     try:
+        # The parent is stable for the lifetime of this descriptor. Serializing
+        # migration on it prevents a concurrent verifier from quarantining the
+        # replacement installed by another process.
+        fcntl.flock(parent_fd, fcntl.LOCK_EX)
         while directory_fd is None:
             try:
                 directory_fd = os.open(
@@ -78,6 +83,7 @@ def framework_directory(
                 )
             _quarantine_entry(parent_fd, path)
 
+        fcntl.flock(parent_fd, fcntl.LOCK_UN)
         yield directory_fd
     finally:
         if directory_fd is not None:

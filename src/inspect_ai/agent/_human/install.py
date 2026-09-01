@@ -31,9 +31,7 @@ async def install_human_agent(
     root_directory_command = framework_directory_command(
         HUMAN_AGENT_DIR, report_creation=True, repair_mode=True
     )
-    root_directory_command[2] = (
-        'test "$(id -u)" = 0 && ' + root_directory_command[2]
-    )
+    root_directory_command[2] = 'test "$(id -u)" = 0 && ' + root_directory_command[2]
     try:
         install_result = await sandbox().exec(
             root_directory_command,

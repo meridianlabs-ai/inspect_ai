@@ -1,8 +1,10 @@
 from argparse import Namespace
+from contextlib import suppress
 from logging import getLogger
 from pathlib import PurePosixPath
 from re import Pattern, compile, match
 from typing import Awaitable, Callable, Literal
+from uuid import uuid4
 
 from pydantic import JsonValue
 
@@ -39,16 +41,29 @@ class SessionEndCommand(HumanAgentCommand):
         # read logs
         session_logs: dict[str, str] = {}
         for session_log in result.stdout.strip().splitlines():
+            staged_log = sessions_dir / f".inspect-read-{uuid4().hex}"
             try:
                 log_result = await sandbox().exec(
-                    ["cat", "--", (sessions_dir / session_log).as_posix()],
+                    [
+                        "cp",
+                        "--",
+                        (sessions_dir / session_log).as_posix(),
+                        staged_log.as_posix(),
+                    ],
                     user=self._user,
                 )
                 if not log_result.success:
                     raise RuntimeError(log_result.stderr)
-                session_logs[session_log] = log_result.stdout
+                session_logs[session_log] = await sandbox().read_file(
+                    staged_log.as_posix()
+                )
             except Exception as ex:
                 logger.warning(f"Error reading human agent session log: {ex}")
+            finally:
+                with suppress(Exception):
+                    await sandbox().exec(
+                        ["rm", "-f", "--", staged_log.as_posix()], user=self._user
+                    )
 
         return session_logs
 

@@ -2,6 +2,7 @@ import os
 import stat
 from pathlib import Path
 
+import inspect_sandbox_tools._util.framework_directory as framework_directory_module
 import pytest
 from inspect_sandbox_tools._util.framework_directory import (
     ensure_framework_directory,
@@ -80,3 +81,26 @@ def test_framework_directory_descriptor_survives_path_replacement(
         directory.rename(tmp_path / "moved")
         directory.mkdir()
         assert os.fstat(directory_fd).st_ino == (tmp_path / "moved").stat().st_ino
+
+
+def test_framework_directory_serializes_migration_on_parent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    directory = tmp_path / "framework"
+    directory.mkdir(mode=0o777)
+    directory.chmod(0o777)
+    lock_operations: list[int] = []
+    real_flock = framework_directory_module.fcntl.flock
+
+    def record_flock(fd: int, operation: int) -> None:
+        lock_operations.append(operation)
+        real_flock(fd, operation)
+
+    monkeypatch.setattr(framework_directory_module.fcntl, "flock", record_flock)
+
+    ensure_framework_directory(directory)
+
+    assert lock_operations == [
+        framework_directory_module.fcntl.LOCK_EX,
+        framework_directory_module.fcntl.LOCK_UN,
+    ]

@@ -74,15 +74,20 @@ async def test_session_logs_are_read_as_configured_user(
             self, cmd: list[str], *, user: str | None = None, **kwargs: object
         ) -> ExecResult[str]:
             calls.append((cmd, user))
-            stdout = "session.log\n" if cmd[0] == "ls" else "recording"
+            stdout = "session.log\n" if cmd[0] == "ls" else ""
             return ExecResult(True, 0, stdout, "")
+
+        async def read_file(self, path: str) -> str:
+            assert path.startswith("/var/tmp/user-sessions/.inspect-read-")
+            return "recording"
 
     monkeypatch.setattr(submit, "sandbox", lambda: FakeSandbox())
 
     logs = await SubmitCommand(True, "alice")._read_session_logs()
 
     assert logs == {"session.log": "recording"}
-    assert [user for _, user in calls] == ["alice", "alice"]
+    assert [user for _, user in calls] == ["alice", "alice", "alice"]
+    assert [cmd[0] for cmd, _ in calls] == ["ls", "cp", "rm"]
 
 
 async def test_checked_write_file_runs_as_owner(
