@@ -248,9 +248,7 @@ set -- $(stat -c '%u %a' -- "$1" 2>/dev/null || stat -f '%u %Lp' "$1" 2>/dev/nul
 test "$1" = "$(id -u)" && test $((0$2 & 022)) -eq 0
 """
     return (
-        await sandbox.exec(
-            ["sh", "-c", script, "sh", SANDBOX_TOOLS_DIR], user=user
-        )
+        await sandbox.exec(["sh", "-c", script, "sh", SANDBOX_TOOLS_DIR], user=user)
     ).success
 
 

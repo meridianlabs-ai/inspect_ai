@@ -28,6 +28,7 @@ class RootProbeRaisesSandbox(SandboxEnvironment):
         self.writes: list[tuple[str, str | bytes]] = []
         self.extracted_as_user: str | None | object = object()
         self.validation_results: list[bool] = []
+        self.tools_dir_exists = False
 
     async def exec(
         self,
@@ -45,9 +46,22 @@ class RootProbeRaisesSandbox(SandboxEnvironment):
         if cmd == ["id", "-u"] and user == "root":
             raise RuntimeError("runuser: may not be used by non-root users")
         if cmd[:2] == ["sh", "-c"] and 'test -e "$1"' in cmd[2]:
-            return ExecResult(success=False, returncode=1, stdout="", stderr="")
+            return ExecResult(
+                success=self.tools_dir_exists,
+                returncode=0 if self.tools_dir_exists else 1,
+                stdout="",
+                stderr="",
+            )
+        if cmd[:2] == ["sh", "-c"] and "source_id=$(stat" in cmd[2]:
+            self.tools_dir_exists = True
+            return ExecResult(success=True, returncode=0, stdout="", stderr="")
         if cmd[:2] == ["sh", "-c"] and 'test -d "$1"' in cmd[2]:
-            return ExecResult(success=False, returncode=1, stdout="", stderr="")
+            return ExecResult(
+                success=self.tools_dir_exists,
+                returncode=0 if self.tools_dir_exists else 1,
+                stdout="",
+                stderr="",
+            )
         if cmd[:2] == ["sh", "-c"] and "validate_file()" in cmd[2]:
             success = (
                 self.validation_results.pop(0) if self.validation_results else False
