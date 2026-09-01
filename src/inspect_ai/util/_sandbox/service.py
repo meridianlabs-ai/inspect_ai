@@ -18,6 +18,7 @@ from inspect_ai._util._async import coro_log_exceptions
 from inspect_ai._util.error import PrerequisiteError
 from inspect_ai.util._subprocess import ExecResult
 
+from ._framework_directory import framework_directory_command
 from .environment import SandboxEnvironment
 from .limits import OutputLimitExceededError, override_max_exec_output_size
 
@@ -571,29 +572,46 @@ class SandboxService:
         await self._write_response(request_file, request_id, None, error)
 
     async def _ensure_service_dir(self) -> None:
-        # Make the shared parent 1777 so users other than the one that
-        # created it can still place their service dirs inside. Run as
-        # the sandbox default user (no user= override) since self._user
-        # typically can't chmod a dir owned by someone else; best-effort
-        # because even the default user may not own it.
+        command = framework_directory_command(
+            SERVICES_DIR, mode=int(SERVICES_DIR_MODE, 8), repair_mode=True
+        )
         try:
-            await self._sandbox.exec(
-                [
-                    "sh",
-                    "-c",
-                    f"mkdir -p {SERVICES_DIR} && "
-                    f"chmod {SERVICES_DIR_MODE} {SERVICES_DIR} 2>/dev/null; true",
-                ],
+            parent_result = await self._sandbox.exec(
+                command,
+                user="root",
                 timeout=600,
                 concurrency=False,
             )
+            if not parent_result.success:
+                parent_result = await self._sandbox.exec(
+                    command, timeout=600, concurrency=False
+                )
         except TimeoutError:
             raise RuntimeError(
                 f"Timed out preparing shared services directory {SERVICES_DIR}"
             )
+        except Exception:
+            parent_result = await self._sandbox.exec(
+                command, timeout=600, concurrency=False
+            )
+        if not parent_result.success:
+            raise PrerequisiteError(
+                f"Shared sandbox services directory '{SERVICES_DIR}' is unsafe: "
+                "it must be owned by the sandbox default user with mode 1777."
+            )
 
         service_dir = self._service_dir.as_posix()
-        result = await self._exec(["mkdir", "-p", service_dir])
+        directories = (
+            [self._root_service_dir.as_posix(), service_dir]
+            if self._service_dir != self._root_service_dir
+            else [service_dir]
+        )
+        result = None
+        for directory in directories:
+            result = await self._exec(framework_directory_command(directory))
+            if not result.success:
+                break
+        assert result is not None
         if not result.success:
             # When the chmod above silently no-op'd, mkdir fails with a
             # generic Permission denied that blames the leaf. Re-blame
@@ -633,7 +651,7 @@ class SandboxService:
     async def _create_rpc_dir(self, name: str) -> str:
         rpc_dir = PurePosixPath(self._service_dir, name).as_posix()
         result = await self._exec(["rm", "-rf", rpc_dir])
-        result = await self._exec(["mkdir", "-p", rpc_dir])
+        result = await self._exec(framework_directory_command(rpc_dir))
         if not result.success:
             raise RuntimeError(
                 f"Error creating rpc directory '{name}' for sandbox '{self._name}': {result.stderr}"

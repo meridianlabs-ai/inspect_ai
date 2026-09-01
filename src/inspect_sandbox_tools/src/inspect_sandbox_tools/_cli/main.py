@@ -24,6 +24,7 @@ from inspect_sandbox_tools._util.constants import (
     SHUTDOWN_STATUS_PATH,
     SOCKET_PATH,
 )
+from inspect_sandbox_tools._util.framework_directory import ensure_framework_directory
 from inspect_sandbox_tools._util.json_rpc_chunking import (
     JSON_RPC_RESPONSE_CHUNK_METHOD,
     chunk_json_rpc_response_if_needed,
@@ -202,7 +203,7 @@ _SERVER_START_LOCK_PATH = SERVER_DIR / "server-start.lock"
 
 def _ensure_server_is_running() -> None:
     """Start one server for this directory, waiting for a concurrent starter."""
-    SERVER_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_framework_directory(SERVER_DIR, owner_uid=os.getuid())
     with _SERVER_START_LOCK_PATH.open("a+") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         _ensure_server_is_running_locked()
@@ -227,7 +228,7 @@ def _ensure_server_is_running_locked() -> None:
 
     SHUTDOWN_STATUS_PATH.unlink(missing_ok=True)
 
-    SERVER_DIR.mkdir(exist_ok=True)
+    ensure_framework_directory(SERVER_DIR, owner_uid=os.getuid())
     stdout_log = open(_SERVER_STDOUT_LOG, "a")
     stderr_log = open(_SERVER_STDERR_LOG, "a")
 

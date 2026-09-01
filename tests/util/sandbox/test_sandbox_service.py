@@ -262,11 +262,12 @@ async def test_ensure_service_dir_raises_when_dir_not_owned() -> None:
     assert issued[0][:2] == ["sh", "-c"]
     assert "chmod 1777" in issued[0][2]
     assert SERVICES_DIR in issued[0][2]
-    assert issued[1] == ["mkdir", "-p", f"{SERVICES_DIR}/squatted"]
+    assert issued[1][:2] == ["sh", "-c"]
+    assert f"{SERVICES_DIR}/squatted" in issued[1][2]
     assert issued[2] == ["test", "-O", f"{SERVICES_DIR}/squatted"]
-    # Parent chmod runs as the sandbox default (no user restriction);
-    # per-service mkdir + squat-check run as the service user.
-    assert fake.calls[0]["user"] is None
+    # Parent preparation prefers root; per-service verification runs as the
+    # service user.
+    assert fake.calls[0]["user"] == "root"
     assert fake.calls[1]["user"] == "agent"
     assert fake.calls[2]["user"] == "agent"
 
@@ -276,6 +277,7 @@ async def test_ensure_service_dir_checks_root_service_dir_when_instance_set() ->
     fake = FakeSandboxEnvironment(
         results=[
             FakeExecResult(),  # chmod 1777 SERVICES_DIR
+            FakeExecResult(),  # verify <name>
             FakeExecResult(),  # mkdir <name>/<instance>
             FakeExecResult(),  # test -O <name>/<instance> -> owned
             FakeExecResult(success=False, returncode=1),  # test -O <name> -> squatted
@@ -299,10 +301,12 @@ async def test_ensure_service_dir_checks_root_service_dir_when_instance_set() ->
     assert f"{SERVICES_DIR}/multi/inst1" not in msg
 
     issued = [call["cmd"] for call in fake.calls]
-    assert len(issued) == 4, f"expected 4 exec calls, got {len(issued)}: {issued}"
-    assert issued[1] == ["mkdir", "-p", f"{SERVICES_DIR}/multi/inst1"]
-    assert issued[2] == ["test", "-O", f"{SERVICES_DIR}/multi/inst1"]
-    assert issued[3] == ["test", "-O", f"{SERVICES_DIR}/multi"]
+    assert len(issued) == 5, f"expected 5 exec calls, got {len(issued)}: {issued}"
+    assert issued[1][:2] == ["sh", "-c"]
+    assert f"{SERVICES_DIR}/multi" in issued[1][2]
+    assert f"{SERVICES_DIR}/multi/inst1" in issued[2][2]
+    assert issued[3] == ["test", "-O", f"{SERVICES_DIR}/multi/inst1"]
+    assert issued[4] == ["test", "-O", f"{SERVICES_DIR}/multi"]
 
 
 async def test_ensure_service_dir_raises_prereq_when_parent_unwritable() -> None:
