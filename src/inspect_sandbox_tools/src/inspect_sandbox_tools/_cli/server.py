@@ -148,8 +148,7 @@ def main() -> None:
     app.router.add_post("/", handle_request)
     app.on_cleanup.append(_cleanup_remote_resources)
 
-    # When non-root, use permissive umask so any user can connect to the socket.
-    # When root, directory permissions (0o700) already block unauthorized access.
+    # The private server directory restricts socket access to its owning user.
     old_umask = os.umask(0o111)
     try:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

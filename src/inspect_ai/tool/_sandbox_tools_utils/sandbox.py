@@ -106,6 +106,11 @@ async def _inject_container_tools_code(sandbox: SandboxEnvironment) -> None:
         async with _open_executable_for_arch(info["architecture"], musl) as (name, f):
             gz_bytes = f.read()  # gzipped tar of the PyInstaller --onedir tree
 
+        # A trusted stale launcher must stop its daemon before its executable tree
+        # is replaced. Do this before any permission repair so a formerly writable
+        # installation can never become eligible for privileged execution.
+        await _stop_trusted_existing_server(sandbox, sandbox._tools_user)
+
         # Create the install dir as root if possible so the tree is root-owned and
         # can be hidden from the agent; fall back to the default user for rootless
         # sandboxes (where user-switching will be disabled, auto-detected by the
@@ -189,6 +194,21 @@ async def _tools_install_is_current(
     sandbox: SandboxEnvironment, user: str | None
 ) -> bool:
     version = _get_sandbox_tools_version()
+    return await _launcher_is_trusted(sandbox, user) and (
+        await sandbox.exec(
+            [
+                "sh",
+                "-c",
+                f'test "$(cat "{_SANDBOX_TOOLS_GENERATION_FILE}")" = "{version}"',
+            ],
+            user=user,
+        )
+    ).success
+
+
+async def _launcher_is_trusted(
+    sandbox: SandboxEnvironment, user: str | None
+) -> bool:
     return (
         await sandbox.exec(
             [
@@ -197,12 +217,26 @@ async def _tools_install_is_current(
                 f'test ! -L "{SANDBOX_CLI}" && test -f "{SANDBOX_CLI}" '
                 f'&& test -x "{SANDBOX_CLI}" '
                 f'&& test "$(stat -c %u "{SANDBOX_CLI}")" = "$(id -u)" '
-                f'&& test $(( 0$(stat -c %a "{SANDBOX_CLI}") & 022 )) = 0 '
-                f'&& test "$(cat "{_SANDBOX_TOOLS_GENERATION_FILE}")" = "{version}"',
+                f'&& test $(( 0$(stat -c %a "{SANDBOX_CLI}") & 022 )) = 0',
             ],
             user=user,
         )
     ).success
+
+
+async def _stop_trusted_existing_server(
+    sandbox: SandboxEnvironment, user: str | None
+) -> None:
+    """Stop a daemon through an existing launcher only when that launcher is trusted."""
+    directory_is_trusted = await _tools_dir_is_verified(sandbox, user)
+    launcher_is_trusted = await _launcher_is_trusted(sandbox, user)
+    if not directory_is_trusted or not launcher_is_trusted:
+        return
+    result = await sandbox.exec([SANDBOX_CLI, "stop-server"], user=user)
+    if not result.success:
+        raise RuntimeError(
+            f"Failed to stop existing sandbox tools server: {result.stderr}"
+        )
 
 
 async def _clear_tools_dir(

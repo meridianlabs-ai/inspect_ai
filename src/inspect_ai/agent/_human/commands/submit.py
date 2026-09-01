@@ -46,9 +46,10 @@ class SessionEndCommand(HumanAgentCommand):
                 script = (
                     "import os,sys; "
                     "f=open(sys.argv[1], encoding='utf-8', newline=''); "
-                    "size=os.fstat(f.fileno()).st_size; "
-                    "size <= int(sys.argv[2]) or sys.exit('session log exceeds limit'); "
-                    "sys.stdout.write(f.read())"
+                    "limit=int(sys.argv[2]); "
+                    "data=f.read(limit + 1); "
+                    "len(data) <= limit or sys.exit('session log exceeds limit'); "
+                    "sys.stdout.write(data)"
                 )
                 with override_sandbox_output_limit(limit, "exec"):
                     read_result = await sandbox().exec(

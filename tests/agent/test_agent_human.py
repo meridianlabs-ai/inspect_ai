@@ -87,6 +87,7 @@ async def test_session_logs_are_read_as_selected_user(
         f"{human_install.RECORD_SESSION_DIR}/agent_session.output",
         str(100 * 1024**2),
     ]
+    assert "f.read(limit + 1)" in fake.calls[1][0][2]
 
 
 @pytest.mark.parametrize(

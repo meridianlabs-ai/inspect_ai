@@ -107,6 +107,14 @@ async def test_inject_container_tools_falls_back_when_root_probe_raises(
         if user is None and sandbox_tools._SANDBOX_TOOLS_GENERATION_FILE in " ".join(cmd)
     ]
     assert generation_calls
+    assert ([sandbox_tools.SANDBOX_CLI, "stop-server"], None) in sandbox.exec_calls
+    stop_index = sandbox.exec_calls.index(
+        ([sandbox_tools.SANDBOX_CLI, "stop-server"], None)
+    )
+    ensure_index = sandbox.exec_calls.index(
+        (sandbox_tools._ensure_tools_dir_command(), None)
+    )
+    assert stop_index < ensure_index
 
 
 async def test_tools_directory_reuse_check_does_not_repair_permissions() -> None:
@@ -121,8 +129,20 @@ async def test_tools_reuse_checks_launcher_trust_and_generation() -> None:
     sandbox = RootProbeRaisesSandbox()
 
     assert await sandbox_tools._tools_install_is_current(sandbox, "root")
-    command = sandbox.exec_calls[-1][0][2]
-    assert "test ! -L" in command
-    assert "stat -c %u" in command
-    assert "& 022" in command
-    assert sandbox_tools._get_sandbox_tools_version() in command
+    launcher_command = sandbox.exec_calls[-2][0][2]
+    generation_command = sandbox.exec_calls[-1][0][2]
+    assert "test ! -L" in launcher_command
+    assert "stat -c %u" in launcher_command
+    assert "& 022" in launcher_command
+    assert sandbox_tools._get_sandbox_tools_version() in generation_command
+
+
+async def test_existing_server_is_stopped_only_through_trusted_launcher() -> None:
+    sandbox = RootProbeRaisesSandbox()
+
+    await sandbox_tools._stop_trusted_existing_server(sandbox, "root")
+
+    assert sandbox.exec_calls[-1] == (
+        [sandbox_tools.SANDBOX_CLI, "stop-server"],
+        "root",
+    )
