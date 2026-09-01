@@ -1,6 +1,8 @@
 """Tests for sandbox tools injection."""
 
 import base64
+import os
+import subprocess
 from contextlib import asynccontextmanager
 from io import BytesIO
 from typing import AsyncIterator, BinaryIO, Literal, overload
@@ -23,6 +25,7 @@ class RootProbeRaisesSandbox(SandboxEnvironment):
         self.exec_calls: list[tuple[list[str], str | None]] = []
         self.exec_inputs: list[str | bytes | None] = []
         self.extracted_as_user: str | None | object = object()
+        self.validation_results: list[bool] = []
 
     async def exec(
         self,
@@ -39,6 +42,16 @@ class RootProbeRaisesSandbox(SandboxEnvironment):
         self.exec_inputs.append(input)
         if cmd == ["id", "-u"] and user == "root":
             raise RuntimeError("runuser: may not be used by non-root users")
+        if cmd[:2] == ["sh", "-c"] and "validate_file()" in cmd[2]:
+            success = (
+                self.validation_results.pop(0) if self.validation_results else False
+            )
+            return ExecResult(
+                success=success,
+                returncode=0 if success else 1,
+                stdout="",
+                stderr="",
+            )
         return ExecResult(success=True, returncode=0, stdout="", stderr="")
 
     async def write_file(self, file: str, contents: str | bytes) -> None:
@@ -68,6 +81,7 @@ async def test_inject_container_tools_falls_back_when_root_probe_raises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sandbox = RootProbeRaisesSandbox()
+    sandbox.validation_results = [False, True]
 
     async def fake_detect_sandbox_os(
         _sandbox: SandboxEnvironment,
@@ -101,6 +115,19 @@ async def test_inject_container_tools_falls_back_when_root_probe_raises(
     assert sandbox.extracted_as_user is None
     assert (["id", "-u"], "root") in sandbox.exec_calls
     assert (sandbox_tools._ensure_tools_dir_command(), None) in sandbox.exec_calls
+    stop_index = sandbox.exec_calls.index(([SANDBOX_CLI, "stop-server"], None))
+    clear_index = next(
+        index
+        for index, (command, _) in enumerate(sandbox.exec_calls)
+        if command[:2] == ["sh", "-c"] and "-mindepth" in command[2]
+    )
+    start_index = sandbox.exec_calls.index(([SANDBOX_CLI, "start-server"], None))
+    release_index = next(
+        index
+        for index, (command, _) in enumerate(sandbox.exec_calls)
+        if command[:2] == ["sh", "-c"] and 'cat "$1/token"' in command[2]
+    )
+    assert stop_index < clear_index < start_index < release_index
 
 
 async def test_write_archive_stages_inside_tools_dir_as_extraction_user() -> None:
@@ -116,15 +143,40 @@ async def test_write_archive_stages_inside_tools_dir_as_extraction_user() -> Non
     assert base64.b64decode(str(sandbox.exec_inputs[-1])) == b"archive"
 
 
-async def test_launcher_validator_requires_regular_executable() -> None:
-    sandbox = RootProbeRaisesSandbox()
+def test_launcher_validator_checks_filesystem_state(tmp_path: os.PathLike[str]) -> None:
+    tools_dir = os.fspath(tmp_path)
+    launcher = os.path.join(tools_dir, "launcher")
+    marker = os.path.join(tools_dir, "generation")
+    identity = "artifact sha256:1234"
+    with open(launcher, "w") as file:
+        file.write("#!/bin/sh\n")
+    with open(marker, "w") as file:
+        file.write(f"{identity}\n")
+    os.chmod(launcher, 0o700)
+    os.chmod(marker, 0o600)
 
-    assert await sandbox_tools._sandbox_cli_is_valid(sandbox, None)
-    command, user = sandbox.exec_calls[-1]
-    assert command[:2] == ["sh", "-c"]
-    assert 'test ! -L "$1"' in command[2]
-    assert "test $((0$2 & 022)) -eq 0" in command[2]
-    assert command[4] == SANDBOX_CLI
-    assert command[5] == sandbox_tools._SANDBOX_TOOLS_GENERATION
-    assert command[6] == sandbox_tools._get_sandbox_tools_version()
-    assert user is None
+    command = sandbox_tools._sandbox_cli_validation_command(identity)
+    command[4:6] = [launcher, marker]
+
+    assert subprocess.run(command, check=False).returncode == 0
+
+    os.chmod(launcher, 0o722)
+    assert subprocess.run(command, check=False).returncode != 0
+    os.chmod(launcher, 0o700)
+
+    with open(marker, "w") as file:
+        file.write("different artifact\n")
+    assert subprocess.run(command, check=False).returncode != 0
+
+    os.unlink(launcher)
+    os.symlink("generation", launcher)
+    assert subprocess.run(command, check=False).returncode != 0
+
+
+def test_artifact_identity_includes_name_and_content_digest() -> None:
+    identity = sandbox_tools._artifact_identity("inspect-sandbox-tools-v1-dev", b"a")
+
+    assert identity.startswith("inspect-sandbox-tools-v1-dev sha256:")
+    assert identity != sandbox_tools._artifact_identity(
+        "inspect-sandbox-tools-v1-dev", b"b"
+    )
