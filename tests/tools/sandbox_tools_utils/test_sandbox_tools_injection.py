@@ -15,6 +15,7 @@ from inspect_ai.util._sandbox._cli import SANDBOX_CLI
 from inspect_ai.util._sandbox.environment import (
     SandboxEnvironment,
     SandboxEnvironmentConfigType,
+    SandboxUnavailableError,
 )
 from inspect_ai.util._sandbox.recon import Architecture, SupportedContainerOSInfo
 from inspect_ai.util._subprocess import ExecResult
@@ -215,6 +216,25 @@ async def test_detector_validates_root_installation_in_one_exec() -> None:
     command, user = sandbox.exec_calls[0]
     assert user == "root"
     assert "validate_owned()" in command[2]
+
+
+async def test_injection_preserves_sandbox_unavailable_error() -> None:
+    class UnavailableSandbox(RootProbeRaisesSandbox):
+        async def exec(
+            self,
+            cmd: list[str],
+            input: str | bytes | None = None,
+            cwd: str | None = None,
+            env: dict[str, str] | None = None,
+            user: str | None = None,
+            timeout: int | None = None,
+            timeout_retry: bool = True,
+            concurrency: bool = True,
+        ) -> ExecResult[str]:
+            raise SandboxUnavailableError("sandbox stopped")
+
+    with pytest.raises(SandboxUnavailableError, match="sandbox stopped"):
+        await sandbox_tools._inject_container_tools_code(UnavailableSandbox())
 
 
 def test_validation_command_rejects_missing_installation(

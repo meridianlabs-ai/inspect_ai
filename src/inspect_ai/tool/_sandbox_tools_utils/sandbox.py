@@ -30,7 +30,10 @@ from inspect_ai.util._sandbox.context import (
     SandboxInjectable,
     sandbox_with_injection,
 )
-from inspect_ai.util._sandbox.environment import SandboxEnvironment
+from inspect_ai.util._sandbox.environment import (
+    SandboxEnvironment,
+    SandboxUnavailableError,
+)
 from inspect_ai.util._sandbox.recon import Architecture, detect_sandbox_os
 
 from ._build_config import (
@@ -101,6 +104,8 @@ async def _inject_container_tools_code(sandbox: SandboxEnvironment) -> None:
         if await _sandbox_tools_detector(sandbox):
             return
         await _inject_container_tools_code_impl(sandbox)
+    except SandboxUnavailableError:
+        raise
     except Exception as e:
         raise SandboxInjectionError(
             f"Failed to inject sandbox tools into sandbox: {e}", cause=e
@@ -241,6 +246,8 @@ async def _sandbox_tools_detector(sandbox: SandboxEnvironment) -> bool:
     for user in ("root", None):
         try:
             result = await sandbox.exec(command, user=user, timeout_retry=False)
+        except SandboxUnavailableError:
+            raise
         except Exception:
             continue
         if result.success:

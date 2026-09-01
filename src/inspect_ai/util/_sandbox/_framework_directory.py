@@ -26,7 +26,11 @@ def framework_directory_command(
     """
     directory = PurePosixPath(path).as_posix()
     path_parts = PurePosixPath(path).parts
-    if directory in {"", ".", "..", "/"} or ".." in path_parts:
+    if (
+        directory in {"", ".", ".."}
+        or not directory.strip("/")
+        or ".." in path_parts
+    ):
         raise ValueError(f"Framework directory must name a directory: {path}")
     if not directory.startswith("/") and "/" in directory:
         raise ValueError(f"Framework directory must be absolute or a leaf: {path}")
