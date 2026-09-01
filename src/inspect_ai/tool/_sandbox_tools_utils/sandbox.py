@@ -43,9 +43,6 @@ _BUCKET_BASE_URL = "https://inspect-sandbox-tools.s3.us-east-2.amazonaws.com"
 
 logger = getLogger(__name__)
 
-_install_lock = anyio.Lock()
-
-
 TRACE_SANDBOX_TOOLS = "Sandbox Tools"
 
 
@@ -101,25 +98,17 @@ async def sandbox_with_injected_tools(
 
 async def _inject_container_tools_code(sandbox: SandboxEnvironment) -> None:
     try:
-        async with _install_lock:
-            # Another SandboxEnvironment may have completed installation while this
-            # caller waited for the shared path.
-            if await _sandbox_tools_detector(sandbox):
-                return
-            await _inject_container_tools_code_locked(sandbox)
+        if await _sandbox_tools_detector(sandbox):
+            return
+        await _inject_container_tools_code_impl(sandbox)
     except Exception as e:
         raise SandboxInjectionError(
             f"Failed to inject sandbox tools into sandbox: {e}", cause=e
         ) from e
 
 
-async def _inject_container_tools_code_locked(sandbox: SandboxEnvironment) -> None:
-    """Install tools while holding the process-wide publication lock.
-
-    SandboxEnvironment instances can refer to the same underlying local sandbox
-    and therefore the same fixed tools path. The shared lock serializes publication
-    across those instances.
-    """
+async def _inject_container_tools_code_impl(sandbox: SandboxEnvironment) -> None:
+    """Stage tools independently and atomically publish into the sandbox."""
     info = await detect_sandbox_os(sandbox)
     musl = info.get("libc") == "musl"
 
@@ -138,6 +127,7 @@ async def _inject_container_tools_code_locked(sandbox: SandboxEnvironment) -> No
         if await _create_tools_dir_as_root(sandbox, install_tmp):
             sandbox._tools_user = "root"
         else:
+            sandbox._tools_user = None
             result = await sandbox.exec(framework_directory_command(install_tmp))
             if not result.success:
                 raise RuntimeError(
@@ -147,20 +137,25 @@ async def _inject_container_tools_code_locked(sandbox: SandboxEnvironment) -> No
         await _extract_tools_tree(
             sandbox, name, gz_bytes, sandbox._tools_user, install_tmp
         )
-        # Once publication starts, learn its outcome before honoring cancellation so
-        # cleanup always targets the directory that was actually published.
-        with anyio.CancelScope(shield=True):
-            result = await sandbox.exec(
-                ["mv", install_tmp, SANDBOX_TOOLS_DIR], user=sandbox._tools_user
-            )
+        if not await _sandbox_cli_is_trusted(
+            sandbox, sandbox._tools_user, tools_dir=install_tmp
+        ):
+            raise RuntimeError("Injected sandbox tools launcher failed validation")
+        result = await sandbox.exec(
+            _publish_tools_command(install_tmp),
+            user=sandbox._tools_user,
+            timeout_retry=False,
+        )
+        if result.returncode == 17:
+            if await _sandbox_tools_detector(sandbox):
+                await _cleanup_paths(sandbox, sandbox._tools_user, install_tmp)
+                return
+            raise RuntimeError("Concurrent sandbox tools installation is unsafe")
         if not result.success:
             raise RuntimeError(
                 f"Failed to publish sandbox tools installation: {result.stderr}"
             )
         published = True
-
-        if not await _sandbox_cli_is_trusted(sandbox, sandbox._tools_user):
-            raise RuntimeError("Injected sandbox tools launcher failed validation")
 
         result = await sandbox.exec(
             [SANDBOX_CLI, "start-server"], user=sandbox._tools_user
@@ -168,14 +163,27 @@ async def _inject_container_tools_code_locked(sandbox: SandboxEnvironment) -> No
         if not result.success:
             raise RuntimeError(f"Failed to start sandbox tools server: {result.stderr}")
     except BaseException:
-        cleanup_path = SANDBOX_TOOLS_DIR if published else install_tmp
-        with anyio.CancelScope(shield=True):
-            await sandbox.exec(
-                ["rm", "-rf", "--", cleanup_path],
-                user=sandbox._tools_user,
-                timeout_retry=False,
-            )
+        if not published:
+            await _cleanup_paths(sandbox, sandbox._tools_user, install_tmp)
         raise
+
+
+def _publish_tools_command(install_tmp: str) -> list[str]:
+    """Return a collision-safe, sandbox-scoped publication command."""
+    lock_dir = f"{SANDBOX_TOOLS_DIR}.publish-lock"
+    script = """\
+set -eu
+i=0
+while ! mkdir -m 700 -- "$2" 2>/dev/null; do
+    i=$((i + 1))
+    test "$i" -lt 100 || exit 18
+    sleep .1
+done
+trap 'rmdir -- "$2"' EXIT
+if test -e "$3" || test -L "$3"; then exit 17; fi
+mv -- "$1" "$3"
+"""
+    return ["sh", "-c", script, "sh", install_tmp, lock_dir, SANDBOX_TOOLS_DIR]
 
 
 async def _create_tools_dir_as_root(
@@ -202,11 +210,6 @@ async def _create_tools_dir_as_root(
             "Sandbox tools path exists but is not a root-owned 0700 directory"
         )
     return True
-
-
-def _ensure_tools_dir_command() -> list[str]:
-    """Return the command enforcing the sandbox-tools directory contract."""
-    return framework_directory_command(SANDBOX_TOOLS_DIR)
 
 
 async def _tools_dir_exists(sandbox: SandboxEnvironment) -> bool:
@@ -272,10 +275,15 @@ validate_file() {
 
 
 async def _sandbox_cli_is_trusted(
-    sandbox: SandboxEnvironment, user: str | None
+    sandbox: SandboxEnvironment,
+    user: str | None,
+    *,
+    tools_dir: str = SANDBOX_TOOLS_DIR,
 ) -> bool:
     """Return whether the existing launcher is safe to execute."""
-    return (await sandbox.exec(_sandbox_cli_validation_command(), user=user)).success
+    command = _sandbox_cli_validation_command()
+    command[4] = f"{tools_dir}{SANDBOX_CLI.removeprefix(SANDBOX_TOOLS_DIR)}"
+    return (await sandbox.exec(command, user=user)).success
 
 
 async def _extract_tools_tree(
@@ -305,12 +313,7 @@ async def _extract_tools_tree(
             ["tar", "xzf", gz_tmp, "-C", tools_dir], user=user
         )
     finally:
-        with anyio.CancelScope(shield=True):
-            await sandbox.exec(
-                ["rm", "-f", "--", upload_tmp, gz_tmp],
-                user=user,
-                timeout_retry=False,
-            )
+        await _cleanup_paths(sandbox, user, upload_tmp, gz_tmp, recursive=False)
     if result.success:
         return
 
@@ -329,14 +332,35 @@ async def _extract_tools_tree(
             ["tar", "xf", tar_tmp, "-C", tools_dir], user=user
         )
     finally:
-        with anyio.CancelScope(shield=True):
-            await sandbox.exec(
-                ["rm", "-f", "--", upload_tmp, tar_tmp],
+        await _cleanup_paths(sandbox, user, upload_tmp, tar_tmp, recursive=False)
+    if not result.success:
+        raise RuntimeError(f"Failed to extract sandbox tools: {result.stderr}")
+
+
+async def _cleanup_paths(
+    sandbox: SandboxEnvironment,
+    user: str | None,
+    *paths: str,
+    recursive: bool = True,
+) -> None:
+    """Best-effort cleanup without delaying or replacing cancellation."""
+    try:
+        with anyio.move_on_after(5, shield=True):
+            result = await sandbox.exec(
+                ["rm", "-rf" if recursive else "-f", "--", *paths],
                 user=user,
                 timeout_retry=False,
             )
-    if not result.success:
-        raise RuntimeError(f"Failed to extract sandbox tools: {result.stderr}")
+            if not result.success:
+                trace_message(
+                    logger,
+                    TRACE_SANDBOX_TOOLS,
+                    f"sandbox tools cleanup failed: {result.stderr}",
+                )
+    except Exception as ex:
+        trace_message(
+            logger, TRACE_SANDBOX_TOOLS, f"sandbox tools cleanup failed: {ex}"
+        )
 
 
 async def _write_archive(

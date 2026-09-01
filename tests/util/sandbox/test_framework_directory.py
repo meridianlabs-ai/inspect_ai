@@ -76,7 +76,7 @@ def test_framework_directory_rejects_unsafe_path() -> None:
         framework_directory_command("framework; true")
 
 
-@pytest.mark.parametrize("path", ["", ".", ".."])
+@pytest.mark.parametrize("path", ["", ".", "..", "/", "/home/user/subdir/.."])
 def test_framework_directory_rejects_ambiguous_leaf(path: str) -> None:
     with pytest.raises(ValueError, match="must name a directory"):
         framework_directory_command(path)

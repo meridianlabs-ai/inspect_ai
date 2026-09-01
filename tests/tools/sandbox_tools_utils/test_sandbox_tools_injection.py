@@ -187,7 +187,7 @@ async def test_extract_cancellation_removes_uploaded_archive() -> None:
     assert cleanup_calls[0][-1] == "/protected/install/archive.tgz"
 
 
-async def test_injection_is_serialized_across_sandbox_instances(
+async def test_injection_staging_is_concurrent_across_sandbox_instances(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     installed = False
@@ -206,7 +206,7 @@ async def test_injection_is_serialized_across_sandbox_instances(
         active_installers -= 1
 
     monkeypatch.setattr(sandbox_tools, "_sandbox_tools_detector", detector)
-    monkeypatch.setattr(sandbox_tools, "_inject_container_tools_code_locked", injector)
+    monkeypatch.setattr(sandbox_tools, "_inject_container_tools_code_impl", injector)
 
     async with anyio.create_task_group() as task_group:
         task_group.start_soon(
@@ -216,7 +216,7 @@ async def test_injection_is_serialized_across_sandbox_instances(
             sandbox_tools._inject_container_tools_code, RootProbeRaisesSandbox()
         )
 
-    assert maximum_active_installers == 1
+    assert maximum_active_installers == 2
 
 
 def test_launcher_validator_checks_filesystem_state(tmp_path: os.PathLike[str]) -> None:
