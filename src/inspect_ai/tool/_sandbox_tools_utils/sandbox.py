@@ -174,15 +174,13 @@ def _ensure_tools_dir_command() -> list[str]:
         "umask 077; "
         f"mkdir -m 700 -- {SANDBOX_TOOLS_DIR} 2>/dev/null || "
         f"{{ test -d {SANDBOX_TOOLS_DIR} && test ! -L {SANDBOX_TOOLS_DIR} && "
-        f"test \"$(stat -c %u -- {SANDBOX_TOOLS_DIR})\" = \"$(id -u)\" && "
-        f"test \"$(stat -c %a -- {SANDBOX_TOOLS_DIR})\" = 700; }}"
+        f'test "$(stat -c %u -- {SANDBOX_TOOLS_DIR})" = "$(id -u)" && '
+        f'test "$(stat -c %a -- {SANDBOX_TOOLS_DIR})" = 700; }}'
     )
     return ["sh", "-c", script]
 
 
-async def _tools_dir_is_verified(
-    sandbox: SandboxEnvironment, user: str | None
-) -> bool:
+async def _tools_dir_is_verified(sandbox: SandboxEnvironment, user: str | None) -> bool:
     return (await sandbox.exec(_ensure_tools_dir_command(), user=user)).success
 
 
@@ -194,7 +192,9 @@ async def _sandbox_tools_detector(sandbox: SandboxEnvironment) -> bool:
             if not await _tools_dir_is_verified(sandbox, "root"):
                 return False
             sandbox._tools_user = "root"
-            return (await sandbox.exec(["test", "-r", SANDBOX_CLI], user="root")).success
+            return (
+                await sandbox.exec(["test", "-r", SANDBOX_CLI], user="root")
+            ).success
     except Exception:
         pass
 
