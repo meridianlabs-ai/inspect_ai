@@ -17,6 +17,7 @@ from inspect_ai.util._sandbox.environment import (
     SandboxEnvironmentConfigType,
     SandboxUnavailableError,
 )
+from inspect_ai.util._sandbox.events import SandboxEnvironmentProxy
 from inspect_ai.util._sandbox.local import LocalSandboxEnvironment
 from inspect_ai.util._sandbox.recon import Architecture, SupportedContainerOSInfo
 from inspect_ai.util._subprocess import ExecResult
@@ -279,6 +280,17 @@ def test_local_sandbox_tools_install_is_namespaced_per_os_user() -> None:
     assert tools_dir == f"{sandbox_tools.SANDBOX_TOOLS_DIR}-{os.getuid()}"
 
 
+def test_proxied_local_sandbox_tools_install_is_namespaced_per_os_user() -> None:
+    local = LocalSandboxEnvironment()
+    sandbox = SandboxEnvironmentProxy(local)
+    try:
+        tools_dir = sandbox_tools._sandbox_tools_dir(sandbox)
+    finally:
+        local.directory.cleanup()
+
+    assert tools_dir == f"{sandbox_tools.SANDBOX_TOOLS_DIR}-{os.getuid()}"
+
+
 async def test_cancelled_root_staging_creation_cleans_up_as_root(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -475,8 +487,8 @@ def test_launcher_validator_checks_filesystem_state(tmp_path: os.PathLike[str]) 
     with open(launcher, "w") as file:
         file.write("#!/bin/sh\n")
     os.chmod(launcher, 0o700)
-    command = sandbox_tools._sandbox_cli_validation_command()
-    command[4] = launcher
+    command = sandbox_tools._sandbox_tools_validation_command(tools_dir)
+    command[5] = launcher
 
     assert subprocess.run(command, check=False).returncode == 0
 

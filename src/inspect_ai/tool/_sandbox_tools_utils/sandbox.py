@@ -289,27 +289,6 @@ id -u
     return ["sh", "-c", script, "sh", tools_dir, sandbox_cli]
 
 
-def _sandbox_cli_validation_command() -> list[str]:
-    """Build the command that validates an installed launcher."""
-    script = """\
-validate_file() {
-    test -f "$1" && test ! -L "$1" || return 1
-    set -- $(stat -c '%u %a' -- "$1" 2>/dev/null || stat -f '%u %Lp' "$1" 2>/dev/null) || return 1
-    test "$1" = "$(id -u)" && test $((0$2 & 022)) -eq 0
-}
-"""
-    checks = ['validate_file "$1"', 'test -x "$1"']
-    command = [
-        "sh",
-        "-c",
-        script,
-        "sh",
-        f"{SANDBOX_TOOLS_DIR}/{SANDBOX_TOOLS_BASE_NAME}",
-    ]
-    command[2] += " &&\n".join(checks) + "\n"
-    return command
-
-
 async def _sandbox_cli_is_trusted(
     sandbox: SandboxEnvironment,
     user: str | None,
@@ -317,14 +296,17 @@ async def _sandbox_cli_is_trusted(
     tools_dir: str = SANDBOX_TOOLS_DIR,
 ) -> bool:
     """Return whether the existing launcher is safe to execute."""
-    command = _sandbox_cli_validation_command()
-    command[4] = f"{tools_dir}/{SANDBOX_TOOLS_BASE_NAME}"
+    command = _sandbox_tools_validation_command(tools_dir)
     return (await sandbox.exec(command, user=user)).success
 
 
 def _sandbox_tools_dir(sandbox: SandboxEnvironment) -> str:
     """Return the install directory, namespaced for host-local sandboxes."""
-    if isinstance(sandbox, LocalSandboxEnvironment):
+    try:
+        sandbox.as_type(LocalSandboxEnvironment)
+    except TypeError:
+        pass
+    else:
         return local_sandbox_tools_dir(os.getuid())
     return SANDBOX_TOOLS_DIR
 
