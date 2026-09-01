@@ -8,6 +8,7 @@ from typing import AsyncIterator, BinaryIO, Literal, overload
 import pytest
 
 from inspect_ai.tool._sandbox_tools_utils import sandbox as sandbox_tools
+from inspect_ai.util._sandbox._cli import SANDBOX_CLI, SANDBOX_TOOLS_DIR
 from inspect_ai.util._sandbox.environment import (
     SandboxEnvironment,
     SandboxEnvironmentConfigType,
@@ -104,7 +105,7 @@ async def test_inject_container_tools_falls_back_when_root_probe_raises(
 
 async def test_write_archive_stages_inside_tools_dir_as_extraction_user() -> None:
     sandbox = RootProbeRaisesSandbox()
-    archive_path = f"{sandbox_tools.SANDBOX_TOOLS_DIR}/.pkg.tgz"
+    archive_path = f"{SANDBOX_TOOLS_DIR}/.pkg.tgz"
 
     await sandbox_tools._write_archive(sandbox, archive_path, b"archive", "root")
 
@@ -119,13 +120,11 @@ async def test_launcher_validator_requires_regular_executable() -> None:
     sandbox = RootProbeRaisesSandbox()
 
     assert await sandbox_tools._sandbox_cli_is_valid(sandbox, None)
-    assert sandbox.exec_calls[-1] == (
-        [
-            "sh",
-            "-c",
-            'test -f "$1" && test -x "$1"',
-            "sh",
-            sandbox_tools.SANDBOX_CLI,
-        ],
-        None,
-    )
+    command, user = sandbox.exec_calls[-1]
+    assert command[:2] == ["sh", "-c"]
+    assert 'test ! -L "$1"' in command[2]
+    assert "test $((0$2 & 022)) -eq 0" in command[2]
+    assert command[4] == SANDBOX_CLI
+    assert command[5] == sandbox_tools._SANDBOX_TOOLS_GENERATION
+    assert command[6] == sandbox_tools._get_sandbox_tools_version()
+    assert user is None

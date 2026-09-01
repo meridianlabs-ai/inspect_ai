@@ -45,6 +45,7 @@ logger = getLogger(__name__)
 
 
 TRACE_SANDBOX_TOOLS = "Sandbox Tools"
+_SANDBOX_TOOLS_GENERATION = f"{SANDBOX_TOOLS_DIR}/.generation"
 
 
 class SandboxInjectionError(Exception):
@@ -119,7 +120,9 @@ async def _inject_container_tools_code(sandbox: SandboxEnvironment) -> None:
                     f"Failed to create or verify sandbox tools dir: {result.stderr}"
                 )
 
+        await _clear_tools_dir(sandbox, sandbox._tools_user)
         await _extract_tools_tree(sandbox, name, gz_bytes, sandbox._tools_user)
+        await _write_tools_generation(sandbox, sandbox._tools_user)
 
         if not await _tools_dir_is_verified(sandbox, sandbox._tools_user):
             raise RuntimeError("Sandbox tools directory changed during extraction")
@@ -171,6 +174,45 @@ async def _tools_dir_is_verified(sandbox: SandboxEnvironment, user: str | None) 
     return (await sandbox.exec(_ensure_tools_dir_command(), user=user)).success
 
 
+async def _clear_tools_dir(sandbox: SandboxEnvironment, user: str | None) -> None:
+    """Remove an obsolete install only after its directory has been secured."""
+    result = await sandbox.exec(
+        [
+            "sh",
+            "-c",
+            'find "$1" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +',
+            "sh",
+            SANDBOX_TOOLS_DIR,
+        ],
+        user=user,
+    )
+    if not result.success:
+        raise RuntimeError(
+            f"Failed to clear obsolete sandbox tools: {result.stderr}"
+        )
+
+
+async def _write_tools_generation(
+    sandbox: SandboxEnvironment, user: str | None
+) -> None:
+    """Record the installed artifact generation in a protected regular file."""
+    result = await sandbox.exec(
+        [
+            "sh",
+            "-c",
+            'umask 077; printf "%s\\n" "$2" > "$1"',
+            "sh",
+            _SANDBOX_TOOLS_GENERATION,
+            _get_sandbox_tools_version(),
+        ],
+        user=user,
+    )
+    if not result.success:
+        raise RuntimeError(
+            f"Failed to record sandbox tools generation: {result.stderr}"
+        )
+
+
 async def _sandbox_tools_detector(sandbox: SandboxEnvironment) -> bool:
     """Authorize reuse only when both the install root and launcher are trusted."""
     try:
@@ -189,13 +231,28 @@ async def _sandbox_tools_detector(sandbox: SandboxEnvironment) -> bool:
     return await _sandbox_cli_is_valid(sandbox, None)
 
 
-async def _sandbox_cli_is_valid(
-    sandbox: SandboxEnvironment, user: str | None
-) -> bool:
-    """Return whether the launcher is a regular executable for ``user``."""
+async def _sandbox_cli_is_valid(sandbox: SandboxEnvironment, user: str | None) -> bool:
+    """Return whether the launcher and artifact generation are trusted."""
+    script = """\
+validate_file() {
+    test -f "$1" && test ! -L "$1" || return 1
+    set -- $(stat -c '%u %a' -- "$1" 2>/dev/null || stat -f '%u %Lp' "$1" 2>/dev/null) || return 1
+    test "$1" = "$(id -u)" && test $((0$2 & 022)) -eq 0
+}
+validate_file "$1" && test -x "$1" &&
+validate_file "$2" && test "$(cat "$2")" = "$3"
+"""
     return (
         await sandbox.exec(
-            ["sh", "-c", 'test -f "$1" && test -x "$1"', "sh", SANDBOX_CLI],
+            [
+                "sh",
+                "-c",
+                script,
+                "sh",
+                SANDBOX_CLI,
+                _SANDBOX_TOOLS_GENERATION,
+                _get_sandbox_tools_version(),
+            ],
             user=user,
         )
     ).success
