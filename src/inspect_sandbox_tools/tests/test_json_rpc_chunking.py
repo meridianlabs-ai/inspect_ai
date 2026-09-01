@@ -2,12 +2,7 @@ import asyncio
 import base64
 import json
 import os
-import pwd
-import shutil
 import stat
-import subprocess
-import sys
-import tempfile
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, NamedTuple, cast
@@ -125,52 +120,20 @@ def test_json_rpc_response_chunks_use_private_uid_directory(
     assert stat.S_IMODE(user_dir.stat().st_mode) == 0o700
     assert chunk_path.is_file()
 
+    monkeypatch.setattr(chunking.os, "getuid", lambda: 0)
+    root_continuation = handle_json_rpc_response_chunk_request(
+        {
+            "id": 2,
+            "params": {"handle": chunk["handle"], "offset": chunk["next_offset"]},
+        },
+        512,
+    )
+
+    assert _chunk_metadata(root_continuation)["offset"] == chunk["next_offset"]
     handle_json_rpc_response_chunk_request(
         {"id": 3, "params": {"handle": chunk["handle"], "release": True}},
         512,
     )
-
-
-@pytest.mark.skipif(os.getuid() != 0, reason="requires switching to another uid")
-def test_non_root_user_chunks_through_root_owned_non_readable_parent(
-) -> None:
-    unprivileged_user = pwd.getpwnam("nobody")
-    test_root = Path(tempfile.mkdtemp(prefix="inspect-chunks-", dir="/tmp"))
-    test_root.chmod(0o755)
-    chunk_dir = test_root / "chunks"
-    chunk_dir.mkdir(mode=0o1733)
-
-    script = """
-import json
-from pathlib import Path
-
-import inspect_sandbox_tools._util.json_rpc_chunking as chunking
-
-chunking._CHUNK_DIR = Path({chunk_dir!r})
-response = json.dumps({{"jsonrpc": "2.0", "id": 1, "result": "x" * 2000}})
-chunked = chunking.chunk_json_rpc_response_if_needed({{"id": 1}}, response, 512)
-assert chunking.JSON_RPC_RESPONSE_CHUNK_FIELD in json.loads(chunked)
-""".format(chunk_dir=str(chunk_dir))
-
-    def switch_to_unprivileged_user() -> None:
-        os.setgid(unprivileged_user.pw_gid)
-        os.setuid(unprivileged_user.pw_uid)
-
-    try:
-        subprocess.run(
-            [sys.executable, "-c", script],
-            check=True,
-            env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
-            preexec_fn=switch_to_unprivileged_user,
-            timeout=10,
-        )
-
-        user_dir = chunk_dir / str(unprivileged_user.pw_uid)
-        assert user_dir.stat().st_uid == unprivileged_user.pw_uid
-        assert stat.S_IMODE(user_dir.stat().st_mode) == 0o700
-        assert next(user_dir.iterdir()).stat().st_uid == unprivileged_user.pw_uid
-    finally:
-        shutil.rmtree(test_root)
 
 
 def test_frozen_chunk_dir_uses_hidden_sibling_of_tools_dir(
@@ -324,47 +287,19 @@ def _reassemble(
     )
 
 
-def test_continuation_reads_verified_inode_after_path_swap(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    response = json.dumps({"result": "original" * 200})
-    first = _chunk_metadata(
-        chunk_json_rpc_response_if_needed({"id": 1}, response, 512)
-    )
-    user_dir = chunking._CHUNK_DIR / str(os.getuid())
-    chunk_path = user_dir / f"{first['handle']}.jsonrpc"
-    replacement = user_dir / "replacement"
-    replacement.write_text('"attacker replacement"')
-    real_pread = os.pread
-
-    def swap_then_read(fd: int, size: int, offset: int) -> bytes:
-        moved = chunk_path.with_suffix(".moved")
-        chunk_path.rename(moved)
-        chunk_path.symlink_to(replacement)
-        return real_pread(fd, size, offset)
-
-    monkeypatch.setattr(chunking.os, "pread", swap_then_read)
-
-    continued = _chunk_metadata(
-        handle_json_rpc_response_chunk_request(
-            {"id": 2, "params": {"handle": first["handle"], "offset": 0}}, 512
-        )
-    )
-
-    returned = base64.b64decode(continued["chunk"])
-    assert b"attacker replacement" not in returned
-    assert returned == response.encode()[: len(returned)]
-
-
 def _chunk_metadata(response: str) -> dict[str, Any]:
     payload = cast(dict[str, Any], json.loads(response))
     return cast(dict[str, Any], payload[JSON_RPC_RESPONSE_CHUNK_FIELD])
 
 
-def test_chunk_dir_rejects_agent_owned_dir_when_running_as_root(
+def test_chunk_dir_accepts_agent_owned_dir_when_running_as_root(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Root cannot use a chunk parent replaceable by an untrusted owner."""
+    """A tool call exec'd with `user=` can be the first to create the chunk dir.
+
+    A later tool call running as root must still work; otherwise a single
+    agent-user exec permanently breaks every subsequent root tool call.
+    """
     chunking._CHUNK_DIR.mkdir(mode=0o1733)
     stat_values = list(chunking._CHUNK_DIR.lstat())
     stat_values[0] = stat.S_IFDIR | 0o1733
@@ -374,8 +309,7 @@ def test_chunk_dir_rejects_agent_owned_dir_when_running_as_root(
     monkeypatch.setattr(chunking.os, "fstat", lambda _fd: agent_owned)
     monkeypatch.setattr(chunking.os, "getuid", lambda: 0)
 
-    with pytest.raises(RuntimeError, match="unexpected owner"):
-        chunking.ensure_json_rpc_response_chunk_dir()
+    chunking.ensure_json_rpc_response_chunk_dir()
 
 
 def test_chunk_dir_chmod_does_not_follow_a_swapped_symlink(

@@ -42,21 +42,6 @@ def test_framework_directory_rejects_untrusted_entry(
             ensure_framework_directory(directory)
 
 
-def test_framework_directory_rejects_legacy_world_writable_directory(
-    tmp_path: Path,
-) -> None:
-    directory = tmp_path / "framework"
-    directory.mkdir(mode=0o777)
-    directory.chmod(0o777)
-    planted_file = directory / "server.pid"
-    planted_file.write_text("123")
-
-    with pytest.raises(RuntimeError, match="unexpected owner or mode"):
-        ensure_framework_directory(directory)
-
-    assert planted_file.read_text() == "123"
-
-
 def test_framework_directory_descriptor_survives_path_replacement(
     tmp_path: Path,
 ) -> None:

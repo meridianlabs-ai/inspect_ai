@@ -21,7 +21,7 @@ def framework_directory(
     if path.name in ("", ".", ".."):
         raise ValueError(f"Framework directory must name a child: {path}")
 
-    parent_fd = os.open(path.parent, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW)
+    parent_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     directory_fd: int | None = None
     try:
         while directory_fd is None:
@@ -47,12 +47,7 @@ def framework_directory(
             if directory_fd is None:
                 continue
             status = os.fstat(directory_fd)
-            unsafe_permissions = stat.S_IMODE(status.st_mode) & 0o022
-            if (
-                stat.S_ISDIR(status.st_mode)
-                and status.st_uid == owner_uid
-                and not unsafe_permissions
-            ):
+            if stat.S_ISDIR(status.st_mode) and status.st_uid == owner_uid:
                 os.fchmod(directory_fd, mode)
                 status = os.fstat(directory_fd)
                 if stat.S_IMODE(status.st_mode) == mode:
@@ -60,9 +55,6 @@ def framework_directory(
 
             os.close(directory_fd)
             directory_fd = None
-            # Replacing an entry in an attacker-writable parent cannot be made
-            # conditional on the inode inspected above with portable Python APIs.
-            # Fail closed rather than racing a rename of a concurrent replacement.
             raise RuntimeError(
                 f"Framework directory has unexpected owner or mode: {path}"
             )

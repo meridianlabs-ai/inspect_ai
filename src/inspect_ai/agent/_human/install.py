@@ -15,8 +15,6 @@ WELCOME_FILE = "welcome.txt"
 WELCOME_LOGIN_FILE = "welcome_login.txt"
 INSTRUCTIONS_FILE = "instructions.txt"
 RECORD_SESSION_DIR = "/var/tmp/user-sessions"
-BASHRC_BLOCK_BEGIN = "### BEGIN INSPECT HUMAN AGENT SETUP"
-BASHRC_BLOCK_END = "### END INSPECT HUMAN AGENT SETUP"
 
 
 async def install_human_agent(
@@ -25,87 +23,44 @@ async def install_human_agent(
     bashrc_content: str | None,
     record_session: bool,
 ) -> None:
+    # see if we have already installed
+    install_result = await sandbox().exec(
+        framework_directory_command(HUMAN_AGENT_DIR, report_creation=True), user="root"
+    )
+    if not install_result.success:
+        raise RuntimeError(f"Unsafe human-agent directory: {HUMAN_AGENT_DIR}")
+    if install_result.stdout.strip() == "existing":
+        return
+
     if not user:
         user = (await sandbox().exec(["whoami"])).stdout.strip()
 
-    # Root owns new installations until setup is complete. Existing non-root
-    # installations are verified as their configured owner and remain reusable.
-    root_directory_command = framework_directory_command(
-        HUMAN_AGENT_DIR, report_creation=True, repair_mode=True
-    )
-    root_directory_command[2] = 'test "$(id -u)" = 0 && ' + root_directory_command[2]
-    installed_as_root = False
-    try:
-        install_result = await sandbox().exec(
-            root_directory_command,
-            user="root",
-        )
-        installed_as_root = install_result.success
-    except Exception:
-        install_result = None
-    if (install_result is None or not install_result.success) and user != "root":
-        install_result = await sandbox().exec(
-            framework_directory_command(
-                HUMAN_AGENT_DIR, report_creation=True, repair_mode=True
-            ),
-            user=user,
-        )
-    if install_result is None or not install_result.success:
-        raise RuntimeError(f"Unsafe human-agent directory: {HUMAN_AGENT_DIR}")
-    existing_install = install_result.stdout.strip() == "existing"
-    if existing_install and not record_session:
-        return
-
-    if installed_as_root and user != "root":
+    if user != "root":
         await checked_exec(["chown", user, HUMAN_AGENT_DIR], user="root")
 
     # setup installation directory
-    await checked_exec(
-        framework_directory_command(INSTALL_DIR, repair_mode=True), user=user
-    )
+    await checked_exec(framework_directory_command(INSTALL_DIR), user="root")
+    if user != "root":
+        await checked_exec(["chown", user, INSTALL_DIR], user="root")
 
     if record_session:
-        await checked_exec(
-            framework_directory_command(RECORD_SESSION_DIR, repair_mode=True), user=user
-        )
-        if existing_install:
-            await checked_exec(
-                [
-                    "find",
-                    RECORD_SESSION_DIR,
-                    "-maxdepth",
-                    "1",
-                    "-type",
-                    "f",
-                    "-exec",
-                    "chmod",
-                    "600",
-                    "--",
-                    "{}",
-                    "+",
-                ],
-                user=user,
-            )
+        await checked_exec(framework_directory_command(RECORD_SESSION_DIR), user="root")
+        if user != "root":
+            await checked_exec(["chown", user, RECORD_SESSION_DIR], user="root")
 
     # generate task.py
     task_py = human_agent_commands(commands)
-    await checked_write_file(
-        f"{INSTALL_DIR}/{TASK_PY}", task_py, executable=True, user=user
-    )
+    await checked_write_file(f"{INSTALL_DIR}/{TASK_PY}", task_py, executable=True)
 
     # generate .bashrc
     bash_rc = human_agent_bashrc(commands, bashrc_content, record_session)
-    await checked_write_file(
-        f"{INSTALL_DIR}/{BASHRC}", bash_rc, executable=True, user=user
-    )
+    await checked_write_file(f"{INSTALL_DIR}/{BASHRC}", bash_rc, executable=True)
 
     # write and run installation script
     install_sh = human_agent_install_sh(user)
-    await checked_write_file(
-        f"{INSTALL_DIR}/{INSTALL_SH}", install_sh, executable=True, user=user
-    )
-    await checked_exec(["bash", f"./{INSTALL_SH}"], cwd=INSTALL_DIR, user=user)
-    await checked_exec(["rm", "-rf", INSTALL_DIR], user=user)
+    await checked_write_file(f"{INSTALL_DIR}/{INSTALL_SH}", install_sh, executable=True)
+    await checked_exec(["bash", f"./{INSTALL_SH}"], cwd=INSTALL_DIR)
+    await checked_exec(["rm", "-rf", INSTALL_DIR])
 
 
 def human_agent_commands(commands: list[HumanAgentCommand]) -> str:
@@ -258,17 +213,7 @@ def human_agent_bashrc(
     """).lstrip()
 
     # return .bashrc
-    return "\n".join(
-        [
-            BASHRC_BLOCK_BEGIN,
-            TERMINAL_CHECK,
-            COMMANDS,
-            RECORDING,
-            INSTRUCTIONS,
-            CLOCK,
-            BASHRC_BLOCK_END,
-        ]
-    )
+    return "\n".join([TERMINAL_CHECK, COMMANDS, RECORDING, INSTRUCTIONS, CLOCK])
 
 
 def human_agent_install_sh(user: str | None) -> str:
@@ -287,11 +232,7 @@ def human_agent_install_sh(user: str | None) -> str:
     fi
     USER_HOME=$(getent passwd $USER | cut -d: -f6)
 
-    # Replace the block managed by Inspect, preserving user-owned content.
-    sed -i \
-        -e '/^{BASHRC_BLOCK_BEGIN}$/,/^{BASHRC_BLOCK_END}$/d' \
-        -e '/^### Inspect Human Agent Setup /,/^task start$/d' \
-        $USER_HOME/{BASHRC}
+    # append to user's .bashrc
     cat {BASHRC} >> $USER_HOME/{BASHRC}
     """)
 
@@ -311,6 +252,8 @@ async def checked_exec(
 async def checked_write_file(
     file: str, contents: str, executable: bool = False, user: str | None = None
 ) -> None:
-    await checked_exec(["tee", "--", file], input=contents, user=user)
+    await checked_exec(["tee", "--", file], input=contents)
+    if user:
+        await checked_exec(["chown", user, file], user="root")
     if executable:
-        await checked_exec(["chmod", "+x", file], user=user)
+        await checked_exec(["chmod", "+x", file])

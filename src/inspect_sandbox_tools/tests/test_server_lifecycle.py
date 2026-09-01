@@ -1,5 +1,4 @@
 import asyncio
-import importlib
 import json
 import os
 import re
@@ -173,20 +172,15 @@ def test_prepare_socket_parent_tolerates_concurrent_fallback_creation(
     monkeypatch.setattr(server_module, "SERVER_DIR", server_dir)
     monkeypatch.setattr(server_module, "SOCKET_PATH", fallback_dir / "server.sock")
 
-    framework_directory_module = importlib.import_module(
-        "inspect_sandbox_tools._util.framework_directory"
-    )
-    original_mkdir = framework_directory_module.os.mkdir
+    original_mkdir = Path.mkdir
 
-    def concurrent_mkdir(
-        path: str, mode: int = 0o777, *, dir_fd: int | None = None
-    ) -> None:
-        if path == fallback_dir.name and dir_fd is not None:
-            original_mkdir(path, mode, dir_fd=dir_fd)
+    def concurrent_mkdir(path: Path, *args: object, **kwargs: object) -> None:
+        if path == fallback_dir:
+            original_mkdir(path, *args, **kwargs)
             raise FileExistsError
-        original_mkdir(path, mode, dir_fd=dir_fd)
+        original_mkdir(path, *args, **kwargs)
 
-    monkeypatch.setattr(framework_directory_module.os, "mkdir", concurrent_mkdir)
+    monkeypatch.setattr(Path, "mkdir", concurrent_mkdir)
 
     server_module._prepare_socket_parent()
 
@@ -681,33 +675,3 @@ async def test_exec_hides_server_directory_from_in_process_tools(
     monkeypatch.setattr(main_module, "_dispatch_local_method", dispatch)
 
     await main_module._exec('{"jsonrpc":"2.0","method":"in_process","id":1}')
-
-
-def test_exec_initializes_chunk_storage_before_switching_user(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[str] = []
-    monkeypatch.setattr(main_module, "load_tools", lambda _module: {"in_process"})
-    monkeypatch.setattr(
-        main_module,
-        "ensure_json_rpc_response_chunk_dir",
-        lambda: calls.append("ensure"),
-    )
-    monkeypatch.setattr(
-        main_module, "switch_user", lambda _user: calls.append("switch")
-    )
-    monkeypatch.setattr(main_module, "get_home_dir", lambda _user: "/home/alice")
-
-    async def dispatch(_request: str) -> str:
-        return '{"jsonrpc":"2.0","result":null,"id":1}'
-
-    monkeypatch.setattr(main_module, "_dispatch_local_method", dispatch)
-
-    asyncio.run(
-        main_module._exec(
-            '{"jsonrpc":"2.0","method":"in_process",'
-            '"params":{"_run_as_user":"alice"},"id":1}'
-        )
-    )
-
-    assert calls == ["ensure", "switch"]

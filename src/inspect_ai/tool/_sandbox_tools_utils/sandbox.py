@@ -1,7 +1,5 @@
-import base64
 import gzip
 import os
-import shlex
 import subprocess
 import sys
 import tempfile
@@ -26,7 +24,6 @@ from inspect_ai._util.trace import trace_message
 from inspect_ai.util import input_screen
 from inspect_ai.util._concurrency import concurrency
 from inspect_ai.util._sandbox._cli import SANDBOX_CLI, SANDBOX_TOOLS_DIR
-from inspect_ai.util._sandbox._framework_directory import framework_directory_command
 from inspect_ai.util._sandbox.context import (
     SandboxInjectable,
     sandbox_file_detector,
@@ -47,7 +44,6 @@ logger = getLogger(__name__)
 
 
 TRACE_SANDBOX_TOOLS = "Sandbox Tools"
-_SANDBOX_TOOLS_VERSION_FILE = f"{SANDBOX_TOOLS_DIR}/.inspect-version"
 
 
 class SandboxInjectionError(Exception):
@@ -123,7 +119,6 @@ async def _inject_container_tools_code(sandbox: SandboxEnvironment) -> None:
                     f"Failed to create or verify sandbox tools dir: {result.stderr}"
                 )
 
-        await _stop_installed_tools_server(sandbox, sandbox._tools_user)
         await _extract_tools_tree(sandbox, name, gz_bytes, sandbox._tools_user)
 
         if not await _tools_dir_is_verified(sandbox, sandbox._tools_user):
@@ -137,7 +132,6 @@ async def _inject_container_tools_code(sandbox: SandboxEnvironment) -> None:
         )
         if not result.success:
             raise RuntimeError(f"Failed to start sandbox tools server: {result.stderr}")
-        await _write_tools_version(sandbox, sandbox._tools_user)
     except Exception as e:
         raise SandboxInjectionError(
             f"Failed to inject sandbox tools into sandbox: {e}", cause=e
@@ -169,8 +163,21 @@ async def _create_tools_dir_as_root(sandbox: SandboxEnvironment) -> bool:
 
 
 def _ensure_tools_dir_command() -> list[str]:
-    """Return the shared framework-directory bootstrap command."""
-    return framework_directory_command(SANDBOX_TOOLS_DIR, repair_mode=True)
+    """Return the bootstrap adapter for the framework-directory contract.
+
+    ``mkdir`` binds creation atomically. An existing entry is only adopted when
+    it is a non-symlink directory owned by the effective UID with exact mode
+    0700. Under sticky ``/var/tmp``, an unprivileged user cannot replace a
+    root-owned entry after this verification.
+    """
+    script = (
+        "umask 077; "
+        f"mkdir -m 700 -- {SANDBOX_TOOLS_DIR} 2>/dev/null || "
+        f"{{ test -d {SANDBOX_TOOLS_DIR} && test ! -L {SANDBOX_TOOLS_DIR} && "
+        f'test "$(stat -c %u -- {SANDBOX_TOOLS_DIR})" = "$(id -u)" && '
+        f'test "$(stat -c %a -- {SANDBOX_TOOLS_DIR})" = 700; }}'
+    )
+    return ["sh", "-c", script]
 
 
 async def _tools_dir_is_verified(sandbox: SandboxEnvironment, user: str | None) -> bool:
@@ -185,96 +192,16 @@ async def _sandbox_tools_detector(sandbox: SandboxEnvironment) -> bool:
             if not await _tools_dir_is_verified(sandbox, "root"):
                 return False
             sandbox._tools_user = "root"
-            return await _installed_tools_version_matches(sandbox, "root")
+            return (
+                await sandbox.exec(["test", "-r", SANDBOX_CLI], user="root")
+            ).success
     except Exception:
         pass
 
     if not await _tools_dir_is_verified(sandbox, None):
         return False
     sandbox._tools_user = None
-    launcher_exists = await sandbox_file_detector(SANDBOX_CLI)(sandbox)
-    return launcher_exists and await _installed_tools_version_matches(sandbox, None)
-
-
-async def _installed_tools_version_matches(
-    sandbox: SandboxEnvironment, user: str | None
-) -> bool:
-    launcher = await sandbox.exec(["test", "-r", SANDBOX_CLI], user=user)
-    if not launcher.success:
-        return False
-    result = await sandbox.exec(["cat", _SANDBOX_TOOLS_VERSION_FILE], user=user)
-    return result.success and result.stdout.strip() == _get_sandbox_tools_version()
-
-
-async def _write_tools_version(sandbox: SandboxEnvironment, user: str | None) -> None:
-    result = await sandbox.exec(
-        [
-            "sh",
-            "-c",
-            f"umask 077; printf '%s\\n' {_get_sandbox_tools_version()} > "
-            f"{_SANDBOX_TOOLS_VERSION_FILE}",
-        ],
-        user=user,
-    )
-    if not result.success:
-        raise RuntimeError(f"Failed to write sandbox tools version: {result.stderr}")
-
-
-async def _stop_installed_tools_server(
-    sandbox: SandboxEnvironment, user: str | None
-) -> None:
-    """Stop a trusted prior installation before replacing its running bundle."""
-    launcher = await sandbox.exec(["test", "-x", SANDBOX_CLI], user=user)
-    if not launcher.success:
-        return
-    result = await sandbox.exec([SANDBOX_CLI, "stop-server"], user=user)
-    if not result.success:
-        version = await sandbox.exec(
-            ["test", "-r", _SANDBOX_TOOLS_VERSION_FILE], user=user
-        )
-        if version.success:
-            raise RuntimeError(
-                f"Failed to stop prior sandbox tools server: {result.stderr}"
-            )
-        # Versionless bundles can predate stop-server. Keep their tree intact
-        # for any live legacy daemon while the new server starts from a fresh
-        # install and socket directory.
-        tools_dir = shlex.quote(SANDBOX_TOOLS_DIR)
-        result = await sandbox.exec(
-            [
-                "sh",
-                "-c",
-                f"d={tools_dir}; "
-                'q=$(mktemp -d "${d}.legacy.XXXXXXXXXX") && '
-                'mv -T -- "$d" "$q/state" && mkdir -m 700 -- "$d"',
-            ],
-            user=user,
-        )
-        if not result.success:
-            raise RuntimeError(
-                f"Failed to preserve legacy sandbox tools: {result.stderr}"
-            )
-    # v28 used a 0777 server directory and could create the shared chunk root as
-    # an unprivileged user. Retire both so v29 cannot reuse poisoned state. The
-    # server path is environment-scoped by LocalSandbox, so resolve it in the
-    # sandbox process just as the CLI does.
-    chunk_dir = shlex.quote(f"{SANDBOX_TOOLS_DIR}-json-rpc-chunks")
-    result = await sandbox.exec(
-        [
-            "sh",
-            "-c",
-            'server_dir="${INSPECT_SANDBOX_TOOLS_DIR:-/tmp/sandbox-tools}"; '
-            f"chunk_dir={chunk_dir}; "
-            'for d in "$server_dir" "$chunk_dir"; do '
-            'if [ -e "$d" ] || [ -L "$d" ]; then '
-            'q=$(mktemp -d "${d}.retired.XXXXXXXXXX") && '
-            'mv -T -- "$d" "$q/state" && rm -rf -- "$q" || exit; '
-            "fi; done",
-        ],
-        user=user,
-    )
-    if not result.success:
-        raise RuntimeError(f"Failed to retire prior sandbox tools state: {result.stderr}")
+    return await sandbox_file_detector(SANDBOX_CLI)(sandbox)
 
 
 async def _extract_tools_tree(
@@ -282,17 +209,16 @@ async def _extract_tools_tree(
 ) -> None:
     """Extract the gzipped onedir tar into SANDBOX_TOOLS_DIR.
 
-    The artifact is transferred as base64 text over stdin and decoded inside the
-    verified install directory. This ensures root extraction never opens a path in
-    an agent-writable directory.
+    The artifact is staged to a temp file via write_file (which base64-encodes binary
+    content reliably; raw binary stdin through exec is not safe) and then extracted.
 
     Optimistic path: ship the compressed artifact and extract with `tar xzf`. If the
     container's `tar` lacks gzip support, fall back to injecting an uncompressed tar,
     which only needs plain `tar xf` (the broadest assumption). The uncompressed tar is
     cached in the binaries dir so we decompress at most once per artifact.
     """
-    gz_tmp = f"{SANDBOX_TOOLS_DIR}/.pkg.tgz"
-    await _write_trusted_archive(sandbox, gz_tmp, gz_bytes, user)
+    gz_tmp = f"{SANDBOX_TOOLS_DIR}.pkg.tgz"
+    await sandbox.write_file(gz_tmp, gz_bytes)
     result = await sandbox.exec(
         ["tar", "xzf", gz_tmp, "-C", SANDBOX_TOOLS_DIR], user=user
     )
@@ -306,28 +232,14 @@ async def _extract_tools_tree(
         TRACE_SANDBOX_TOOLS,
         f"tar xzf failed ({result.stderr.strip()}); retrying with uncompressed tar",
     )
-    tar_tmp = f"{SANDBOX_TOOLS_DIR}/.pkg.tar"
-    await _write_trusted_archive(
-        sandbox, tar_tmp, _uncompressed_tar_bytes(name, gz_bytes), user
-    )
+    tar_tmp = f"{SANDBOX_TOOLS_DIR}.pkg.tar"
+    await sandbox.write_file(tar_tmp, _uncompressed_tar_bytes(name, gz_bytes))
     result = await sandbox.exec(
         ["tar", "xf", tar_tmp, "-C", SANDBOX_TOOLS_DIR], user=user
     )
     await sandbox.exec(["rm", "-f", tar_tmp], user=user)
     if not result.success:
         raise RuntimeError(f"Failed to extract sandbox tools: {result.stderr}")
-
-
-async def _write_trusted_archive(
-    sandbox: SandboxEnvironment, path: str, contents: bytes, user: str | None
-) -> None:
-    """Write an archive as its extraction user inside the verified directory."""
-    encoded = base64.b64encode(contents).decode("ascii")
-    result = await sandbox.exec(
-        ["sh", "-c", f"umask 077; base64 -d > {path}"], input=encoded, user=user
-    )
-    if not result.success:
-        raise RuntimeError(f"Failed to stage sandbox tools archive: {result.stderr}")
 
 
 def _uncompressed_tar_bytes(name: str, gz_bytes: bytes) -> bytes:

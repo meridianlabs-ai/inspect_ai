@@ -13,14 +13,13 @@ def human_agent_commands(
     answer: bool | str,
     intermediate_scoring: bool,
     record_session: bool,
-    user: str | None,
     instructions: str | None,
 ) -> list[HumanAgentCommand]:
     # base submit, validate, and quit
     commands = [
-        SubmitCommand(record_session, user),
+        SubmitCommand(record_session),
         ValidateCommand(answer),
-        QuitCommand(record_session, user),
+        QuitCommand(record_session),
     ]
 
     # optional intermediate scoring

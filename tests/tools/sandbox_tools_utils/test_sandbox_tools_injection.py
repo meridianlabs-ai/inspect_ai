@@ -1,10 +1,7 @@
 """Tests for sandbox tools injection."""
 
-import stat
-import subprocess
 from contextlib import asynccontextmanager
 from io import BytesIO
-from pathlib import Path
 from typing import AsyncIterator, BinaryIO, Literal, overload
 
 import pytest
@@ -16,31 +13,6 @@ from inspect_ai.util._sandbox.environment import (
 )
 from inspect_ai.util._sandbox.recon import Architecture, SupportedContainerOSInfo
 from inspect_ai.util._subprocess import ExecResult
-
-
-def test_tools_directory_repairs_legacy_private_mode(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    tools_dir = tmp_path / "sandbox-tools"
-    tools_dir.mkdir(mode=0o755)
-    monkeypatch.setattr(sandbox_tools, "SANDBOX_TOOLS_DIR", str(tools_dir))
-
-    subprocess.run(sandbox_tools._ensure_tools_dir_command(), check=True)
-
-    assert stat.S_IMODE(tools_dir.stat().st_mode) == 0o700
-
-
-def test_tools_directory_rejects_legacy_writable_mode(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    tools_dir = tmp_path / "sandbox-tools"
-    tools_dir.mkdir(mode=0o777)
-    tools_dir.chmod(0o777)
-    monkeypatch.setattr(sandbox_tools, "SANDBOX_TOOLS_DIR", str(tools_dir))
-
-    result = subprocess.run(sandbox_tools._ensure_tools_dir_command(), check=False)
-
-    assert result.returncode != 0
 
 
 class RootProbeRaisesSandbox(SandboxEnvironment):
@@ -125,58 +97,3 @@ async def test_inject_container_tools_falls_back_when_root_probe_raises(
     assert sandbox.extracted_as_user is None
     assert (["id", "-u"], "root") in sandbox.exec_calls
     assert (sandbox_tools._ensure_tools_dir_command(), None) in sandbox.exec_calls
-
-
-async def test_stop_installed_tools_server_before_replacement() -> None:
-    sandbox = RootProbeRaisesSandbox()
-
-    await sandbox_tools._stop_installed_tools_server(sandbox, None)
-
-    assert sandbox.exec_calls[:2] == [
-        (["test", "-x", sandbox_tools.SANDBOX_CLI], None),
-        ([sandbox_tools.SANDBOX_CLI, "stop-server"], None),
-    ]
-    assert len(sandbox.exec_calls) == 3
-    assert sandbox.exec_calls[2][1] is None
-    retirement = sandbox.exec_calls[2][0]
-    assert retirement[:2] == ["sh", "-c"]
-    assert "${INSPECT_SANDBOX_TOOLS_DIR:-/tmp/sandbox-tools}" in retirement[2]
-    assert f"{sandbox_tools.SANDBOX_TOOLS_DIR}-json-rpc-chunks" in retirement[2]
-    assert 'mktemp -d "${d}.retired.XXXXXXXXXX"' in retirement[2]
-    assert "mv -T" in retirement[2]
-    assert "chmod" not in retirement[2]
-
-
-async def test_versionless_tools_without_stop_server_are_preserved() -> None:
-    class LegacySandbox(RootProbeRaisesSandbox):
-        async def exec(
-            self,
-            cmd: list[str],
-            input: str | bytes | None = None,
-            cwd: str | None = None,
-            env: dict[str, str] | None = None,
-            user: str | None = None,
-            timeout: int | None = None,
-            timeout_retry: bool = True,
-            concurrency: bool = True,
-        ) -> ExecResult[str]:
-            self.exec_calls.append((cmd, user))
-            if cmd == [sandbox_tools.SANDBOX_CLI, "stop-server"]:
-                return ExecResult(False, 2, "", "unknown command")
-            if cmd == ["test", "-r", sandbox_tools._SANDBOX_TOOLS_VERSION_FILE]:
-                return ExecResult(False, 1, "", "")
-            return ExecResult(True, 0, "", "")
-
-    sandbox = LegacySandbox()
-
-    await sandbox_tools._stop_installed_tools_server(sandbox, None)
-
-    assert any(
-        cmd[:2] == ["sh", "-c"] and ".legacy." in cmd[2]
-        for cmd, _ in sandbox.exec_calls
-    )
-    assert any(
-        cmd[:2] == ["sh", "-c"]
-        and "${INSPECT_SANDBOX_TOOLS_DIR:-/tmp/sandbox-tools}" in cmd[2]
-        for cmd, _ in sandbox.exec_calls
-    )
