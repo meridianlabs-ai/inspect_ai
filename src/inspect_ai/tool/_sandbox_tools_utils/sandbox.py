@@ -160,10 +160,10 @@ async def _inject_container_tools_code_impl(sandbox: SandboxEnvironment) -> None
             user=tools_user,
             timeout_retry=False,
         )
+        if not result.success and await _sandbox_tools_detector(sandbox):
+            await _cleanup_paths(sandbox, tools_user, install_tmp)
+            return
         if result.returncode == 17:
-            if await _sandbox_tools_detector(sandbox):
-                await _cleanup_paths(sandbox, tools_user, install_tmp)
-                return
             raise RuntimeError("Concurrent sandbox tools installation is unsafe")
         if not result.success:
             raise RuntimeError(
@@ -301,12 +301,17 @@ async def _sandbox_tools_detector(sandbox: SandboxEnvironment) -> bool:
     command = _sandbox_tools_validation_command(tools_dir)
     root_available = False
     try:
-        probe = await sandbox.exec(["id", "-u"], user="root", timeout_retry=False)
-        root_available = probe.success and probe.stdout.strip() == "0"
-    except SandboxUnavailableError:
-        raise
-    except Exception:
-        pass
+        sandbox.as_type(LocalSandboxEnvironment)
+    except TypeError:
+        try:
+            probe = await sandbox.exec(
+                ["id", "-u"], user="root", timeout_retry=False
+            )
+            root_available = probe.success and probe.stdout.strip() == "0"
+        except SandboxUnavailableError:
+            raise
+        except Exception:
+            pass
 
     users: tuple[str | None, ...] = ("root",) if root_available else (None,)
     for user in users:

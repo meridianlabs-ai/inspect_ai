@@ -5,6 +5,7 @@ import shutil
 import signal
 import subprocess
 import time
+import warnings
 from contextlib import asynccontextmanager
 from io import BytesIO
 from typing import AsyncIterator, BinaryIO, Literal, overload
@@ -158,6 +159,74 @@ async def test_inject_container_tools_falls_back_when_root_probe_raises(
     assert validation_index < start_index
 
 
+async def test_injection_accepts_valid_install_after_publication_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ConcurrentPublisherSandbox(RootProbeRaisesSandbox):
+        async def exec(
+            self,
+            cmd: list[str],
+            input: str | bytes | None = None,
+            cwd: str | None = None,
+            env: dict[str, str] | None = None,
+            user: str | None = None,
+            timeout: int | None = None,
+            timeout_retry: bool = True,
+            concurrency: bool = True,
+        ) -> ExecResult[str]:
+            if cmd[:2] == ["sh", "-c"] and "source_id=$(stat" in cmd[2]:
+                self.exec_calls.append((cmd, user))
+                self.tools_dir_exists = True
+                return ExecResult(
+                    success=False,
+                    returncode=2,
+                    stdout="",
+                    stderr="publication lock disappeared",
+                )
+            return await super().exec(
+                cmd, input, cwd, env, user, timeout, timeout_retry, concurrency
+            )
+
+    async def fake_detect_sandbox_os(
+        _sandbox: SandboxEnvironment,
+    ) -> SupportedContainerOSInfo:
+        return {"architecture": "amd64", "libc": "glibc"}
+
+    @asynccontextmanager
+    async def fake_open_executable_for_arch(
+        _arch: Architecture,
+        _musl: bool,
+    ) -> AsyncIterator[tuple[str, BinaryIO]]:
+        yield "inspect-sandbox-tools", BytesIO(b"binary")
+
+    async def fake_extract_tools_tree(
+        _sandbox: SandboxEnvironment,
+        _name: str,
+        _gz_bytes: bytes,
+        _user: str | None,
+        _tools_dir: str,
+    ) -> None:
+        pass
+
+    async def trusted_staging(
+        _sandbox: SandboxEnvironment,
+        _user: str | None,
+        _tools_dir: str,
+    ) -> bool:
+        return True
+
+    monkeypatch.setattr(sandbox_tools, "detect_sandbox_os", fake_detect_sandbox_os)
+    monkeypatch.setattr(
+        sandbox_tools, "_open_executable_for_arch", fake_open_executable_for_arch
+    )
+    monkeypatch.setattr(sandbox_tools, "_extract_tools_tree", fake_extract_tools_tree)
+    monkeypatch.setattr(sandbox_tools, "_sandbox_cli_is_trusted", trusted_staging)
+
+    await sandbox_tools._inject_container_tools_code_impl(
+        ConcurrentPublisherSandbox()
+    )
+
+
 async def test_injection_accepts_trusted_installation_appearing_late(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -247,6 +316,27 @@ async def test_detector_rejects_default_user_install_when_root_is_available() ->
 
     assert not await sandbox_tools._sandbox_tools_detector(sandbox)
     assert [user for _, user in sandbox.exec_calls] == ["root", "root"]
+
+
+async def test_detector_does_not_warn_about_user_for_local_sandbox() -> None:
+    sandbox = LocalSandboxEnvironment()
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            assert not await sandbox_tools._sandbox_tools_detector(sandbox)
+    finally:
+        sandbox.directory.cleanup()
+
+
+async def test_detector_does_not_warn_about_user_for_proxied_local_sandbox() -> None:
+    local = LocalSandboxEnvironment()
+    sandbox = SandboxEnvironmentProxy(local)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            assert not await sandbox_tools._sandbox_tools_detector(sandbox)
+    finally:
+        local.directory.cleanup()
 
 
 async def test_injection_preserves_sandbox_unavailable_error() -> None:
