@@ -97,3 +97,32 @@ async def test_inject_container_tools_falls_back_when_root_probe_raises(
     assert sandbox.extracted_as_user is None
     assert (["id", "-u"], "root") in sandbox.exec_calls
     assert (sandbox_tools._ensure_tools_dir_command(), None) in sandbox.exec_calls
+    assert (
+        ["find", sandbox_tools.SANDBOX_TOOLS_DIR, "-mindepth", "1", "-delete"],
+        None,
+    ) in sandbox.exec_calls
+    generation_calls = [
+        cmd
+        for cmd, user in sandbox.exec_calls
+        if user is None and sandbox_tools._SANDBOX_TOOLS_GENERATION_FILE in " ".join(cmd)
+    ]
+    assert generation_calls
+
+
+async def test_tools_directory_reuse_check_does_not_repair_permissions() -> None:
+    sandbox = RootProbeRaisesSandbox()
+
+    assert await sandbox_tools._tools_dir_is_verified(sandbox, None)
+    command = sandbox.exec_calls[-1][0]
+    assert "chmod" not in command[2]
+
+
+async def test_tools_reuse_checks_launcher_trust_and_generation() -> None:
+    sandbox = RootProbeRaisesSandbox()
+
+    assert await sandbox_tools._tools_install_is_current(sandbox, "root")
+    command = sandbox.exec_calls[-1][0][2]
+    assert "test ! -L" in command
+    assert "stat -c %u" in command
+    assert "& 022" in command
+    assert sandbox_tools._get_sandbox_tools_version() in command

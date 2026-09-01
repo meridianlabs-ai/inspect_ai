@@ -7,7 +7,8 @@ from typing import Awaitable, Callable, Literal
 from pydantic import JsonValue
 
 from inspect_ai._util.ansi import render_text
-from inspect_ai.util._sandbox import sandbox
+from inspect_ai.util._sandbox import override_sandbox_output_limit, sandbox
+from inspect_ai.util._sandbox.limits import SandboxEnvironmentLimits
 
 from ..install import RECORD_SESSION_DIR
 from ..state import HumanAgentState
@@ -40,10 +41,19 @@ class SessionEndCommand(HumanAgentCommand):
         session_logs: dict[str, str] = {}
         for session_log in result.stdout.strip().splitlines():
             try:
-                read_result = await sandbox().exec(
-                    ["cat", "--", (sessions_dir / session_log).as_posix()],
-                    user=self._user,
+                limit = SandboxEnvironmentLimits.MAX_READ_FILE_SIZE
+                path = (sessions_dir / session_log).as_posix()
+                script = (
+                    "import os,sys; "
+                    "f=open(sys.argv[1], encoding='utf-8', newline=''); "
+                    "size=os.fstat(f.fileno()).st_size; "
+                    "size <= int(sys.argv[2]) or sys.exit('session log exceeds limit'); "
+                    "sys.stdout.write(f.read())"
                 )
+                with override_sandbox_output_limit(limit, "exec"):
+                    read_result = await sandbox().exec(
+                        ["python3", "-c", script, path, str(limit)], user=self._user
+                    )
                 if not read_result.success:
                     raise RuntimeError(read_result.stderr)
                 session_logs[session_log] = read_result.stdout

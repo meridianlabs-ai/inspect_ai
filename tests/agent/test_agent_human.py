@@ -83,6 +83,10 @@ async def test_session_logs_are_read_as_selected_user(
 
     assert logs == {"agent_session.output": "session contents"}
     assert [user for _, user in fake.calls] == ["agent", "agent"]
+    assert fake.calls[1][0][-2:] == [
+        f"{human_install.RECORD_SESSION_DIR}/agent_session.output",
+        str(100 * 1024**2),
+    ]
 
 
 @pytest.mark.parametrize(

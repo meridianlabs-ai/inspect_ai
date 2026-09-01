@@ -56,7 +56,7 @@ def _json_rpc_response_chunk_dir() -> Iterator[int]:
     # chmod on a path follows it. O_DIRECTORY|O_NOFOLLOW also subsumes the
     # is-it-really-a-directory check.
     try:
-        dir_fd = os.open(_CHUNK_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        dir_fd = os.open(_CHUNK_DIR, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW)
     except OSError as ex:
         raise RuntimeError(
             f"JSON-RPC response chunk path is not a directory: {_CHUNK_DIR}"
@@ -75,6 +75,18 @@ def _json_rpc_response_chunk_dir() -> Iterator[int]:
         # identity's entries.
         required_mode = 0o1733
         if chunk_dir_stat.st_uid == current_uid or current_uid == 0:
+            readable_fd = os.open(
+                ".", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd
+            )
+            readable_stat = os.fstat(readable_fd)
+            if (readable_stat.st_dev, readable_stat.st_ino) != (
+                chunk_dir_stat.st_dev,
+                chunk_dir_stat.st_ino,
+            ):
+                os.close(readable_fd)
+                raise RuntimeError("JSON-RPC response chunk directory changed")
+            os.close(dir_fd)
+            dir_fd = readable_fd
             os.fchmod(dir_fd, required_mode)
         elif stat.S_IMODE(chunk_dir_stat.st_mode) != required_mode:
             raise RuntimeError(

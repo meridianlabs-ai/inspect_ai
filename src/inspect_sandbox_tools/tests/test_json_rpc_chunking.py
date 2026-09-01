@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import os
+import pwd
 import stat
 from contextlib import suppress
 from pathlib import Path
@@ -48,6 +49,34 @@ def test_chunk_dir_accepts_secure_root_owner(
     monkeypatch.setattr(chunking.os, "fchmod", unexpected_chmod)
 
     chunking.ensure_json_rpc_response_chunk_dir()
+
+
+def test_nonroot_can_spill_under_root_owned_chunk_dir(tmp_path: Path) -> None:
+    if os.getuid() != 0 or not hasattr(os, "fork"):
+        pytest.skip("cross-UID permission test requires root on POSIX")
+    try:
+        nobody = pwd.getpwnam("nobody")
+    except KeyError:
+        pytest.skip("cross-UID permission test requires a nobody user")
+
+    tmp_path.chmod(0o755)
+    chunking._CHUNK_DIR.mkdir(mode=0o1733)
+    child = os.fork()
+    if child == 0:
+        try:
+            os.setgroups([])
+            os.setgid(nobody.pw_gid)
+            os.setuid(nobody.pw_uid)
+            response = json.dumps(
+                {"jsonrpc": "2.0", "id": 1, "result": "x" * 2000}
+            )
+            chunked = chunk_json_rpc_response_if_needed({"id": 1}, response, 512)
+            os._exit(0 if JSON_RPC_RESPONSE_CHUNK_FIELD in json.loads(chunked) else 1)
+        except BaseException:
+            os._exit(1)
+
+    _, status = os.waitpid(child, 0)
+    assert os.waitstatus_to_exitcode(status) == 0
 
 
 def test_json_rpc_response_chunking_round_trips_large_stdout_and_stderr() -> None:

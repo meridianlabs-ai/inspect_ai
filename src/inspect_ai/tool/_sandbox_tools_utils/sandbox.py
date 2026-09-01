@@ -45,6 +45,7 @@ logger = getLogger(__name__)
 
 
 TRACE_SANDBOX_TOOLS = "Sandbox Tools"
+_SANDBOX_TOOLS_GENERATION_FILE = f"{SANDBOX_TOOLS_DIR}/.generation"
 
 
 class SandboxInjectionError(Exception):
@@ -120,7 +121,9 @@ async def _inject_container_tools_code(sandbox: SandboxEnvironment) -> None:
                     f"Failed to create or verify sandbox tools dir: {result.stderr}"
                 )
 
+        await _clear_tools_dir(sandbox, sandbox._tools_user)
         await _extract_tools_tree(sandbox, name, gz_bytes, sandbox._tools_user)
+        await _write_tools_generation(sandbox, sandbox._tools_user)
 
         if not await _tools_dir_is_verified(sandbox, sandbox._tools_user):
             raise RuntimeError("Sandbox tools directory changed during extraction")
@@ -178,18 +181,54 @@ def _ensure_tools_dir_command() -> list[str]:
 
 
 async def _tools_dir_is_verified(sandbox: SandboxEnvironment, user: str | None) -> bool:
-    return (await sandbox.exec(_ensure_tools_dir_command(), user=user)).success
+    command = framework_directory_command(SANDBOX_TOOLS_DIR, repair_mode=False)
+    return (await sandbox.exec(command, user=user)).success
 
 
-async def _launcher_is_executable(
+async def _tools_install_is_current(
     sandbox: SandboxEnvironment, user: str | None
 ) -> bool:
+    version = _get_sandbox_tools_version()
     return (
         await sandbox.exec(
-            ["sh", "-c", f"test -f {SANDBOX_CLI} && test -x {SANDBOX_CLI}"],
+            [
+                "sh",
+                "-c",
+                f'test ! -L "{SANDBOX_CLI}" && test -f "{SANDBOX_CLI}" '
+                f'&& test -x "{SANDBOX_CLI}" '
+                f'&& test "$(stat -c %u "{SANDBOX_CLI}")" = "$(id -u)" '
+                f'&& test $(( 0$(stat -c %a "{SANDBOX_CLI}") & 022 )) = 0 '
+                f'&& test "$(cat "{_SANDBOX_TOOLS_GENERATION_FILE}")" = "{version}"',
+            ],
             user=user,
         )
     ).success
+
+
+async def _clear_tools_dir(
+    sandbox: SandboxEnvironment, user: str | None
+) -> None:
+    result = await sandbox.exec(
+        ["find", SANDBOX_TOOLS_DIR, "-mindepth", "1", "-delete"], user=user
+    )
+    if not result.success:
+        raise RuntimeError(f"Failed to clear sandbox tools dir: {result.stderr}")
+
+
+async def _write_tools_generation(
+    sandbox: SandboxEnvironment, user: str | None
+) -> None:
+    result = await sandbox.exec(
+        [
+            "sh",
+            "-c",
+            f'umask 077; printf "%s\\n" "{_get_sandbox_tools_version()}" '
+            f'> "{_SANDBOX_TOOLS_GENERATION_FILE}"',
+        ],
+        user=user,
+    )
+    if not result.success:
+        raise RuntimeError(f"Failed to record sandbox tools generation: {result.stderr}")
 
 
 async def _sandbox_tools_detector(sandbox: SandboxEnvironment) -> bool:
@@ -200,14 +239,14 @@ async def _sandbox_tools_detector(sandbox: SandboxEnvironment) -> bool:
             if not await _tools_dir_is_verified(sandbox, "root"):
                 return False
             sandbox._tools_user = "root"
-            return await _launcher_is_executable(sandbox, "root")
+            return await _tools_install_is_current(sandbox, "root")
     except Exception:
         pass
 
     if not await _tools_dir_is_verified(sandbox, None):
         return False
     sandbox._tools_user = None
-    return await _launcher_is_executable(sandbox, None)
+    return await _tools_install_is_current(sandbox, None)
 
 
 async def _extract_tools_tree(
