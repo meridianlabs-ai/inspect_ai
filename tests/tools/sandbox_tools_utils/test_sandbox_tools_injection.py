@@ -1,8 +1,10 @@
 """Tests for sandbox tools injection."""
 
 import os
+import signal
 import shutil
 import subprocess
+import time
 from contextlib import asynccontextmanager
 from io import BytesIO
 from typing import AsyncIterator, BinaryIO, Literal, overload
@@ -273,8 +275,8 @@ def test_local_sandbox_tools_install_is_namespaced_per_os_user() -> None:
     finally:
         sandbox.directory.cleanup()
 
-    assert tools_dir == sandbox_tools.local_sandbox_tools_dir(
-        sandbox_tools.local_sandbox_tools_namespace()
+    assert tools_dir == sandbox_cli.local_sandbox_tools_dir(
+        sandbox_cli.local_sandbox_tools_namespace()
     )
 
 
@@ -286,8 +288,8 @@ def test_proxied_local_sandbox_tools_install_is_namespaced_per_os_user() -> None
     finally:
         local.directory.cleanup()
 
-    assert tools_dir == sandbox_tools.local_sandbox_tools_dir(
-        sandbox_tools.local_sandbox_tools_namespace()
+    assert tools_dir == sandbox_cli.local_sandbox_tools_dir(
+        sandbox_cli.local_sandbox_tools_namespace()
     )
 
 
@@ -335,6 +337,7 @@ async def test_cancelled_root_staging_creation_cleans_up_as_root(
     ) -> bool:
         creation_started.set()
         await anyio.sleep_forever()
+        raise AssertionError("sleep_forever returned")
 
     async def record_cleanup(
         _sandbox: SandboxEnvironment,
@@ -400,6 +403,65 @@ def test_publish_command_rejects_destination_created_during_move(
     )
 
     assert result.returncode == 17
+
+
+def test_publish_command_recovers_stale_lock(tmp_path: os.PathLike[str]) -> None:
+    base = os.fspath(tmp_path)
+    staging = os.path.join(base, "staging")
+    destination = os.path.join(base, "tools")
+    lock = os.path.join(base, "lock")
+    os.mkdir(staging)
+    os.mkdir(lock)
+    with open(os.path.join(lock, "owner"), "w") as owner:
+        owner.write("999999999\n")
+    command = sandbox_tools._publish_tools_command(staging)
+    command[5] = lock
+    command[6] = destination
+
+    result = subprocess.run(command, check=False, capture_output=True, text=True)
+
+    assert result.returncode == 0
+    assert os.path.isdir(destination)
+    assert not os.path.exists(lock)
+
+
+def test_publish_command_cancellation_releases_lock(
+    tmp_path: os.PathLike[str],
+) -> None:
+    base = os.fspath(tmp_path)
+    staging = os.path.join(base, "staging")
+    destination = os.path.join(base, "tools")
+    lock = os.path.join(base, "lock")
+    bin_dir = os.path.join(base, "bin")
+    os.mkdir(staging)
+    os.mkdir(bin_dir)
+    mv_wrapper = os.path.join(bin_dir, "mv")
+    with open(mv_wrapper, "w") as wrapper:
+        wrapper.write("#!/bin/sh\nsleep 30\n")
+    os.chmod(mv_wrapper, 0o700)
+    command = sandbox_tools._publish_tools_command(staging)
+    command[5] = lock
+    command[6] = destination
+    process = subprocess.Popen(
+        command,
+        env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
+        start_new_session=True,
+    )
+    try:
+        for _ in range(100):
+            if os.path.exists(os.path.join(lock, "owner")):
+                break
+            assert process.poll() is None
+            time.sleep(0.01)
+        assert os.path.exists(os.path.join(lock, "owner"))
+        os.killpg(process.pid, signal.SIGTERM)
+        process.wait(timeout=5)
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+
+    assert not os.path.exists(lock)
 
 
 async def test_write_archive_uses_provider_file_transfer() -> None:
