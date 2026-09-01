@@ -17,7 +17,9 @@ We additionally choose a dot-prefixed random hash sub-directory to reduce
 accidental discovery. When Inspect can run commands in the sandbox as root, it
 installs the tree as root and restricts it to 0700. A root-owned 0700 tree
 prevents access by other, non-root users, but not by a process running in the
-sandbox as root.
+sandbox as root. Local sandboxes instead place the directory under the user's
+home directory so another user cannot reserve its name in a shared sticky
+directory.
 """
 
 import hashlib
@@ -51,4 +53,5 @@ def local_sandbox_tools_dir(user_namespace: str) -> str:
     Returns:
         The per-user sandbox tools installation path.
     """
-    return f"{SANDBOX_TOOLS_DIR}-{user_namespace}"
+    name = f".{Path(SANDBOX_TOOLS_DIR).name}-{user_namespace}"
+    return str(Path.home() / name)

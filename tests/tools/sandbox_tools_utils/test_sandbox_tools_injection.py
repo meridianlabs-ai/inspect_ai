@@ -8,6 +8,7 @@ import time
 import warnings
 from contextlib import asynccontextmanager
 from io import BytesIO
+from pathlib import Path
 from typing import AsyncIterator, BinaryIO, Literal, overload
 
 import anyio
@@ -211,8 +212,10 @@ async def test_injection_accepts_valid_install_after_publication_failure(
     async def trusted_staging(
         _sandbox: SandboxEnvironment,
         _user: str | None,
-        _tools_dir: str,
+        *,
+        tools_dir: str,
     ) -> bool:
+        assert ".install-" in tools_dir
         return True
 
     monkeypatch.setattr(sandbox_tools, "detect_sandbox_os", fake_detect_sandbox_os)
@@ -419,6 +422,7 @@ def test_local_sandbox_tools_install_is_namespaced_per_os_user() -> None:
     assert tools_dir == sandbox_cli.local_sandbox_tools_dir(
         sandbox_cli.local_sandbox_tools_namespace()
     )
+    assert Path(tools_dir).parent == Path.home()
 
 
 def test_proxied_local_sandbox_tools_install_is_namespaced_per_os_user() -> None:
@@ -529,7 +533,7 @@ def test_publish_command_rejects_destination_created_during_move(
     assert real_mv is not None
     mv_wrapper = os.path.join(bin_dir, "mv")
     with open(mv_wrapper, "w") as wrapper:
-        wrapper.write(f'#!/bin/sh\nmkdir -- "$3"\nexec "{real_mv}" "$@"\n')
+        wrapper.write(f'#!/bin/sh\nmkdir -- "$4"\nexec "{real_mv}" "$@"\n')
     os.chmod(mv_wrapper, 0o700)
     command = sandbox_tools._publish_tools_command(staging)
     command[5] = os.path.join(base, "lock")
@@ -542,6 +546,8 @@ def test_publish_command_rejects_destination_created_during_move(
     )
 
     assert result.returncode == 17
+    assert os.path.isdir(staging)
+    assert os.listdir(destination) == []
 
 
 def test_publish_command_recovers_stale_lock(tmp_path: os.PathLike[str]) -> None:
@@ -553,13 +559,53 @@ def test_publish_command_recovers_stale_lock(tmp_path: os.PathLike[str]) -> None
     os.mkdir(lock)
     os.chmod(lock, 0o700)
     with open(os.path.join(lock, "owner"), "w") as owner:
-        owner.write("999999999\n")
+        owner.write("999999999:1\n")
     os.chmod(os.path.join(lock, "owner"), 0o600)
     command = sandbox_tools._publish_tools_command(staging)
     command[5] = lock
     command[6] = destination
 
     result = subprocess.run(command, check=False, capture_output=True, text=True)
+
+    assert result.returncode == 0
+    assert os.path.isdir(destination)
+    assert not os.path.exists(lock)
+
+
+def test_publish_command_expires_live_looking_lock(
+    tmp_path: os.PathLike[str],
+) -> None:
+    base = os.fspath(tmp_path)
+    staging = os.path.join(base, "staging")
+    destination = os.path.join(base, "tools")
+    lock = os.path.join(base, "lock")
+    bin_dir = os.path.join(base, "bin")
+    os.mkdir(staging)
+    os.mkdir(lock)
+    os.chmod(lock, 0o700)
+    os.mkdir(bin_dir)
+    process_fields = (
+        Path(f"/proc/{os.getpid()}/stat").read_text().split(") ", 1)[1]
+    )
+    process_start = process_fields.split()[19]
+    with open(os.path.join(lock, "owner"), "w") as owner:
+        owner.write(f"{os.getpid()}:{process_start}\n")
+    os.chmod(os.path.join(lock, "owner"), 0o600)
+    sleep_wrapper = os.path.join(bin_dir, "sleep")
+    with open(sleep_wrapper, "w") as wrapper:
+        wrapper.write("#!/bin/sh\nexit 0\n")
+    os.chmod(sleep_wrapper, 0o700)
+    command = sandbox_tools._publish_tools_command(staging)
+    command[5] = lock
+    command[6] = destination
+
+    result = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
+    )
 
     assert result.returncode == 0
     assert os.path.isdir(destination)
@@ -829,3 +875,32 @@ def test_launcher_validator_checks_filesystem_state(tmp_path: os.PathLike[str]) 
     os.unlink(launcher)
     os.symlink("missing", launcher)
     assert subprocess.run(command, check=False).returncode != 0
+
+
+def test_launcher_validator_accepts_safe_root_owned_install_for_nonroot_user(
+    tmp_path: os.PathLike[str],
+) -> None:
+    if os.getuid() != 0:
+        pytest.skip("root ownership fixture requires root")
+    tools_dir = os.fspath(tmp_path)
+    launcher = os.path.join(tools_dir, "launcher")
+    with open(launcher, "w") as file:
+        file.write("#!/bin/sh\n")
+    os.chmod(tools_dir, 0o755)
+    os.chmod(launcher, 0o755)
+    bin_dir = os.path.join(tools_dir, "bin")
+    os.mkdir(bin_dir)
+    id_wrapper = os.path.join(bin_dir, "id")
+    with open(id_wrapper, "w") as wrapper:
+        wrapper.write("#!/bin/sh\nprintf '1000\\n'\n")
+    os.chmod(id_wrapper, 0o700)
+    command = sandbox_tools._sandbox_tools_validation_command(tools_dir)
+    command[5] = launcher
+
+    result = subprocess.run(
+        command,
+        check=False,
+        env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
+    )
+
+    assert result.returncode == 0

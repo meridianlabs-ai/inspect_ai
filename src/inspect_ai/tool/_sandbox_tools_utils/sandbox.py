@@ -207,6 +207,10 @@ safe_owner_file() {
     test ! -L "$owner_file" && test -f "$owner_file" &&
         test "$(path_attributes "$owner_file")" = "$lock_uid:600"
 }
+process_start() {
+    test -r "/proc/$1/stat" || return 1
+    sed 's/.*) //' "/proc/$1/stat" | awk '{print $20}'
+}
 i=0
 while ! mkdir -m 700 -- "$2" 2>/dev/null; do
     i=$((i + 1))
@@ -214,14 +218,19 @@ while ! mkdir -m 700 -- "$2" 2>/dev/null; do
     safe_lock_dir || exit 18
     if safe_owner_file; then
         owner=$(cat -- "$owner_file")
-        case "$owner" in *[!0-9]*) exit 18;; esac
-        if test -z "$owner"; then
+        case "$owner" in *:*) owner_pid=${owner%%:*}; owner_start=${owner#*:};; *) owner_pid=; owner_start=;; esac
+        case "$owner_pid$owner_start" in *[!0-9]*) exit 18;; esac
+        if test -z "$owner_pid" || test -z "$owner_start"; then
             if test "$i" -ge 10; then
                 rm -f -- "$owner_file"
                 rmdir -- "$lock_dir" 2>/dev/null || exit 18
                 continue
             fi
-        elif ! kill -0 "$owner" 2>/dev/null; then
+        elif test "$(process_start "$owner_pid" 2>/dev/null || true)" != "$owner_start"; then
+            rm -f -- "$owner_file"
+            rmdir -- "$lock_dir" 2>/dev/null || exit 18
+            continue
+        elif test "$i" -ge 90; then
             rm -f -- "$owner_file"
             rmdir -- "$lock_dir" 2>/dev/null || exit 18
             continue
@@ -239,10 +248,10 @@ trap cleanup_lock EXIT
 trap 'cleanup_lock; exit 129' HUP
 trap 'cleanup_lock; exit 130' INT
 trap 'cleanup_lock; exit 143' TERM
-printf '%s\n' "$$" > "$owner_file"
+printf '%s:%s\n' "$$" "$(process_start "$$")" > "$owner_file"
 if test -e "$3" || test -L "$3"; then exit 17; fi
 source_id=$(stat -c '%d:%i' -- "$1" 2>/dev/null || stat -f '%d:%i' "$1")
-mv -- "$1" "$3"
+mv -nT -- "$1" "$3"
 target_id=$(stat -c '%d:%i' -- "$3" 2>/dev/null || stat -f '%d:%i' "$3")
 test "$source_id" = "$target_id" || exit 17
 """
@@ -336,10 +345,12 @@ set -e
 validate_owned() {
     test "$1" "$2" && test ! -L "$2" || return 1
     set -- $(stat -c '%u %a' -- "$2" 2>/dev/null || stat -f '%u %Lp' "$2" 2>/dev/null) || return 1
-    test "$1" = "$(id -u)" && test $((0$2 & 022)) -eq 0
+    test "$1" = "$(id -u)" || test "$1" = 0 || return 1
+    test $((0$2 & 022)) -eq 0
 }
 validate_owned -d "$1"
 validate_owned -f "$2"
+test -x "$1"
 test -x "$2"
 id -u
 """
