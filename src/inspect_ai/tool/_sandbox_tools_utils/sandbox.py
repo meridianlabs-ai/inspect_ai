@@ -178,7 +178,7 @@ def _ensure_tools_dir_command() -> list[str]:
         f'test "$(stat -c %u -- {SANDBOX_TOOLS_DIR})" = "$(id -u)" && '
         f'mode="$(stat -c %a -- {SANDBOX_TOOLS_DIR})" && '
         f'case "$mode" in *[2367][0-7]|*[0-7][2367]) false;; '
-        f'esac && chmod 700 -- {SANDBOX_TOOLS_DIR}; }}'
+        f"esac && chmod 700 -- {SANDBOX_TOOLS_DIR}; }}"
     )
     return ["sh", "-c", script]
 
