@@ -1,6 +1,7 @@
 """Tests for sandbox tools injection."""
 
 import os
+import shutil
 import subprocess
 from contextlib import asynccontextmanager
 from io import BytesIO
@@ -86,7 +87,7 @@ async def test_inject_container_tools_falls_back_when_root_probe_raises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sandbox = RootProbeRaisesSandbox()
-    sandbox.validation_results = [True]
+    sandbox.validation_results = [True, True]
 
     async def fake_detect_sandbox_os(
         _sandbox: SandboxEnvironment,
@@ -127,6 +128,71 @@ async def test_inject_container_tools_falls_back_when_root_probe_raises(
         if command[:2] == ["sh", "-c"] and "validate_file()" in command[2]
     )
     assert validation_index < start_index
+
+
+async def test_injection_accepts_trusted_installation_appearing_late(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sandbox = RootProbeRaisesSandbox()
+
+    async def fake_detect_sandbox_os(
+        _sandbox: SandboxEnvironment,
+    ) -> SupportedContainerOSInfo:
+        return {"architecture": "amd64", "libc": "glibc"}
+
+    @asynccontextmanager
+    async def fake_open_executable_for_arch(
+        _arch: Architecture,
+        _musl: bool,
+    ) -> AsyncIterator[tuple[str, BinaryIO]]:
+        yield "inspect-sandbox-tools", BytesIO(b"binary")
+
+    detector_results = iter((False, True))
+
+    async def fake_detector(_sandbox: SandboxEnvironment) -> bool:
+        return next(detector_results)
+
+    async def tools_dir_exists(_sandbox: SandboxEnvironment) -> bool:
+        return True
+
+    monkeypatch.setattr(sandbox_tools, "detect_sandbox_os", fake_detect_sandbox_os)
+    monkeypatch.setattr(
+        sandbox_tools, "_open_executable_for_arch", fake_open_executable_for_arch
+    )
+    monkeypatch.setattr(sandbox_tools, "_sandbox_tools_detector", fake_detector)
+    monkeypatch.setattr(sandbox_tools, "_tools_dir_exists", tools_dir_exists)
+
+    await sandbox_tools._inject_container_tools_code(sandbox)
+
+    assert all(command != ["id", "-u"] for command, _ in sandbox.exec_calls)
+
+
+def test_publish_command_rejects_destination_created_during_move(
+    tmp_path: os.PathLike[str],
+) -> None:
+    base = os.fspath(tmp_path)
+    staging = os.path.join(base, "staging")
+    destination = os.path.join(base, "tools")
+    bin_dir = os.path.join(base, "bin")
+    os.mkdir(staging)
+    os.mkdir(bin_dir)
+    real_mv = shutil.which("mv")
+    assert real_mv is not None
+    mv_wrapper = os.path.join(bin_dir, "mv")
+    with open(mv_wrapper, "w") as wrapper:
+        wrapper.write(f'#!/bin/sh\nmkdir -- "$3"\nexec "{real_mv}" "$@"\n')
+    os.chmod(mv_wrapper, 0o700)
+    command = sandbox_tools._publish_tools_command(staging)
+    command[5] = os.path.join(base, "lock")
+    command[6] = destination
+
+    result = subprocess.run(
+        command,
+        check=False,
+        env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
+    )
+
+    assert result.returncode == 17
 
 
 async def test_write_archive_uses_provider_file_transfer() -> None:

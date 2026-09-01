@@ -116,6 +116,8 @@ async def _inject_container_tools_code_impl(sandbox: SandboxEnvironment) -> None
         gz_bytes = f.read()  # gzipped tar of the PyInstaller --onedir tree
 
     if await _tools_dir_exists(sandbox):
+        if await _sandbox_tools_detector(sandbox):
+            return
         raise RuntimeError(
             "Existing sandbox tools installation is unsafe; recreate the sandbox "
             "rather than replacing a potentially active installation"
@@ -155,6 +157,14 @@ async def _inject_container_tools_code_impl(sandbox: SandboxEnvironment) -> None
             raise RuntimeError(
                 f"Failed to publish sandbox tools installation: {result.stderr}"
             )
+        tools_dir_is_verified = await _tools_dir_is_verified(
+            sandbox, sandbox._tools_user
+        )
+        sandbox_cli_is_trusted = await _sandbox_cli_is_trusted(
+            sandbox, sandbox._tools_user
+        )
+        if not tools_dir_is_verified or not sandbox_cli_is_trusted:
+            raise RuntimeError("Published sandbox tools installation failed validation")
         published = True
 
         result = await sandbox.exec(
@@ -181,7 +191,10 @@ while ! mkdir -m 700 -- "$2" 2>/dev/null; do
 done
 trap 'rmdir -- "$2"' EXIT
 if test -e "$3" || test -L "$3"; then exit 17; fi
+source_id=$(stat -c '%d:%i' -- "$1" 2>/dev/null || stat -f '%d:%i' "$1")
 mv -- "$1" "$3"
+target_id=$(stat -c '%d:%i' -- "$3" 2>/dev/null || stat -f '%d:%i' "$3")
+test "$source_id" = "$target_id" || exit 17
 """
     return ["sh", "-c", script, "sh", install_tmp, lock_dir, SANDBOX_TOOLS_DIR]
 
