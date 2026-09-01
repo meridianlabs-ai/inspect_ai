@@ -47,7 +47,7 @@ def framework_directory_command(
         f"umask 077; if mkdir -m {mode_text} -- {directory} 2>/dev/null; "
         f"then :; else test -d {directory} && test ! -L {directory} && "
         f'set -- $({stat_values}) && test "$1" = "$(id -u)" && '
-        f'test $((0$2 & 022)) -eq 0 && chmod {mode_text} -- {directory} && '
+        f"test $((0$2 & 022)) -eq 0 && chmod {mode_text} -- {directory} && "
         f'set -- $({stat_values}) && test "$1" = "$(id -u)" && '
         f'test "$2" = {mode_text}; fi'
     )

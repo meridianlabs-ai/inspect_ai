@@ -213,9 +213,7 @@ async def _clear_tools_dir(sandbox: SandboxEnvironment, user: str | None) -> Non
         user=user,
     )
     if not result.success:
-        raise RuntimeError(
-            f"Failed to clear obsolete sandbox tools: {result.stderr}"
-        )
+        raise RuntimeError(f"Failed to clear obsolete sandbox tools: {result.stderr}")
 
 
 async def _acquire_install_lock(
