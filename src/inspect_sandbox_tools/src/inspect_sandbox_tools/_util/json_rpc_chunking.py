@@ -56,8 +56,16 @@ def ensure_json_rpc_response_chunk_dir() -> None:
     # descriptor: a path-based check leaves a window to swap in a symlink, and
     # chmod on a path follows it. O_DIRECTORY|O_NOFOLLOW also subsumes the
     # is-it-really-a-directory check.
+    current_uid = os.getuid()
+    open_flags = os.O_DIRECTORY | os.O_NOFOLLOW
+    if current_uid != 0:
+        # A 1733 parent intentionally cannot be listed by scoped users. O_PATH
+        # still permits fstat and descriptor-relative child creation.
+        open_flags |= os.O_PATH
+    else:
+        open_flags |= os.O_RDONLY
     try:
-        dir_fd = os.open(_CHUNK_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        dir_fd = os.open(_CHUNK_DIR, open_flags)
     except OSError as ex:
         raise RuntimeError(
             f"JSON-RPC response chunk path is not a directory: {_CHUNK_DIR}"
@@ -65,7 +73,6 @@ def ensure_json_rpc_response_chunk_dir() -> None:
 
     try:
         chunk_dir_stat = os.fstat(dir_fd)
-        current_uid = os.getuid()
         if current_uid == 0 and chunk_dir_stat.st_uid != 0:
             raise RuntimeError(
                 f"JSON-RPC response chunk directory has unexpected owner: {_CHUNK_DIR}"

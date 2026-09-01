@@ -46,6 +46,7 @@ logger = getLogger(__name__)
 
 
 TRACE_SANDBOX_TOOLS = "Sandbox Tools"
+_SANDBOX_TOOLS_VERSION_FILE = f"{SANDBOX_TOOLS_DIR}/.inspect-version"
 
 
 class SandboxInjectionError(Exception):
@@ -122,6 +123,7 @@ async def _inject_container_tools_code(sandbox: SandboxEnvironment) -> None:
                 )
 
         await _extract_tools_tree(sandbox, name, gz_bytes, sandbox._tools_user)
+        await _write_tools_version(sandbox, sandbox._tools_user)
 
         if not await _tools_dir_is_verified(sandbox, sandbox._tools_user):
             raise RuntimeError("Sandbox tools directory changed during extraction")
@@ -181,16 +183,39 @@ async def _sandbox_tools_detector(sandbox: SandboxEnvironment) -> bool:
             if not await _tools_dir_is_verified(sandbox, "root"):
                 return False
             sandbox._tools_user = "root"
-            return (
-                await sandbox.exec(["test", "-r", SANDBOX_CLI], user="root")
-            ).success
+            return await _installed_tools_version_matches(sandbox, "root")
     except Exception:
         pass
 
     if not await _tools_dir_is_verified(sandbox, None):
         return False
     sandbox._tools_user = None
-    return await sandbox_file_detector(SANDBOX_CLI)(sandbox)
+    launcher_exists = await sandbox_file_detector(SANDBOX_CLI)(sandbox)
+    return launcher_exists and await _installed_tools_version_matches(sandbox, None)
+
+
+async def _installed_tools_version_matches(
+    sandbox: SandboxEnvironment, user: str | None
+) -> bool:
+    launcher = await sandbox.exec(["test", "-r", SANDBOX_CLI], user=user)
+    if not launcher.success:
+        return False
+    result = await sandbox.exec(["cat", _SANDBOX_TOOLS_VERSION_FILE], user=user)
+    return result.success and result.stdout.strip() == _get_sandbox_tools_version()
+
+
+async def _write_tools_version(sandbox: SandboxEnvironment, user: str | None) -> None:
+    result = await sandbox.exec(
+        [
+            "sh",
+            "-c",
+            f"umask 077; printf '%s\\n' {_get_sandbox_tools_version()} > "
+            f"{_SANDBOX_TOOLS_VERSION_FILE}",
+        ],
+        user=user,
+    )
+    if not result.success:
+        raise RuntimeError(f"Failed to write sandbox tools version: {result.stderr}")
 
 
 async def _extract_tools_tree(

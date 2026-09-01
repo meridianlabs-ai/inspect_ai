@@ -1,3 +1,4 @@
+import base64
 import concurrent.futures
 import re
 import subprocess
@@ -70,24 +71,28 @@ async def test_session_logs_are_read_as_configured_user(
     calls: list[tuple[list[str], str | None]] = []
 
     class FakeSandbox:
+        read_calls = 0
+
         async def exec(
             self, cmd: list[str], *, user: str | None = None, **kwargs: object
         ) -> ExecResult[str]:
             calls.append((cmd, user))
-            stdout = "session.log\n" if cmd[0] == "ls" else ""
+            if cmd[0] == "ls":
+                stdout = "session.log\n"
+            elif self.read_calls == 0:
+                stdout = base64.b64encode(b"recording").decode()
+                self.read_calls += 1
+            else:
+                stdout = ""
             return ExecResult(True, 0, stdout, "")
-
-        async def read_file(self, path: str) -> str:
-            assert path.startswith("/var/tmp/user-sessions/.inspect-read-")
-            return "recording"
 
     monkeypatch.setattr(submit, "sandbox", lambda: FakeSandbox())
 
     logs = await SubmitCommand(True, "alice")._read_session_logs()
 
     assert logs == {"session.log": "recording"}
-    assert [user for _, user in calls] == ["alice", "alice", "alice"]
-    assert [cmd[0] for cmd, _ in calls] == ["ls", "cp", "rm"]
+    assert [user for _, user in calls] == ["alice", "alice"]
+    assert [cmd[0] for cmd, _ in calls] == ["ls", "sh"]
 
 
 async def test_checked_write_file_runs_as_owner(

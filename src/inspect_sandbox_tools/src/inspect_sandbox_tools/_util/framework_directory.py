@@ -1,7 +1,5 @@
-import fcntl
 import os
 import stat
-import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator, Literal
@@ -26,13 +24,9 @@ def framework_directory(
     if path.name in ("", ".", ".."):
         raise ValueError(f"Framework directory must name a child: {path}")
 
-    parent_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    parent_fd = os.open(path.parent, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW)
     directory_fd: int | None = None
     try:
-        # The parent is stable for the lifetime of this descriptor. Serializing
-        # migration on it prevents a concurrent verifier from quarantining the
-        # replacement installed by another process.
-        fcntl.flock(parent_fd, fcntl.LOCK_EX)
         while directory_fd is None:
             try:
                 directory_fd = os.open(
@@ -51,9 +45,7 @@ def framework_directory(
                     dir_fd=parent_fd,
                 )
             except OSError as ex:
-                if existing != "replace":
-                    raise RuntimeError(f"Unsafe framework directory: {path}") from ex
-                _quarantine_entry(parent_fd, path)
+                raise RuntimeError(f"Unsafe framework directory: {path}") from ex
 
             if directory_fd is None:
                 continue
@@ -71,19 +63,13 @@ def framework_directory(
 
             os.close(directory_fd)
             directory_fd = None
-            # A same-owner legacy directory that was writable by other users may
-            # contain planted sockets or metadata. Never adopt its contents.
-            if existing != "replace" and not (
-                stat.S_ISDIR(status.st_mode)
-                and status.st_uid == owner_uid
-                and unsafe_permissions
-            ):
-                raise RuntimeError(
-                    f"Framework directory has unexpected owner or mode: {path}"
-                )
-            _quarantine_entry(parent_fd, path)
+            # Replacing an entry in an attacker-writable parent cannot be made
+            # conditional on the inode inspected above with portable Python APIs.
+            # Fail closed rather than racing a rename of a concurrent replacement.
+            raise RuntimeError(
+                f"Framework directory has unexpected owner or mode: {path}"
+            )
 
-        fcntl.flock(parent_fd, fcntl.LOCK_UN)
         yield directory_fd
     finally:
         if directory_fd is not None:
@@ -106,17 +92,3 @@ def ensure_framework_directory(
         existing=existing,
     ):
         pass
-
-
-def _quarantine_entry(parent_fd: int, path: Path) -> None:
-    quarantine_name = f".{path.name}.untrusted-{uuid.uuid4().hex}"
-    try:
-        os.rename(
-            path.name, quarantine_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd
-        )
-    except FileNotFoundError:
-        return
-    except OSError as ex:
-        raise RuntimeError(
-            f"Unable to replace unsafe framework directory: {path}"
-        ) from ex

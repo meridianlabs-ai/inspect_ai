@@ -1,15 +1,19 @@
+import base64
+import shlex
 from argparse import Namespace
-from contextlib import suppress
 from logging import getLogger
 from pathlib import PurePosixPath
 from re import Pattern, compile, match
 from typing import Awaitable, Callable, Literal
-from uuid import uuid4
 
 from pydantic import JsonValue
 
 from inspect_ai._util.ansi import render_text
 from inspect_ai.util._sandbox import sandbox
+from inspect_ai.util._sandbox.limits import (
+    OutputLimitExceededError,
+    SandboxEnvironmentLimits,
+)
 
 from ..install import RECORD_SESSION_DIR
 from ..state import HumanAgentState
@@ -41,31 +45,43 @@ class SessionEndCommand(HumanAgentCommand):
         # read logs
         session_logs: dict[str, str] = {}
         for session_log in result.stdout.strip().splitlines():
-            staged_log = sessions_dir / f".inspect-read-{uuid4().hex}"
             try:
-                log_result = await sandbox().exec(
-                    [
-                        "cp",
-                        "--",
-                        (sessions_dir / session_log).as_posix(),
-                        staged_log.as_posix(),
-                    ],
-                    user=self._user,
-                )
-                if not log_result.success:
-                    raise RuntimeError(log_result.stderr)
-                session_logs[session_log] = await sandbox().read_file(
-                    staged_log.as_posix()
+                session_logs[session_log] = await self._read_session_log(
+                    sessions_dir / session_log
                 )
             except Exception as ex:
                 logger.warning(f"Error reading human agent session log: {ex}")
-            finally:
-                with suppress(Exception):
-                    await sandbox().exec(
-                        ["rm", "-f", "--", staged_log.as_posix()], user=self._user
-                    )
 
         return session_logs
+
+    async def _read_session_log(self, path: PurePosixPath) -> str:
+        """Read a complete private log without a privileged path handoff."""
+        chunk_size = 64 * 1024
+        quoted_path = shlex.quote(path.as_posix())
+        contents = bytearray()
+        chunk_index = 0
+        while True:
+            result = await sandbox().exec(
+                [
+                    "sh",
+                    "-c",
+                    f"dd if={quoted_path} bs={chunk_size} skip={chunk_index} count=1 "
+                    "status=none | base64",
+                ],
+                user=self._user,
+            )
+            if not result.success:
+                raise RuntimeError(result.stderr)
+            chunk = base64.b64decode(result.stdout)
+            contents.extend(chunk)
+            if len(contents) > SandboxEnvironmentLimits.MAX_READ_FILE_SIZE:
+                raise OutputLimitExceededError(
+                    limit_str=SandboxEnvironmentLimits.MAX_READ_FILE_SIZE_STR,
+                    truncated_output=None,
+                )
+            if len(chunk) < chunk_size:
+                return contents.decode("utf-8")
+            chunk_index += 1
 
 
 class QuitCommand(SessionEndCommand):
