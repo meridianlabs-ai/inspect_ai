@@ -2,9 +2,7 @@ import os
 import stat
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator, Literal
-
-ExistingDirectoryPolicy = Literal["verify", "replace"]
+from typing import Iterator
 
 
 @contextmanager
@@ -13,7 +11,6 @@ def framework_directory(
     *,
     owner_uid: int,
     mode: int = 0o700,
-    existing: ExistingDirectoryPolicy = "verify",
 ) -> Iterator[int]:
     """Open a verified framework-owned directory without following its entry.
 
@@ -82,13 +79,11 @@ def ensure_framework_directory(
     *,
     owner_uid: int | None = None,
     mode: int = 0o700,
-    existing: ExistingDirectoryPolicy = "verify",
 ) -> None:
     """Create or verify a framework-owned directory."""
     with framework_directory(
         path,
         owner_uid=os.getuid() if owner_uid is None else owner_uid,
         mode=mode,
-        existing=existing,
     ):
         pass

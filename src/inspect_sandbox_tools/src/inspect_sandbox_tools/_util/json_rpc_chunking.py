@@ -57,15 +57,16 @@ def ensure_json_rpc_response_chunk_dir() -> None:
     # chmod on a path follows it. O_DIRECTORY|O_NOFOLLOW also subsumes the
     # is-it-really-a-directory check.
     current_uid = os.getuid()
-    open_flags = os.O_DIRECTORY | os.O_NOFOLLOW
-    if current_uid != 0:
-        # A 1733 parent intentionally cannot be listed by scoped users. O_PATH
-        # still permits fstat and descriptor-relative child creation.
-        open_flags |= os.O_PATH
-    else:
-        open_flags |= os.O_RDONLY
+    open_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     try:
-        dir_fd = os.open(_CHUNK_DIR, open_flags)
+        try:
+            dir_fd = os.open(_CHUNK_DIR, open_flags)
+        except PermissionError:
+            # A root-owned 1733 parent intentionally cannot be listed by scoped
+            # users. O_PATH permits verification and relative child creation.
+            dir_fd = os.open(
+                _CHUNK_DIR, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW
+            )
     except OSError as ex:
         raise RuntimeError(
             f"JSON-RPC response chunk path is not a directory: {_CHUNK_DIR}"

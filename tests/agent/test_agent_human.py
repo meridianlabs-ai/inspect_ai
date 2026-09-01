@@ -1,12 +1,13 @@
 import base64
 import concurrent.futures
+import json
 import re
 import subprocess
 import sys
 import time
 from argparse import Namespace
 from io import StringIO
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 from test_helpers.utils import skip_if_no_docker
@@ -64,6 +65,37 @@ async def test_install_human_agent_falls_back_when_root_exec_raises(
     assert calls == ["root", "agent"]
 
 
+async def test_existing_recording_install_is_migrated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An existing install repairs recording storage and refreshes its bashrc."""
+    checked_calls: list[tuple[list[str], str | None]] = []
+
+    class FakeSandbox:
+        async def exec(
+            self, cmd: list[str], *, user: str | None = None, **kwargs: object
+        ) -> ExecResult[str]:
+            return ExecResult(True, 0, "existing\n", "")
+
+    async def fake_checked_exec(
+        cmd: list[str],
+        input: str | bytes | None = None,
+        cwd: str | None = None,
+        user: str | None = None,
+    ) -> str:
+        checked_calls.append((cmd, user))
+        return ""
+
+    monkeypatch.setattr(install, "sandbox", lambda: FakeSandbox())
+    monkeypatch.setattr(install, "checked_exec", fake_checked_exec)
+
+    await install.install_human_agent("root", [], None, True)
+
+    assert any(install.RECORD_SESSION_DIR in " ".join(cmd) for cmd, _ in checked_calls)
+    assert any(cmd[:2] == ["find", install.RECORD_SESSION_DIR] for cmd, _ in checked_calls)
+    assert (["bash", f"./{install.INSTALL_SH}"], "root") in checked_calls
+
+
 async def test_session_logs_are_read_as_configured_user(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -80,7 +112,12 @@ async def test_session_logs_are_read_as_configured_user(
             if cmd[0] == "ls":
                 stdout = "session.log\n"
             elif self.read_calls == 0:
-                stdout = base64.b64encode(b"recording").decode()
+                stdout = json.dumps(
+                    {
+                        "data": base64.b64encode(b"recording").decode(),
+                        "eof": True,
+                    }
+                )
                 self.read_calls += 1
             else:
                 stdout = ""
@@ -92,7 +129,22 @@ async def test_session_logs_are_read_as_configured_user(
 
     assert logs == {"session.log": "recording"}
     assert [user for _, user in calls] == ["alice", "alice"]
-    assert [cmd[0] for cmd, _ in calls] == ["ls", "sh"]
+    assert [cmd[0] for cmd, _ in calls] == ["ls", "python3"]
+
+
+async def test_session_log_rejects_truncated_transfer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeSandbox:
+        async def exec(self, cmd: list[str], **kwargs: object) -> ExecResult[str]:
+            return ExecResult(True, 0, '{"data":"YWJj"', "")
+
+    monkeypatch.setattr(submit, "sandbox", lambda: FakeSandbox())
+
+    with pytest.raises(json.JSONDecodeError):
+        await SubmitCommand(True, "alice")._read_session_log(
+            PurePosixPath("/var/tmp/user-sessions/session.log")
+        )
 
 
 async def test_checked_write_file_runs_as_owner(

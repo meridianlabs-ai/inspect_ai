@@ -125,3 +125,14 @@ async def test_inject_container_tools_falls_back_when_root_probe_raises(
     assert sandbox.extracted_as_user is None
     assert (["id", "-u"], "root") in sandbox.exec_calls
     assert (sandbox_tools._ensure_tools_dir_command(), None) in sandbox.exec_calls
+
+
+async def test_stop_installed_tools_server_before_replacement() -> None:
+    sandbox = RootProbeRaisesSandbox()
+
+    await sandbox_tools._stop_installed_tools_server(sandbox, None)
+
+    assert sandbox.exec_calls == [
+        (["test", "-x", sandbox_tools.SANDBOX_CLI], None),
+        ([sandbox_tools.SANDBOX_CLI, "stop-server"], None),
+    ]

@@ -48,7 +48,8 @@ async def install_human_agent(
         )
     if install_result is None or not install_result.success:
         raise RuntimeError(f"Unsafe human-agent directory: {HUMAN_AGENT_DIR}")
-    if install_result.stdout.strip() == "existing":
+    existing_install = install_result.stdout.strip() == "existing"
+    if existing_install and not record_session:
         return
 
     if user != "root":
@@ -63,6 +64,24 @@ async def install_human_agent(
         await checked_exec(
             framework_directory_command(RECORD_SESSION_DIR, repair_mode=True), user=user
         )
+        if existing_install:
+            await checked_exec(
+                [
+                    "find",
+                    RECORD_SESSION_DIR,
+                    "-maxdepth",
+                    "1",
+                    "-type",
+                    "f",
+                    "-exec",
+                    "chmod",
+                    "600",
+                    "--",
+                    "{}",
+                    "+",
+                ],
+                user=user,
+            )
 
     # generate task.py
     task_py = human_agent_commands(commands)

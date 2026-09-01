@@ -42,14 +42,6 @@ def test_framework_directory_rejects_untrusted_entry(
             ensure_framework_directory(directory)
 
 
-def test_framework_directory_rejects_non_directory_replacement(tmp_path: Path) -> None:
-    directory = tmp_path / "framework"
-    directory.touch()
-
-    with pytest.raises(RuntimeError, match="Unsafe framework directory"):
-        ensure_framework_directory(directory, existing="replace")
-
-
 def test_framework_directory_rejects_legacy_world_writable_directory(
     tmp_path: Path,
 ) -> None:

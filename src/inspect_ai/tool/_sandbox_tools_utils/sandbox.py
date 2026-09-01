@@ -122,6 +122,7 @@ async def _inject_container_tools_code(sandbox: SandboxEnvironment) -> None:
                     f"Failed to create or verify sandbox tools dir: {result.stderr}"
                 )
 
+        await _stop_installed_tools_server(sandbox, sandbox._tools_user)
         await _extract_tools_tree(sandbox, name, gz_bytes, sandbox._tools_user)
         await _write_tools_version(sandbox, sandbox._tools_user)
 
@@ -216,6 +217,18 @@ async def _write_tools_version(sandbox: SandboxEnvironment, user: str | None) ->
     )
     if not result.success:
         raise RuntimeError(f"Failed to write sandbox tools version: {result.stderr}")
+
+
+async def _stop_installed_tools_server(
+    sandbox: SandboxEnvironment, user: str | None
+) -> None:
+    """Stop a trusted prior installation before replacing its running bundle."""
+    launcher = await sandbox.exec(["test", "-x", SANDBOX_CLI], user=user)
+    if not launcher.success:
+        return
+    result = await sandbox.exec([SANDBOX_CLI, "stop-server"], user=user)
+    if not result.success:
+        raise RuntimeError(f"Failed to stop prior sandbox tools server: {result.stderr}")
 
 
 async def _extract_tools_tree(

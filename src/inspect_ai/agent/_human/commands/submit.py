@@ -1,5 +1,5 @@
 import base64
-import shlex
+import json
 from argparse import Namespace
 from logging import getLogger
 from pathlib import PurePosixPath
@@ -56,32 +56,52 @@ class SessionEndCommand(HumanAgentCommand):
 
     async def _read_session_log(self, path: PurePosixPath) -> str:
         """Read a complete private log without a privileged path handoff."""
-        chunk_size = 64 * 1024
-        quoted_path = shlex.quote(path.as_posix())
+        output_limit = SandboxEnvironmentLimits.MAX_EXEC_OUTPUT_SIZE
+        chunk_size = min(64 * 1024, max(0, (output_limit - 1024) * 3 // 4))
+        if chunk_size == 0:
+            raise RuntimeError("Sandbox exec output limit is too small to read logs")
+        reader = (
+            "import base64,json,sys;"
+            "f=open(sys.argv[1],'rb');f.seek(int(sys.argv[2]));"
+            "data=f.read(int(sys.argv[3]));"
+            "print(json.dumps({'data':base64.b64encode(data).decode(),"
+            "'eof':len(data)<int(sys.argv[3])}))"
+        )
         contents = bytearray()
-        chunk_index = 0
+        offset = 0
         while True:
             result = await sandbox().exec(
                 [
-                    "sh",
+                    "python3",
                     "-c",
-                    f"dd if={quoted_path} bs={chunk_size} skip={chunk_index} count=1 "
-                    "status=none | base64",
+                    reader,
+                    path.as_posix(),
+                    str(offset),
+                    str(chunk_size),
                 ],
                 user=self._user,
             )
             if not result.success:
-                raise RuntimeError(result.stderr)
-            chunk = base64.b64decode(result.stdout)
+                raise RuntimeError(f"Unable to read session log: {result.stderr}")
+            frame = json.loads(result.stdout)
+            if not isinstance(frame, dict) or set(frame) != {"data", "eof"}:
+                raise RuntimeError("Invalid session log transfer frame")
+            data = frame["data"]
+            eof = frame["eof"]
+            if not isinstance(data, str) or not isinstance(eof, bool):
+                raise RuntimeError("Invalid session log transfer frame")
+            chunk = base64.b64decode(data, validate=True)
+            if len(chunk) > chunk_size or (not eof and len(chunk) != chunk_size):
+                raise RuntimeError("Incomplete session log transfer frame")
             contents.extend(chunk)
             if len(contents) > SandboxEnvironmentLimits.MAX_READ_FILE_SIZE:
                 raise OutputLimitExceededError(
                     limit_str=SandboxEnvironmentLimits.MAX_READ_FILE_SIZE_STR,
                     truncated_output=None,
                 )
-            if len(chunk) < chunk_size:
+            if eof:
                 return contents.decode("utf-8")
-            chunk_index += 1
+            offset += len(chunk)
 
 
 class QuitCommand(SessionEndCommand):
