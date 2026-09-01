@@ -62,10 +62,11 @@ class SessionEndCommand(HumanAgentCommand):
             raise RuntimeError("Sandbox exec output limit is too small to read logs")
         reader = (
             "import base64,json,sys;"
-            "f=open(sys.argv[1],'rb');f.seek(int(sys.argv[2]));"
-            "data=f.read(int(sys.argv[3]));"
-            "print(json.dumps({'data':base64.b64encode(data).decode(),"
-            "'eof':len(data)<int(sys.argv[3])}))"
+            "offset=int(sys.argv[2]);size=int(sys.argv[3]);"
+            "f=open(sys.argv[1],'rb');f.seek(offset);data=f.read(size);"
+            "print(json.dumps({'offset':offset,'length':len(data),"
+            "'data':base64.b64encode(data).decode(),"
+            "'eof':len(data)<size},separators=(',',':')))"
         )
         contents = bytearray()
         offset = 0
@@ -84,14 +85,34 @@ class SessionEndCommand(HumanAgentCommand):
             if not result.success:
                 raise RuntimeError(f"Unable to read session log: {result.stderr}")
             frame = json.loads(result.stdout)
-            if not isinstance(frame, dict) or set(frame) != {"data", "eof"}:
+            if not isinstance(frame, dict) or set(frame) != {
+                "offset",
+                "length",
+                "data",
+                "eof",
+            }:
                 raise RuntimeError("Invalid session log transfer frame")
+            frame_offset = frame["offset"]
+            length = frame["length"]
             data = frame["data"]
             eof = frame["eof"]
-            if not isinstance(data, str) or not isinstance(eof, bool):
+            if (
+                not isinstance(frame_offset, int)
+                or isinstance(frame_offset, bool)
+                or frame_offset != offset
+                or not isinstance(length, int)
+                or isinstance(length, bool)
+                or length < 0
+                or not isinstance(data, str)
+                or not isinstance(eof, bool)
+            ):
                 raise RuntimeError("Invalid session log transfer frame")
             chunk = base64.b64decode(data, validate=True)
-            if len(chunk) > chunk_size or (not eof and len(chunk) != chunk_size):
+            if (
+                len(chunk) != length
+                or length > chunk_size
+                or (not eof and length != chunk_size)
+            ):
                 raise RuntimeError("Incomplete session log transfer frame")
             contents.extend(chunk)
             if len(contents) > SandboxEnvironmentLimits.MAX_READ_FILE_SIZE:

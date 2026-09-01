@@ -114,6 +114,8 @@ async def test_session_logs_are_read_as_configured_user(
             elif self.read_calls == 0:
                 stdout = json.dumps(
                     {
+                        "offset": 0,
+                        "length": len(b"recording"),
                         "data": base64.b64encode(b"recording").decode(),
                         "eof": True,
                     }
@@ -142,6 +144,26 @@ async def test_session_log_rejects_truncated_transfer(
     monkeypatch.setattr(submit, "sandbox", lambda: FakeSandbox())
 
     with pytest.raises(json.JSONDecodeError):
+        await SubmitCommand(True, "alice")._read_session_log(
+            PurePosixPath("/var/tmp/user-sessions/session.log")
+        )
+
+
+async def test_session_log_rejects_frame_for_wrong_offset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeSandbox:
+        async def exec(self, cmd: list[str], **kwargs: object) -> ExecResult[str]:
+            return ExecResult(
+                True,
+                0,
+                '{"offset":1,"length":3,"data":"YWJj","eof":true}',
+                "",
+            )
+
+    monkeypatch.setattr(submit, "sandbox", lambda: FakeSandbox())
+
+    with pytest.raises(RuntimeError, match="Invalid session log transfer frame"):
         await SubmitCommand(True, "alice")._read_session_log(
             PurePosixPath("/var/tmp/user-sessions/session.log")
         )

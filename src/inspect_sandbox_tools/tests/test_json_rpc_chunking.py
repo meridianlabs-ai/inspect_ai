@@ -3,9 +3,11 @@ import base64
 import json
 import os
 import pwd
+import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, NamedTuple, cast
@@ -131,11 +133,11 @@ def test_json_rpc_response_chunks_use_private_uid_directory(
 
 @pytest.mark.skipif(os.getuid() != 0, reason="requires switching to another uid")
 def test_non_root_user_chunks_through_root_owned_non_readable_parent(
-    tmp_path: Path,
 ) -> None:
     unprivileged_user = pwd.getpwnam("nobody")
-    tmp_path.chmod(0o755)
-    chunk_dir = tmp_path / "chunks"
+    test_root = Path(tempfile.mkdtemp(prefix="inspect-chunks-", dir="/tmp"))
+    test_root.chmod(0o755)
+    chunk_dir = test_root / "chunks"
     chunk_dir.mkdir(mode=0o1733)
 
     script = """
@@ -154,18 +156,21 @@ assert chunking.JSON_RPC_RESPONSE_CHUNK_FIELD in json.loads(chunked)
         os.setgid(unprivileged_user.pw_gid)
         os.setuid(unprivileged_user.pw_uid)
 
-    subprocess.run(
-        [sys.executable, "-c", script],
-        check=True,
-        env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
-        preexec_fn=switch_to_unprivileged_user,
-        timeout=10,
-    )
+    try:
+        subprocess.run(
+            [sys.executable, "-c", script],
+            check=True,
+            env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
+            preexec_fn=switch_to_unprivileged_user,
+            timeout=10,
+        )
 
-    user_dir = chunk_dir / str(unprivileged_user.pw_uid)
-    assert user_dir.stat().st_uid == unprivileged_user.pw_uid
-    assert stat.S_IMODE(user_dir.stat().st_mode) == 0o700
-    assert next(user_dir.iterdir()).stat().st_uid == unprivileged_user.pw_uid
+        user_dir = chunk_dir / str(unprivileged_user.pw_uid)
+        assert user_dir.stat().st_uid == unprivileged_user.pw_uid
+        assert stat.S_IMODE(user_dir.stat().st_mode) == 0o700
+        assert next(user_dir.iterdir()).stat().st_uid == unprivileged_user.pw_uid
+    finally:
+        shutil.rmtree(test_root)
 
 
 def test_frozen_chunk_dir_uses_hidden_sibling_of_tools_dir(

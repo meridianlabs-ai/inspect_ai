@@ -135,4 +135,14 @@ async def test_stop_installed_tools_server_before_replacement() -> None:
     assert sandbox.exec_calls == [
         (["test", "-x", sandbox_tools.SANDBOX_CLI], None),
         ([sandbox_tools.SANDBOX_CLI, "stop-server"], None),
+        (
+            [
+                "sh",
+                "-c",
+                'd="/tmp/sandbox-tools"; '
+                'if [ -d "$d" ]; then q="$d.retired.$$"; '
+                'mv -- "$d" "$q" && chmod 700 -- "$q"; fi',
+            ],
+            None,
+        ),
     ]

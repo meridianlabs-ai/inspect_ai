@@ -7,9 +7,9 @@ import sys
 import tempfile
 import time
 import uuid
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator, NamedTuple
 
 from inspect_sandbox_tools._util.framework_directory import ensure_framework_directory
 
@@ -143,10 +143,12 @@ def handle_json_rpc_response_chunk_request(
     handle = params.get("handle")
     if not isinstance(handle, str) or not _VALID_HANDLE.fullmatch(handle):
         return _json_rpc_error(request_id, -32602, "invalid chunk handle")
-    chunk_path = _chunk_path(handle)
-
     if params.get("release") is True:
-        chunk_path.unlink(missing_ok=True)
+        try:
+            with _open_chunk(handle) as chunk:
+                os.unlink(chunk.filename, dir_fd=chunk.directory_fd)
+        except FileNotFoundError:
+            pass
         return _json_rpc_success(request_id, None)
     if "release" in params:
         return _json_rpc_error(request_id, -32602, "release must be true")
@@ -156,13 +158,14 @@ def handle_json_rpc_response_chunk_request(
         return _json_rpc_error(request_id, -32602, "invalid chunk offset")
 
     try:
-        return _read_chunk_response(
-            request_id,
-            handle,
-            chunk_path,
-            offset,
-            _response_byte_limit(max_response_bytes),
-        )
+        with _open_chunk(handle) as chunk:
+            return _read_chunk_response_fd(
+                request_id,
+                handle,
+                chunk.file_fd,
+                offset,
+                _response_byte_limit(max_response_bytes),
+            )
     except FileNotFoundError:
         return _json_rpc_error(request_id, -32000, "chunk handle not found")
     except ValueError as ex:
@@ -216,6 +219,34 @@ def _read_chunk_response(
         max_response_bytes,
     )
     os.utime(chunk_path, None)
+    return response
+
+
+def _read_chunk_response_fd(
+    request_id: Any,
+    handle: str,
+    chunk_fd: int,
+    offset: int,
+    max_response_bytes: int,
+) -> str:
+    """Read a chunk from the same verified inode throughout the operation."""
+    total_size = os.fstat(chunk_fd).st_size
+    if offset >= total_size:
+        raise ValueError("chunk offset is beyond the response")
+    candidate = os.pread(
+        chunk_fd, min(_MAX_CHUNK_BYTES, total_size - offset), offset
+    )
+    if not candidate:
+        raise OSError("chunk file ended before its declared size")
+    response = _largest_fitting_chunk_response(
+        request_id,
+        handle,
+        offset,
+        total_size,
+        candidate,
+        max_response_bytes,
+    )
+    os.utime(chunk_fd, None)
     return response
 
 
@@ -275,56 +306,66 @@ def _chunk_response(
     )
 
 
-def _chunk_path(handle: str) -> Path:
+class _OpenChunk(NamedTuple):
+    directory_fd: int
+    file_fd: int
+    filename: str
+
+
+@contextmanager
+def _open_chunk(handle: str) -> Iterator[_OpenChunk]:
+    """Open an owned chunk without following user-replaceable path entries."""
     if not _VALID_HANDLE.fullmatch(handle):
         raise ValueError("invalid chunk handle")
     filename = f"{handle}.jsonrpc"
-    current_user_path = _CHUNK_DIR / str(os.getuid()) / filename
-    if _is_owned_chunk_file(current_user_path, os.getuid()):
-        return current_user_path
-
-    # The host invokes continuations as the tools user (normally root), even
-    # when an in-process request switched to a sandbox user before producing
-    # the original response. Root can locate that user's private chunk without
-    # making the directory enumerable or writable to sandbox users.
-    if os.getuid() == 0:
-        found_path = _find_chunk_path_for_root(filename)
-        if found_path is not None:
-            return found_path
-    return current_user_path
-
-
-def _find_chunk_path_for_root(filename: str) -> Path | None:
-    with suppress(OSError):
-        for user_dir in _CHUNK_DIR.iterdir():
+    current_uid = os.getuid()
+    root_flags = os.O_RDONLY if current_uid == 0 else os.O_PATH
+    root_fd = os.open(
+        _CHUNK_DIR, root_flags | os.O_DIRECTORY | os.O_NOFOLLOW
+    )
+    try:
+        user_names = [str(current_uid)]
+        if current_uid == 0:
+            user_names = os.listdir(root_fd)
+        for user_name in user_names:
             try:
-                user_uid = int(user_dir.name)
-                user_dir_stat = user_dir.lstat()
+                user_uid = int(user_name)
+                user_fd = os.open(
+                    user_name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=root_fd,
+                )
             except (OSError, ValueError):
                 continue
-            if (
-                stat.S_ISLNK(user_dir_stat.st_mode)
-                or not stat.S_ISDIR(user_dir_stat.st_mode)
-                or user_dir_stat.st_uid != user_uid
-                or stat.S_IMODE(user_dir_stat.st_mode) != 0o700
-            ):
-                continue
-            chunk_path = user_dir / filename
-            if _is_owned_chunk_file(chunk_path, user_uid):
-                return chunk_path
-    return None
-
-
-def _is_owned_chunk_file(chunk_path: Path, expected_uid: int) -> bool:
-    try:
-        chunk_stat = chunk_path.lstat()
-    except OSError:
-        return False
-    return (
-        not stat.S_ISLNK(chunk_stat.st_mode)
-        and stat.S_ISREG(chunk_stat.st_mode)
-        and chunk_stat.st_uid == expected_uid
-    )
+            try:
+                user_status = os.fstat(user_fd)
+                if (
+                    user_status.st_uid != user_uid
+                    or stat.S_IMODE(user_status.st_mode) != 0o700
+                ):
+                    continue
+                try:
+                    chunk_fd = os.open(
+                        filename, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=user_fd
+                    )
+                except OSError:
+                    continue
+                chunk_status = os.fstat(chunk_fd)
+                if not stat.S_ISREG(chunk_status.st_mode) or (
+                    chunk_status.st_uid != user_uid
+                ):
+                    os.close(chunk_fd)
+                    continue
+                try:
+                    yield _OpenChunk(user_fd, chunk_fd, filename)
+                finally:
+                    os.close(chunk_fd)
+                return
+            finally:
+                os.close(user_fd)
+        raise FileNotFoundError(filename)
+    finally:
+        os.close(root_fd)
 
 
 def _response_byte_limit(explicit_limit: int | None) -> int:

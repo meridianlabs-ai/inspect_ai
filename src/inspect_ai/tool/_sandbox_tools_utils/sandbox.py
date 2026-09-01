@@ -124,7 +124,6 @@ async def _inject_container_tools_code(sandbox: SandboxEnvironment) -> None:
 
         await _stop_installed_tools_server(sandbox, sandbox._tools_user)
         await _extract_tools_tree(sandbox, name, gz_bytes, sandbox._tools_user)
-        await _write_tools_version(sandbox, sandbox._tools_user)
 
         if not await _tools_dir_is_verified(sandbox, sandbox._tools_user):
             raise RuntimeError("Sandbox tools directory changed during extraction")
@@ -137,6 +136,7 @@ async def _inject_container_tools_code(sandbox: SandboxEnvironment) -> None:
         )
         if not result.success:
             raise RuntimeError(f"Failed to start sandbox tools server: {result.stderr}")
+        await _write_tools_version(sandbox, sandbox._tools_user)
     except Exception as e:
         raise SandboxInjectionError(
             f"Failed to inject sandbox tools into sandbox: {e}", cause=e
@@ -229,6 +229,20 @@ async def _stop_installed_tools_server(
     result = await sandbox.exec([SANDBOX_CLI, "stop-server"], user=user)
     if not result.success:
         raise RuntimeError(f"Failed to stop prior sandbox tools server: {result.stderr}")
+    # v28 used a 0777 default server directory. Retire the now-stopped directory
+    # so v29 creates trusted state from scratch and cannot reuse poisoned entries.
+    result = await sandbox.exec(
+        [
+            "sh",
+            "-c",
+            'd="/tmp/sandbox-tools"; '
+            'if [ -d "$d" ]; then q="$d.retired.$$"; '
+            'mv -- "$d" "$q" && chmod 700 -- "$q"; fi',
+        ],
+        user=user,
+    )
+    if not result.success:
+        raise RuntimeError(f"Failed to retire prior sandbox tools state: {result.stderr}")
 
 
 async def _extract_tools_tree(
