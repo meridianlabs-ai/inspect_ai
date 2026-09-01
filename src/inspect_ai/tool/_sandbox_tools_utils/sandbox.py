@@ -24,7 +24,12 @@ from inspect_ai._util.package import get_package_direct_url
 from inspect_ai._util.trace import trace_message
 from inspect_ai.util import input_screen
 from inspect_ai.util._concurrency import concurrency
-from inspect_ai.util._sandbox._cli import SANDBOX_CLI, SANDBOX_TOOLS_DIR
+from inspect_ai.util._sandbox._cli import (
+    SANDBOX_CLI,
+    SANDBOX_TOOLS_BASE_NAME,
+    SANDBOX_TOOLS_DIR,
+    local_sandbox_tools_dir,
+)
 from inspect_ai.util._sandbox._framework_directory import framework_directory_command
 from inspect_ai.util._sandbox.context import (
     SandboxInjectable,
@@ -34,6 +39,7 @@ from inspect_ai.util._sandbox.environment import (
     SandboxEnvironment,
     SandboxUnavailableError,
 )
+from inspect_ai.util._sandbox.local import LocalSandboxEnvironment
 from inspect_ai.util._sandbox.recon import Architecture, detect_sandbox_os
 
 from ._build_config import (
@@ -120,7 +126,8 @@ async def _inject_container_tools_code_impl(sandbox: SandboxEnvironment) -> None
     async with _open_executable_for_arch(info["architecture"], musl) as (name, f):
         gz_bytes = f.read()  # gzipped tar of the PyInstaller --onedir tree
 
-    if await _tools_dir_exists(sandbox):
+    tools_dir = _sandbox_tools_dir(sandbox)
+    if await _tools_dir_exists(sandbox, tools_dir):
         if await _sandbox_tools_detector(sandbox):
             return
         raise RuntimeError(
@@ -128,13 +135,14 @@ async def _inject_container_tools_code_impl(sandbox: SandboxEnvironment) -> None
             "rather than replacing a potentially active installation"
         )
 
-    install_tmp = f"{SANDBOX_TOOLS_DIR}.install-{os.urandom(16).hex()}"
+    install_tmp = f"{tools_dir}.install-{os.urandom(16).hex()}"
     published = False
+    tools_user: str | None = "root"
     try:
-        if await _create_tools_dir_as_root(sandbox, install_tmp):
-            sandbox._tools_user = "root"
-        else:
-            sandbox._tools_user = None
+        sandbox._tools_user = tools_user
+        if not await _create_tools_dir_as_root(sandbox, install_tmp):
+            tools_user = None
+            sandbox._tools_user = tools_user
             result = await sandbox.exec(framework_directory_command(install_tmp))
             if not result.success:
                 raise RuntimeError(
@@ -142,20 +150,20 @@ async def _inject_container_tools_code_impl(sandbox: SandboxEnvironment) -> None
                 )
 
         await _extract_tools_tree(
-            sandbox, name, gz_bytes, sandbox._tools_user, install_tmp
+            sandbox, name, gz_bytes, tools_user, install_tmp
         )
         if not await _sandbox_cli_is_trusted(
-            sandbox, sandbox._tools_user, tools_dir=install_tmp
+            sandbox, tools_user, tools_dir=install_tmp
         ):
             raise RuntimeError("Injected sandbox tools launcher failed validation")
         result = await sandbox.exec(
-            _publish_tools_command(install_tmp),
-            user=sandbox._tools_user,
+            _publish_tools_command(install_tmp, tools_dir),
+            user=tools_user,
             timeout_retry=False,
         )
         if result.returncode == 17:
             if await _sandbox_tools_detector(sandbox):
-                await _cleanup_paths(sandbox, sandbox._tools_user, install_tmp)
+                await _cleanup_paths(sandbox, tools_user, install_tmp)
                 return
             raise RuntimeError("Concurrent sandbox tools installation is unsafe")
         if not result.success:
@@ -167,19 +175,21 @@ async def _inject_container_tools_code_impl(sandbox: SandboxEnvironment) -> None
         published = True
 
         result = await sandbox.exec(
-            [SANDBOX_CLI, "start-server"], user=sandbox._tools_user
+            [SANDBOX_CLI, "start-server"], user=tools_user
         )
         if not result.success:
             raise RuntimeError(f"Failed to start sandbox tools server: {result.stderr}")
     except BaseException:
         if not published:
-            await _cleanup_paths(sandbox, sandbox._tools_user, install_tmp)
+            await _cleanup_paths(sandbox, tools_user, install_tmp)
         raise
 
 
-def _publish_tools_command(install_tmp: str) -> list[str]:
+def _publish_tools_command(
+    install_tmp: str, tools_dir: str = SANDBOX_TOOLS_DIR
+) -> list[str]:
     """Return a collision-safe, sandbox-scoped publication command."""
-    lock_dir = f"{SANDBOX_TOOLS_DIR}.publish-lock"
+    lock_dir = f"{tools_dir}.publish-lock"
     script = """\
 set -eu
 i=0
@@ -195,7 +205,7 @@ mv -- "$1" "$3"
 target_id=$(stat -c '%d:%i' -- "$3" 2>/dev/null || stat -f '%d:%i' "$3")
 test "$source_id" = "$target_id" || exit 17
 """
-    return ["sh", "-c", script, "sh", install_tmp, lock_dir, SANDBOX_TOOLS_DIR]
+    return ["sh", "-c", script, "sh", install_tmp, lock_dir, tools_dir]
 
 
 async def _create_tools_dir_as_root(
@@ -224,7 +234,9 @@ async def _create_tools_dir_as_root(
     return True
 
 
-async def _tools_dir_exists(sandbox: SandboxEnvironment) -> bool:
+async def _tools_dir_exists(
+    sandbox: SandboxEnvironment, tools_dir: str = SANDBOX_TOOLS_DIR
+) -> bool:
     """Return whether any entry already occupies the install path."""
     return (
         await sandbox.exec(
@@ -233,7 +245,7 @@ async def _tools_dir_exists(sandbox: SandboxEnvironment) -> bool:
                 "-c",
                 'test -e "$1" || test -L "$1"',
                 "sh",
-                SANDBOX_TOOLS_DIR,
+                tools_dir,
             ],
             timeout_retry=False,
         )
@@ -242,7 +254,8 @@ async def _tools_dir_exists(sandbox: SandboxEnvironment) -> bool:
 
 async def _sandbox_tools_detector(sandbox: SandboxEnvironment) -> bool:
     """Authorize reuse and select the identity that owns a trusted install."""
-    command = _sandbox_tools_validation_command()
+    tools_dir = _sandbox_tools_dir(sandbox)
+    command = _sandbox_tools_validation_command(tools_dir)
     for user in (None, "root"):
         try:
             result = await sandbox.exec(command, user=user, timeout_retry=False)
@@ -256,7 +269,9 @@ async def _sandbox_tools_detector(sandbox: SandboxEnvironment) -> bool:
     return False
 
 
-def _sandbox_tools_validation_command() -> list[str]:
+def _sandbox_tools_validation_command(
+    tools_dir: str = SANDBOX_TOOLS_DIR,
+) -> list[str]:
     """Build one command that validates the install root and launcher."""
     script = """\
 set -e
@@ -270,7 +285,8 @@ validate_owned -f "$2"
 test -x "$2"
 id -u
 """
-    return ["sh", "-c", script, "sh", SANDBOX_TOOLS_DIR, SANDBOX_CLI]
+    sandbox_cli = f"{tools_dir}/{SANDBOX_TOOLS_BASE_NAME}"
+    return ["sh", "-c", script, "sh", tools_dir, sandbox_cli]
 
 
 def _sandbox_cli_validation_command() -> list[str]:
@@ -283,7 +299,13 @@ validate_file() {
 }
 """
     checks = ['validate_file "$1"', 'test -x "$1"']
-    command = ["sh", "-c", script, "sh", SANDBOX_CLI]
+    command = [
+        "sh",
+        "-c",
+        script,
+        "sh",
+        f"{SANDBOX_TOOLS_DIR}/{SANDBOX_TOOLS_BASE_NAME}",
+    ]
     command[2] += " &&\n".join(checks) + "\n"
     return command
 
@@ -296,8 +318,15 @@ async def _sandbox_cli_is_trusted(
 ) -> bool:
     """Return whether the existing launcher is safe to execute."""
     command = _sandbox_cli_validation_command()
-    command[4] = f"{tools_dir}{SANDBOX_CLI.removeprefix(SANDBOX_TOOLS_DIR)}"
+    command[4] = f"{tools_dir}/{SANDBOX_TOOLS_BASE_NAME}"
     return (await sandbox.exec(command, user=user)).success
+
+
+def _sandbox_tools_dir(sandbox: SandboxEnvironment) -> str:
+    """Return the install directory, namespaced for host-local sandboxes."""
+    if isinstance(sandbox, LocalSandboxEnvironment):
+        return local_sandbox_tools_dir(os.getuid())
+    return SANDBOX_TOOLS_DIR
 
 
 async def _extract_tools_tree(

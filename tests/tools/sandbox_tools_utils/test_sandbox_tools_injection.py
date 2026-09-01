@@ -17,6 +17,7 @@ from inspect_ai.util._sandbox.environment import (
     SandboxEnvironmentConfigType,
     SandboxUnavailableError,
 )
+from inspect_ai.util._sandbox.local import LocalSandboxEnvironment
 from inspect_ai.util._sandbox.recon import Architecture, SupportedContainerOSInfo
 from inspect_ai.util._subprocess import ExecResult
 
@@ -177,7 +178,9 @@ async def test_injection_accepts_trusted_installation_appearing_late(
     async def fake_detector(_sandbox: SandboxEnvironment) -> bool:
         return next(detector_results)
 
-    async def tools_dir_exists(_sandbox: SandboxEnvironment) -> bool:
+    async def tools_dir_exists(
+        _sandbox: SandboxEnvironment, _tools_dir: str
+    ) -> bool:
         return True
 
     monkeypatch.setattr(sandbox_tools, "detect_sandbox_os", fake_detect_sandbox_os)
@@ -264,6 +267,76 @@ async def test_injection_preserves_sandbox_unavailable_error() -> None:
 
     with pytest.raises(SandboxUnavailableError, match="sandbox stopped"):
         await sandbox_tools._inject_container_tools_code(UnavailableSandbox())
+
+
+def test_local_sandbox_tools_install_is_namespaced_per_os_user() -> None:
+    sandbox = LocalSandboxEnvironment()
+    try:
+        tools_dir = sandbox_tools._sandbox_tools_dir(sandbox)
+    finally:
+        sandbox.directory.cleanup()
+
+    assert tools_dir == f"{sandbox_tools.SANDBOX_TOOLS_DIR}-{os.getuid()}"
+
+
+async def test_cancelled_root_staging_creation_cleans_up_as_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class NoSuperSandbox(RootProbeRaisesSandbox):
+        def __init__(self) -> None:
+            self.exec_calls = []
+
+    sandbox = NoSuperSandbox()
+    creation_started = anyio.Event()
+    cleanup_users: list[str | None] = []
+
+    async def fake_detect_sandbox_os(
+        _sandbox: SandboxEnvironment,
+    ) -> SupportedContainerOSInfo:
+        return {"architecture": "amd64", "libc": "glibc"}
+
+    @asynccontextmanager
+    async def fake_open_executable_for_arch(
+        _arch: Architecture,
+        _musl: bool,
+    ) -> AsyncIterator[tuple[str, BinaryIO]]:
+        yield "inspect-sandbox-tools", BytesIO(b"binary")
+
+    async def fake_tools_dir_exists(
+        _sandbox: SandboxEnvironment, _tools_dir: str
+    ) -> bool:
+        return False
+
+    async def cancelled_root_creation(
+        _sandbox: SandboxEnvironment, _path: str
+    ) -> bool:
+        creation_started.set()
+        await anyio.sleep_forever()
+
+    async def record_cleanup(
+        _sandbox: SandboxEnvironment,
+        user: str | None,
+        *_paths: str,
+        recursive: bool = True,
+    ) -> None:
+        cleanup_users.append(user)
+
+    monkeypatch.setattr(sandbox_tools, "detect_sandbox_os", fake_detect_sandbox_os)
+    monkeypatch.setattr(
+        sandbox_tools, "_open_executable_for_arch", fake_open_executable_for_arch
+    )
+    monkeypatch.setattr(sandbox_tools, "_tools_dir_exists", fake_tools_dir_exists)
+    monkeypatch.setattr(
+        sandbox_tools, "_create_tools_dir_as_root", cancelled_root_creation
+    )
+    monkeypatch.setattr(sandbox_tools, "_cleanup_paths", record_cleanup)
+
+    async with anyio.create_task_group() as task_group:
+        task_group.start_soon(sandbox_tools._inject_container_tools_code_impl, sandbox)
+        await creation_started.wait()
+        task_group.cancel_scope.cancel()
+
+    assert cleanup_users == ["root"]
 
 
 def test_validation_command_rejects_missing_installation(

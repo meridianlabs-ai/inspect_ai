@@ -1,3 +1,4 @@
+import os
 import tempfile
 import warnings
 from logging import getLogger
@@ -7,7 +8,7 @@ from typing import Literal, Union, overload
 from typing_extensions import override
 
 from .._subprocess import ExecResult, subprocess
-from ._cli import SANDBOX_CLI
+from ._cli import SANDBOX_CLI, SANDBOX_TOOLS_BASE_NAME, local_sandbox_tools_dir
 from .environment import (
     SandboxEnvironment,
     SandboxEnvironmentConfigType,
@@ -19,6 +20,9 @@ from .limits import (
 from .registry import sandboxenv
 
 logger = getLogger(__name__)
+
+_LOCAL_SANDBOX_TOOLS_DIR = local_sandbox_tools_dir(os.getuid())
+_LOCAL_SANDBOX_CLI = f"{_LOCAL_SANDBOX_TOOLS_DIR}/{SANDBOX_TOOLS_BASE_NAME}"
 
 
 @sandboxenv(name="local")
@@ -90,16 +94,18 @@ class LocalSandboxEnvironment(SandboxEnvironment):
         if not final_cwd.is_absolute():
             final_cwd = self.directory.name / final_cwd
 
+        final_cmd = cmd
         final_env = env
-        if cmd and cmd[0] == SANDBOX_CLI:
+        if cmd and cmd[0] in {SANDBOX_CLI, _LOCAL_SANDBOX_CLI}:
             self._sandbox_tools_used = True
+            final_cmd = [_LOCAL_SANDBOX_CLI, *cmd[1:]]
             final_env = {
                 **(env or {}),
                 self._SANDBOX_TOOLS_DIR_ENV: str(self._sandbox_tools_dir),
             }
 
         result = await subprocess(
-            args=cmd,
+            args=final_cmd,
             input=input,
             cwd=final_cwd,
             env=final_env,
@@ -112,11 +118,11 @@ class LocalSandboxEnvironment(SandboxEnvironment):
     async def _stop_sandbox_tools(self, *, timeout: int) -> None:
         if not self._sandbox_tools_used or not self._sandbox_tools_dir.exists():
             return
-        if not Path(SANDBOX_CLI).exists():
+        if not Path(_LOCAL_SANDBOX_CLI).exists():
             raise RuntimeError("Cannot stop local sandbox-tools server: CLI is missing")
 
         result = await self.exec(
-            [SANDBOX_CLI, "stop-server"],
+            [_LOCAL_SANDBOX_CLI, "stop-server"],
             cwd="/",
             timeout=timeout,
             timeout_retry=False,

@@ -26,3 +26,15 @@ SANDBOX_TOOLS_BASE_NAME = "inspect-sandbox-tools"
 SANDBOX_TOOLS_DIR = "/var/tmp/.da7be258e003d428"
 
 SANDBOX_CLI = f"{SANDBOX_TOOLS_DIR}/{SANDBOX_TOOLS_BASE_NAME}"
+
+
+def local_sandbox_tools_dir(uid: int) -> str:
+    """Return the host-local tools directory isolated to an OS user.
+
+    Args:
+        uid: Numeric host operating-system user ID.
+
+    Returns:
+        The per-user sandbox tools installation path.
+    """
+    return f"{SANDBOX_TOOLS_DIR}-{uid}"
