@@ -26,7 +26,6 @@ from inspect_ai.util._concurrency import concurrency
 from inspect_ai.util._sandbox._cli import SANDBOX_CLI, SANDBOX_TOOLS_DIR
 from inspect_ai.util._sandbox.context import (
     SandboxInjectable,
-    sandbox_file_detector,
     sandbox_with_injection,
 )
 from inspect_ai.util._sandbox.environment import SandboxEnvironment
@@ -184,6 +183,17 @@ async def _tools_dir_is_verified(sandbox: SandboxEnvironment, user: str | None) 
     return (await sandbox.exec(_ensure_tools_dir_command(), user=user)).success
 
 
+async def _launcher_is_executable(
+    sandbox: SandboxEnvironment, user: str | None
+) -> bool:
+    return (
+        await sandbox.exec(
+            ["sh", "-c", f"test -f {SANDBOX_CLI} && test -x {SANDBOX_CLI}"],
+            user=user,
+        )
+    ).success
+
+
 async def _sandbox_tools_detector(sandbox: SandboxEnvironment) -> bool:
     """Authorize reuse only when both the install root and launcher are trusted."""
     try:
@@ -192,16 +202,14 @@ async def _sandbox_tools_detector(sandbox: SandboxEnvironment) -> bool:
             if not await _tools_dir_is_verified(sandbox, "root"):
                 return False
             sandbox._tools_user = "root"
-            return (
-                await sandbox.exec(["test", "-r", SANDBOX_CLI], user="root")
-            ).success
+            return await _launcher_is_executable(sandbox, "root")
     except Exception:
         pass
 
     if not await _tools_dir_is_verified(sandbox, None):
         return False
     sandbox._tools_user = None
-    return await sandbox_file_detector(SANDBOX_CLI)(sandbox)
+    return await _launcher_is_executable(sandbox, None)
 
 
 async def _extract_tools_tree(
