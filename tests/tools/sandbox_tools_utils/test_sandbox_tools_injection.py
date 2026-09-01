@@ -132,20 +132,19 @@ async def test_stop_installed_tools_server_before_replacement() -> None:
 
     await sandbox_tools._stop_installed_tools_server(sandbox, None)
 
-    assert sandbox.exec_calls == [
+    assert sandbox.exec_calls[:2] == [
         (["test", "-x", sandbox_tools.SANDBOX_CLI], None),
         ([sandbox_tools.SANDBOX_CLI, "stop-server"], None),
-        (
-            [
-                "sh",
-                "-c",
-                'd="/tmp/sandbox-tools"; '
-                'if [ -d "$d" ]; then q="$d.retired.$$"; '
-                'mv -- "$d" "$q" && chmod 700 -- "$q"; fi',
-            ],
-            None,
-        ),
     ]
+    assert len(sandbox.exec_calls) == 3
+    assert sandbox.exec_calls[2][1] is None
+    retirement = sandbox.exec_calls[2][0]
+    assert retirement[:2] == ["sh", "-c"]
+    assert "${INSPECT_SANDBOX_TOOLS_DIR:-/tmp/sandbox-tools}" in retirement[2]
+    assert f"{sandbox_tools.SANDBOX_TOOLS_DIR}-json-rpc-chunks" in retirement[2]
+    assert 'mktemp -d "${d}.retired.XXXXXXXXXX"' in retirement[2]
+    assert "mv -T" in retirement[2]
+    assert "chmod" not in retirement[2]
 
 
 async def test_versionless_tools_without_stop_server_are_preserved() -> None:
@@ -173,6 +172,11 @@ async def test_versionless_tools_without_stop_server_are_preserved() -> None:
     await sandbox_tools._stop_installed_tools_server(sandbox, None)
 
     assert any(
-        cmd[:2] == ["sh", "-c"] and ".legacy.$$" in cmd[2]
+        cmd[:2] == ["sh", "-c"] and ".legacy." in cmd[2]
+        for cmd, _ in sandbox.exec_calls
+    )
+    assert any(
+        cmd[:2] == ["sh", "-c"]
+        and "${INSPECT_SANDBOX_TOOLS_DIR:-/tmp/sandbox-tools}" in cmd[2]
         for cmd, _ in sandbox.exec_calls
     )

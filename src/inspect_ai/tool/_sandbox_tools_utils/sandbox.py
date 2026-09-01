@@ -244,8 +244,9 @@ async def _stop_installed_tools_server(
             [
                 "sh",
                 "-c",
-                f'd={tools_dir}; q="$d.legacy.$$"; '
-                'mv -- "$d" "$q" && mkdir -m 700 -- "$d"',
+                f"d={tools_dir}; "
+                'q=$(mktemp -d "${d}.legacy.XXXXXXXXXX") && '
+                'mv -T -- "$d" "$q/state" && mkdir -m 700 -- "$d"',
             ],
             user=user,
         )
@@ -253,15 +254,22 @@ async def _stop_installed_tools_server(
             raise RuntimeError(
                 f"Failed to preserve legacy sandbox tools: {result.stderr}"
             )
-    # v28 used a 0777 default server directory. Retire the now-stopped directory
-    # so v29 creates trusted state from scratch and cannot reuse poisoned entries.
+    # v28 used a 0777 server directory and could create the shared chunk root as
+    # an unprivileged user. Retire both so v29 cannot reuse poisoned state. The
+    # server path is environment-scoped by LocalSandbox, so resolve it in the
+    # sandbox process just as the CLI does.
+    chunk_dir = shlex.quote(f"{SANDBOX_TOOLS_DIR}-json-rpc-chunks")
     result = await sandbox.exec(
         [
             "sh",
             "-c",
-            'd="/tmp/sandbox-tools"; '
-            'if [ -d "$d" ]; then q="$d.retired.$$"; '
-            'mv -- "$d" "$q" && chmod 700 -- "$q"; fi',
+            'server_dir="${INSPECT_SANDBOX_TOOLS_DIR:-/tmp/sandbox-tools}"; '
+            f"chunk_dir={chunk_dir}; "
+            'for d in "$server_dir" "$chunk_dir"; do '
+            'if [ -e "$d" ] || [ -L "$d" ]; then '
+            'q=$(mktemp -d "${d}.retired.XXXXXXXXXX") && '
+            'mv -T -- "$d" "$q/state" && rm -rf -- "$q" || exit; '
+            "fi; done",
         ],
         user=user,
     )
