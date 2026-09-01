@@ -243,7 +243,7 @@ async def _tools_dir_exists(sandbox: SandboxEnvironment) -> bool:
 async def _sandbox_tools_detector(sandbox: SandboxEnvironment) -> bool:
     """Authorize reuse and select the identity that owns a trusted install."""
     command = _sandbox_tools_validation_command()
-    for user in ("root", None):
+    for user in (None, "root"):
         try:
             result = await sandbox.exec(command, user=user, timeout_retry=False)
         except SandboxUnavailableError:
@@ -251,7 +251,7 @@ async def _sandbox_tools_detector(sandbox: SandboxEnvironment) -> bool:
         except Exception:
             continue
         if result.success:
-            sandbox._tools_user = "root" if result.stdout.strip() == "0" else None
+            sandbox._tools_user = user
             return True
     return False
 

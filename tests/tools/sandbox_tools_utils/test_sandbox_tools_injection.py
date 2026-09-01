@@ -192,7 +192,7 @@ async def test_injection_accepts_trusted_installation_appearing_late(
     assert all(command != ["id", "-u"] for command, _ in sandbox.exec_calls)
 
 
-async def test_detector_validates_root_installation_in_one_exec() -> None:
+async def test_detector_preserves_successful_default_root_identity() -> None:
     class TrustedRootSandbox(RootProbeRaisesSandbox):
         async def exec(
             self,
@@ -211,11 +211,40 @@ async def test_detector_validates_root_installation_in_one_exec() -> None:
     sandbox = TrustedRootSandbox()
 
     assert await sandbox_tools._sandbox_tools_detector(sandbox)
-    assert sandbox._tools_user == "root"
+    assert sandbox._tools_user is None
     assert len(sandbox.exec_calls) == 1
     command, user = sandbox.exec_calls[0]
-    assert user == "root"
+    assert user is None
     assert "validate_owned()" in command[2]
+
+
+async def test_detector_uses_explicit_root_only_after_default_fails() -> None:
+    class ExplicitRootSandbox(RootProbeRaisesSandbox):
+        async def exec(
+            self,
+            cmd: list[str],
+            input: str | bytes | None = None,
+            cwd: str | None = None,
+            env: dict[str, str] | None = None,
+            user: str | None = None,
+            timeout: int | None = None,
+            timeout_retry: bool = True,
+            concurrency: bool = True,
+        ) -> ExecResult[str]:
+            self.exec_calls.append((cmd, user))
+            success = user == "root"
+            return ExecResult(
+                success=success,
+                returncode=0 if success else 1,
+                stdout="0\n" if success else "",
+                stderr="",
+            )
+
+    sandbox = ExplicitRootSandbox()
+
+    assert await sandbox_tools._sandbox_tools_detector(sandbox)
+    assert sandbox._tools_user == "root"
+    assert [user for _, user in sandbox.exec_calls] == [None, "root"]
 
 
 async def test_injection_preserves_sandbox_unavailable_error() -> None:
