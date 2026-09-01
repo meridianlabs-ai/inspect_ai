@@ -412,8 +412,10 @@ def test_publish_command_recovers_stale_lock(tmp_path: os.PathLike[str]) -> None
     lock = os.path.join(base, "lock")
     os.mkdir(staging)
     os.mkdir(lock)
+    os.chmod(lock, 0o700)
     with open(os.path.join(lock, "owner"), "w") as owner:
         owner.write("999999999\n")
+    os.chmod(os.path.join(lock, "owner"), 0o600)
     command = sandbox_tools._publish_tools_command(staging)
     command[5] = lock
     command[6] = destination
@@ -423,6 +425,55 @@ def test_publish_command_recovers_stale_lock(tmp_path: os.PathLike[str]) -> None
     assert result.returncode == 0
     assert os.path.isdir(destination)
     assert not os.path.exists(lock)
+
+
+def test_publish_command_rejects_lock_symlink_without_deleting_target(
+    tmp_path: os.PathLike[str],
+) -> None:
+    base = os.fspath(tmp_path)
+    staging = os.path.join(base, "staging")
+    destination = os.path.join(base, "tools")
+    lock_target = os.path.join(base, "lock-target")
+    lock = os.path.join(base, "lock")
+    owner_file = os.path.join(lock_target, "owner")
+    os.mkdir(staging)
+    os.mkdir(lock_target)
+    with open(owner_file, "w") as owner:
+        owner.write("999999999\n")
+    os.symlink(lock_target, lock)
+    command = sandbox_tools._publish_tools_command(staging)
+    command[5] = lock
+    command[6] = destination
+
+    result = subprocess.run(command, check=False, capture_output=True, text=True)
+
+    assert result.returncode == 18
+    assert os.path.isfile(owner_file)
+    assert not os.path.exists(destination)
+
+
+def test_publish_command_rejects_malformed_lock_without_retrying(
+    tmp_path: os.PathLike[str],
+) -> None:
+    base = os.fspath(tmp_path)
+    staging = os.path.join(base, "staging")
+    destination = os.path.join(base, "tools")
+    lock = os.path.join(base, "lock")
+    os.mkdir(staging)
+    os.mkdir(lock)
+    os.chmod(lock, 0o700)
+    with open(os.path.join(lock, "unexpected"), "w") as unexpected:
+        unexpected.write("content")
+    command = sandbox_tools._publish_tools_command(staging)
+    command[5] = lock
+    command[6] = destination
+
+    result = subprocess.run(
+        command, check=False, capture_output=True, text=True, timeout=2
+    )
+
+    assert result.returncode == 18
+    assert not os.path.exists(destination)
 
 
 def test_publish_command_cancellation_releases_lock(

@@ -192,27 +192,46 @@ def _publish_tools_command(
     script = """\
 set -eu
 lock_dir=$2
+owner_file=$lock_dir/owner
+lock_uid=$(id -u)
 cleanup_lock() {
-    rm -f -- "$lock_dir/owner"
+    rm -f -- "$owner_file"
     rmdir -- "$lock_dir" 2>/dev/null || true
+}
+path_attributes() {
+    stat -c '%u:%a' -- "$1" 2>/dev/null || stat -f '%u:%Lp' "$1"
+}
+safe_lock_dir() {
+    test ! -L "$lock_dir" && test -d "$lock_dir" &&
+        test "$(path_attributes "$lock_dir")" = "$lock_uid:700"
+}
+safe_owner_file() {
+    test ! -L "$owner_file" && test -f "$owner_file" &&
+        test "$(path_attributes "$owner_file")" = "$lock_uid:600"
 }
 i=0
 while ! mkdir -m 700 -- "$2" 2>/dev/null; do
-    owner=$(cat -- "$2/owner" 2>/dev/null || true)
-    if test -n "$owner" && ! kill -0 "$owner" 2>/dev/null; then
-        rm -f -- "$2/owner"
-        rmdir -- "$2" 2>/dev/null || true
-        continue
-    fi
     i=$((i + 1))
-    if test -z "$owner" && test "$i" -ge 10; then
-        rmdir -- "$2" 2>/dev/null || true
+    test "$i" -lt 100 || exit 18
+    safe_lock_dir || exit 18
+    if safe_owner_file; then
+        owner=$(cat -- "$owner_file")
+        case "$owner" in ''|*[!0-9]*) exit 18;; esac
+        if ! kill -0 "$owner" 2>/dev/null; then
+            rm -f -- "$owner_file"
+            rmdir -- "$lock_dir" 2>/dev/null || exit 18
+            continue
+        fi
+    elif test -e "$owner_file" || test -L "$owner_file"; then
+        exit 18
+    elif test "$i" -ge 10; then
+        rmdir -- "$lock_dir" 2>/dev/null || exit 18
         continue
     fi
-    test "$i" -lt 100 || exit 18
     sleep .1
 done
-printf '%s\n' "$$" > "$2/owner"
+printf '%s\n' "$$" > "$owner_file"
+chmod 600 -- "$owner_file"
 trap cleanup_lock EXIT
 trap 'cleanup_lock; exit 129' HUP
 trap 'cleanup_lock; exit 130' INT
