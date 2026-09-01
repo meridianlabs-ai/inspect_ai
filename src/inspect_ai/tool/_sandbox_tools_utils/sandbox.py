@@ -236,9 +236,7 @@ async def _sandbox_cli_is_trusted(
     sandbox: SandboxEnvironment, user: str | None
 ) -> bool:
     """Return whether the existing launcher is safe to execute."""
-    return (
-        await sandbox.exec(_sandbox_cli_validation_command(), user=user)
-    ).success
+    return (await sandbox.exec(_sandbox_cli_validation_command(), user=user)).success
 
 
 async def _extract_tools_tree(
