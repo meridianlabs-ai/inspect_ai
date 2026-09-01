@@ -300,6 +300,7 @@ async def test_ensure_service_dir_rootless_requires_default_user() -> None:
         results=[
             FakeExecResult(success=False, returncode=1),  # root parent setup
             FakeExecResult(success=False, returncode=1),  # root probe
+            FakeExecResult(success=False, returncode=1),  # root-owned parent check
             FakeExecResult(stdout="1000\n"),  # default UID
             FakeExecResult(stdout="1001\n"),  # requested service UID
         ]
@@ -320,8 +321,6 @@ async def test_ensure_service_dir_rootless_accepts_root_owned_parent() -> None:
         results=[
             FakeExecResult(success=False, returncode=1),  # root parent setup
             FakeExecResult(success=False, returncode=1),  # root probe
-            FakeExecResult(stdout="1000\n"),  # default UID
-            FakeExecResult(stdout="1000\n"),  # service UID
             FakeExecResult(),  # root-owned parent verification
             FakeExecResult(),  # service directory creation
             FakeExecResult(),  # service directory ownership
@@ -335,10 +334,32 @@ async def test_ensure_service_dir_rootless_accepts_root_owned_parent() -> None:
 
     await service._ensure_service_dir()
 
-    parent_command = fake.calls[4]["cmd"]
+    parent_command = fake.calls[2]["cmd"]
     assert parent_command[:2] == ["sh", "-c"]
     assert f'stat -c %u -- {SERVICES_DIR})" = 0' in parent_command[2]
     assert f'stat -c %a -- {SERVICES_DIR})" = 1777' in parent_command[2]
+
+
+async def test_ensure_service_dir_rootless_safe_parent_allows_alternate_user() -> None:
+    """A safe shared parent permits a service identity unlike the default UID."""
+    fake = FakeSandboxEnvironment(
+        results=[
+            FakeExecResult(success=False, returncode=1),  # root parent setup
+            FakeExecResult(success=False, returncode=1),  # root probe
+            FakeExecResult(),  # root-owned parent verification
+            FakeExecResult(),  # service directory creation
+            FakeExecResult(),  # service directory ownership
+        ]
+    )
+    service = SandboxService(
+        name="alternate_user",
+        sandbox=cast(SandboxEnvironment, fake),
+        user="agent",
+    )
+
+    await service._ensure_service_dir()
+
+    assert all(call["cmd"] != ["id", "-u"] for call in fake.calls[2:])
 
 
 async def test_ensure_service_dir_checks_root_service_dir_when_instance_set() -> None:

@@ -120,16 +120,6 @@ def test_json_rpc_response_chunks_use_private_uid_directory(
     assert stat.S_IMODE(user_dir.stat().st_mode) == 0o700
     assert chunk_path.is_file()
 
-    monkeypatch.setattr(chunking.os, "getuid", lambda: 0)
-    root_continuation = handle_json_rpc_response_chunk_request(
-        {
-            "id": 2,
-            "params": {"handle": chunk["handle"], "offset": chunk["next_offset"]},
-        },
-        512,
-    )
-
-    assert _chunk_metadata(root_continuation)["offset"] == chunk["next_offset"]
     handle_json_rpc_response_chunk_request(
         {"id": 3, "params": {"handle": chunk["handle"], "release": True}},
         512,
@@ -292,14 +282,10 @@ def _chunk_metadata(response: str) -> dict[str, Any]:
     return cast(dict[str, Any], payload[JSON_RPC_RESPONSE_CHUNK_FIELD])
 
 
-def test_chunk_dir_accepts_agent_owned_dir_when_running_as_root(
+def test_chunk_dir_rejects_agent_owned_dir_when_running_as_root(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A tool call exec'd with `user=` can be the first to create the chunk dir.
-
-    A later tool call running as root must still work; otherwise a single
-    agent-user exec permanently breaks every subsequent root tool call.
-    """
+    """Root cannot use a chunk parent replaceable by an untrusted owner."""
     chunking._CHUNK_DIR.mkdir(mode=0o1733)
     stat_values = list(chunking._CHUNK_DIR.lstat())
     stat_values[0] = stat.S_IFDIR | 0o1733
@@ -309,7 +295,8 @@ def test_chunk_dir_accepts_agent_owned_dir_when_running_as_root(
     monkeypatch.setattr(chunking.os, "fstat", lambda _fd: agent_owned)
     monkeypatch.setattr(chunking.os, "getuid", lambda: 0)
 
-    chunking.ensure_json_rpc_response_chunk_dir()
+    with pytest.raises(RuntimeError, match="unexpected owner"):
+        chunking.ensure_json_rpc_response_chunk_dir()
 
 
 def test_chunk_dir_chmod_does_not_follow_a_swapped_symlink(

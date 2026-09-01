@@ -28,20 +28,27 @@ async def install_human_agent(
 
     # Root owns new installations until setup is complete. Existing non-root
     # installations are verified as their configured owner and remain reusable.
-    install_result = await sandbox().exec(
-        framework_directory_command(
-            HUMAN_AGENT_DIR, report_creation=True, repair_mode=True
-        ),
-        user="root",
+    root_directory_command = framework_directory_command(
+        HUMAN_AGENT_DIR, report_creation=True, repair_mode=True
     )
-    if not install_result.success and user != "root":
+    root_directory_command[2] = (
+        'test "$(id -u)" = 0 && ' + root_directory_command[2]
+    )
+    try:
+        install_result = await sandbox().exec(
+            root_directory_command,
+            user="root",
+        )
+    except Exception:
+        install_result = None
+    if (install_result is None or not install_result.success) and user != "root":
         install_result = await sandbox().exec(
             framework_directory_command(
                 HUMAN_AGENT_DIR, report_creation=True, repair_mode=True
             ),
             user=user,
         )
-    if not install_result.success:
+    if install_result is None or not install_result.success:
         raise RuntimeError(f"Unsafe human-agent directory: {HUMAN_AGENT_DIR}")
     if install_result.stdout.strip() == "existing":
         return

@@ -66,7 +66,11 @@ def ensure_json_rpc_response_chunk_dir() -> None:
     try:
         chunk_dir_stat = os.fstat(dir_fd)
         current_uid = os.getuid()
-        if chunk_dir_stat.st_uid not in (0, current_uid) and current_uid != 0:
+        if current_uid == 0 and chunk_dir_stat.st_uid != 0:
+            raise RuntimeError(
+                f"JSON-RPC response chunk directory has unexpected owner: {_CHUNK_DIR}"
+            )
+        if current_uid != 0 and chunk_dir_stat.st_uid not in (0, current_uid):
             raise RuntimeError(
                 f"JSON-RPC response chunk directory has unexpected owner: {_CHUNK_DIR}"
             )
@@ -75,7 +79,7 @@ def ensure_json_rpc_response_chunk_dir() -> None:
         # and absent read bit prevent deletion and enumeration of another
         # identity's entries.
         required_mode = 0o1733
-        if chunk_dir_stat.st_uid == current_uid or current_uid == 0:
+        if chunk_dir_stat.st_uid == current_uid:
             os.fchmod(dir_fd, required_mode)
         elif stat.S_IMODE(chunk_dir_stat.st_mode) != required_mode:
             raise RuntimeError(

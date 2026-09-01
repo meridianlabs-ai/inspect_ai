@@ -25,6 +25,7 @@ from inspect_ai._util.trace import trace_message
 from inspect_ai.util import input_screen
 from inspect_ai.util._concurrency import concurrency
 from inspect_ai.util._sandbox._cli import SANDBOX_CLI, SANDBOX_TOOLS_DIR
+from inspect_ai.util._sandbox._framework_directory import framework_directory_command
 from inspect_ai.util._sandbox.context import (
     SandboxInjectable,
     sandbox_file_detector,
@@ -164,23 +165,8 @@ async def _create_tools_dir_as_root(sandbox: SandboxEnvironment) -> bool:
 
 
 def _ensure_tools_dir_command() -> list[str]:
-    """Return the bootstrap adapter for the framework-directory contract.
-
-    ``mkdir`` binds creation atomically. An existing entry is only adopted when
-    it is a non-symlink directory owned by the effective UID with exact mode
-    0700. Under sticky ``/var/tmp``, an unprivileged user cannot replace a
-    root-owned entry after this verification.
-    """
-    script = (
-        "umask 077; "
-        f"mkdir -m 700 -- {SANDBOX_TOOLS_DIR} 2>/dev/null || "
-        f"{{ test -d {SANDBOX_TOOLS_DIR} && test ! -L {SANDBOX_TOOLS_DIR} && "
-        f'test "$(stat -c %u -- {SANDBOX_TOOLS_DIR})" = "$(id -u)" && '
-        f'mode="$(stat -c %a -- {SANDBOX_TOOLS_DIR})" && '
-        f'case "$mode" in *[2367][0-7]|*[0-7][2367]) false;; '
-        f"esac && chmod 700 -- {SANDBOX_TOOLS_DIR}; }}"
-    )
-    return ["sh", "-c", script]
+    """Return the shared framework-directory bootstrap command."""
+    return framework_directory_command(SANDBOX_TOOLS_DIR, repair_mode=True)
 
 
 async def _tools_dir_is_verified(sandbox: SandboxEnvironment, user: str | None) -> bool:

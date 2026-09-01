@@ -72,6 +72,7 @@ def human_cli(
                         answer,
                         intermediate_scoring,
                         record_session,
+                        user,
                         instructions,
                     )
 

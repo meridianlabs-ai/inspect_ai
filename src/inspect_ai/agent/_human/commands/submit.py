@@ -17,9 +17,10 @@ logger = getLogger(__name__)
 
 
 class SessionEndCommand(HumanAgentCommand):
-    def __init__(self, record_session: bool):
+    def __init__(self, record_session: bool, user: str | None = None) -> None:
         super().__init__()
         self._record_session = record_session
+        self._user = user
 
     @property
     def group(self) -> Literal[1, 2, 3]:
@@ -28,7 +29,9 @@ class SessionEndCommand(HumanAgentCommand):
     async def _read_session_logs(self) -> dict[str, str]:
         # retreive session logs (don't fail)
         sessions_dir = PurePosixPath(RECORD_SESSION_DIR)
-        result = await sandbox().exec(["ls", "-1", sessions_dir.as_posix()])
+        result = await sandbox().exec(
+            ["ls", "-1", sessions_dir.as_posix()], user=self._user
+        )
         if not result.success:
             logger.warning(f"Error listing human agent session logs: {result.stderr}")
             return {}
@@ -37,9 +40,13 @@ class SessionEndCommand(HumanAgentCommand):
         session_logs: dict[str, str] = {}
         for session_log in result.stdout.strip().splitlines():
             try:
-                session_logs[session_log] = await sandbox().read_file(
-                    (sessions_dir / session_log).as_posix()
+                log_result = await sandbox().exec(
+                    ["cat", "--", (sessions_dir / session_log).as_posix()],
+                    user=self._user,
                 )
+                if not log_result.success:
+                    raise RuntimeError(log_result.stderr)
+                session_logs[session_log] = log_result.stdout
             except Exception as ex:
                 logger.warning(f"Error reading human agent session log: {ex}")
 

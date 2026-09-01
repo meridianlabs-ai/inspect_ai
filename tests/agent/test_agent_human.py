@@ -41,6 +41,50 @@ async def test_install_human_agent_repairs_legacy_root_mode(
     assert "chmod 700" in command[2]
 
 
+async def test_install_human_agent_falls_back_when_root_exec_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rootless provider may raise while probing the root installation."""
+    calls: list[str | None] = []
+
+    class FakeSandbox:
+        async def exec(
+            self, cmd: list[str], *, user: str | None = None, **kwargs: object
+        ) -> ExecResult[str]:
+            calls.append(user)
+            if user == "root":
+                raise PermissionError("root execution unavailable")
+            return ExecResult(True, 0, "existing\n", "")
+
+    monkeypatch.setattr(install, "sandbox", lambda: FakeSandbox())
+
+    await install.install_human_agent("agent", [], None, False)
+
+    assert calls == ["root", "agent"]
+
+
+async def test_session_logs_are_read_as_configured_user(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Private recordings are listed and read through their owning identity."""
+    calls: list[tuple[list[str], str | None]] = []
+
+    class FakeSandbox:
+        async def exec(
+            self, cmd: list[str], *, user: str | None = None, **kwargs: object
+        ) -> ExecResult[str]:
+            calls.append((cmd, user))
+            stdout = "session.log\n" if cmd[0] == "ls" else "recording"
+            return ExecResult(True, 0, stdout, "")
+
+    monkeypatch.setattr(submit, "sandbox", lambda: FakeSandbox())
+
+    logs = await SubmitCommand(True, "alice")._read_session_logs()
+
+    assert logs == {"session.log": "recording"}
+    assert [user for _, user in calls] == ["alice", "alice"]
+
+
 async def test_checked_write_file_runs_as_owner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

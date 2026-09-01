@@ -575,9 +575,11 @@ class SandboxService:
         command = framework_directory_command(
             SERVICES_DIR, mode=int(SERVICES_DIR_MODE, 8), repair_mode=True
         )
+        root_command = command.copy()
+        root_command[2] = 'test "$(id -u)" = 0 && ' + root_command[2]
         try:
             parent_result = await self._sandbox.exec(
-                command,
+                root_command,
                 user="root",
                 timeout=600,
                 concurrency=False,
@@ -608,31 +610,35 @@ class SandboxService:
                     f"Shared sandbox services directory '{SERVICES_DIR}' is unsafe: "
                     "it must be owned by root with mode 1777."
                 )
-            default_uid = await self._sandbox.exec(
-                ["id", "-u"], timeout=600, concurrency=False
-            )
-            service_uid = await self._exec(["id", "-u"])
-            if (
-                not default_uid.success
-                or not service_uid.success
-                or default_uid.stdout.strip() != service_uid.stdout.strip()
-            ):
-                user = self._user or "the sandbox default user"
-                raise PrerequisiteError(
-                    f"Sandbox service '{self._name}' cannot run as user '{user}' "
-                    "because root user switching is unavailable."
-                )
-            rootless_command = [
+            root_owned_parent_command = [
                 "sh",
                 "-c",
                 f"if test -d {SERVICES_DIR} && test ! -L {SERVICES_DIR} && "
                 f'test "$(stat -c %u -- {SERVICES_DIR})" = 0 && '
                 f'test "$(stat -c %a -- {SERVICES_DIR})" = {SERVICES_DIR_MODE}; '
-                f"then :; else {command[2]}; fi",
+                "then :; else false; fi",
             ]
             parent_result = await self._sandbox.exec(
-                rootless_command, timeout=600, concurrency=False
+                root_owned_parent_command, timeout=600, concurrency=False
             )
+            if not parent_result.success:
+                default_uid = await self._sandbox.exec(
+                    ["id", "-u"], timeout=600, concurrency=False
+                )
+                service_uid = await self._exec(["id", "-u"])
+                if (
+                    not default_uid.success
+                    or not service_uid.success
+                    or default_uid.stdout.strip() != service_uid.stdout.strip()
+                ):
+                    user = self._user or "the sandbox default user"
+                    raise PrerequisiteError(
+                        f"Sandbox service '{self._name}' cannot run as user '{user}' "
+                        "because root user switching is unavailable."
+                    )
+                parent_result = await self._sandbox.exec(
+                    command, timeout=600, concurrency=False
+                )
         if not parent_result.success:
             raise PrerequisiteError(
                 f"Shared sandbox services directory '{SERVICES_DIR}' is unsafe: "
