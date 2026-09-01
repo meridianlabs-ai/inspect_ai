@@ -1,8 +1,5 @@
-import base64
 import gzip
-import hashlib
 import os
-import secrets
 import subprocess
 import sys
 import tempfile
@@ -47,8 +44,6 @@ logger = getLogger(__name__)
 
 
 TRACE_SANDBOX_TOOLS = "Sandbox Tools"
-_SANDBOX_TOOLS_GENERATION = f"{SANDBOX_TOOLS_DIR}/.generation"
-_SANDBOX_TOOLS_INSTALL_LOCK = f"{SANDBOX_TOOLS_DIR}.install-lock"
 
 
 class SandboxInjectionError(Exception):
@@ -108,7 +103,8 @@ async def _inject_container_tools_code(sandbox: SandboxEnvironment) -> None:
 
         async with _open_executable_for_arch(info["architecture"], musl) as (name, f):
             gz_bytes = f.read()  # gzipped tar of the PyInstaller --onedir tree
-        artifact_identity = _artifact_identity(name, gz_bytes)
+
+        tools_dir_existed = await _tools_dir_exists(sandbox)
 
         # Create and verify the install dir as root if possible; fall
         # back to the default user for rootless sandboxes (where user-switching will
@@ -124,43 +120,21 @@ async def _inject_container_tools_code(sandbox: SandboxEnvironment) -> None:
                     f"Failed to create or verify sandbox tools dir: {result.stderr}"
                 )
 
-        lock_token = await _acquire_install_lock(sandbox, sandbox._tools_user)
-        try:
-            if not await _sandbox_cli_is_valid(
-                sandbox, sandbox._tools_user, artifact_identity
-            ):
-                if await _sandbox_cli_is_trusted(sandbox, sandbox._tools_user):
-                    result = await sandbox.exec(
-                        [SANDBOX_CLI, "stop-server"], user=sandbox._tools_user
-                    )
-                    if not result.success:
-                        raise RuntimeError(
-                            "Failed to stop obsolete sandbox tools server: "
-                            f"{result.stderr}"
-                        )
-
-                await _clear_tools_dir(sandbox, sandbox._tools_user)
-                await _extract_tools_tree(sandbox, name, gz_bytes, sandbox._tools_user)
-                await _write_tools_generation(
-                    sandbox, sandbox._tools_user, artifact_identity
-                )
-
-                if not await _tools_dir_is_verified(sandbox, sandbox._tools_user):
-                    raise RuntimeError(
-                        "Sandbox tools directory changed during extraction"
-                    )
-
-            # Starting while holding the install lock prevents another process
-            # from replacing the launcher between validation and daemon startup.
-            result = await sandbox.exec(
-                [SANDBOX_CLI, "start-server"], user=sandbox._tools_user
+        if tools_dir_existed:
+            raise RuntimeError(
+                "Existing sandbox tools installation is unsafe; recreate the sandbox "
+                "rather than replacing a potentially active installation"
             )
-            if not result.success:
-                raise RuntimeError(
-                    f"Failed to start sandbox tools server: {result.stderr}"
-                )
-        finally:
-            await _release_install_lock(sandbox, sandbox._tools_user, lock_token)
+
+        await _extract_tools_tree(sandbox, name, gz_bytes, sandbox._tools_user)
+        if not await _sandbox_cli_is_trusted(sandbox, sandbox._tools_user):
+            raise RuntimeError("Injected sandbox tools launcher failed validation")
+
+        result = await sandbox.exec(
+            [SANDBOX_CLI, "start-server"], user=sandbox._tools_user
+        )
+        if not result.success:
+            raise RuntimeError(f"Failed to start sandbox tools server: {result.stderr}")
     except Exception as e:
         raise SandboxInjectionError(
             f"Failed to inject sandbox tools into sandbox: {e}", cause=e
@@ -196,118 +170,55 @@ def _ensure_tools_dir_command() -> list[str]:
     return framework_directory_command(SANDBOX_TOOLS_DIR)
 
 
+async def _tools_dir_exists(sandbox: SandboxEnvironment) -> bool:
+    """Return whether any entry already occupies the install path."""
+    return (
+        await sandbox.exec(
+            [
+                "sh",
+                "-c",
+                'test -e "$1" || test -L "$1"',
+                "sh",
+                SANDBOX_TOOLS_DIR,
+            ],
+            timeout_retry=False,
+        )
+    ).success
+
+
 async def _tools_dir_is_verified(sandbox: SandboxEnvironment, user: str | None) -> bool:
-    return (await sandbox.exec(_ensure_tools_dir_command(), user=user)).success
-
-
-async def _clear_tools_dir(sandbox: SandboxEnvironment, user: str | None) -> None:
-    """Remove an obsolete install only after its directory has been secured."""
-    result = await sandbox.exec(
-        [
-            "sh",
-            "-c",
-            'find "$1" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +',
-            "sh",
-            SANDBOX_TOOLS_DIR,
-        ],
-        user=user,
-    )
-    if not result.success:
-        raise RuntimeError(f"Failed to clear obsolete sandbox tools: {result.stderr}")
-
-
-async def _acquire_install_lock(
-    sandbox: SandboxEnvironment, user: str | None
-) -> str:
-    """Acquire a cross-process lock in the target filesystem."""
-    token = secrets.token_hex(16)
     script = """\
-while ! (umask 077 && mkdir -- "$1" 2>/dev/null); do
-    find "$1" -maxdepth 0 -mmin +10 -exec rm -rf -- {} + 2>/dev/null || true
-    sleep 1
-done
-printf '%s\\n' "$2" > "$1/token"
+test -d "$1" && test ! -L "$1" || exit 1
+set -- $(stat -c '%u %a' -- "$1" 2>/dev/null || stat -f '%u %Lp' "$1" 2>/dev/null) || exit 1
+test "$1" = "$(id -u)" && test $((0$2 & 022)) -eq 0
 """
-    result = await sandbox.exec(
-        ["sh", "-c", script, "sh", _SANDBOX_TOOLS_INSTALL_LOCK, token],
-        user=user,
-        timeout=600,
-    )
-    if not result.success:
-        raise RuntimeError(
-            f"Failed to acquire sandbox tools install lock: {result.stderr}"
+    return (
+        await sandbox.exec(
+            ["sh", "-c", script, "sh", SANDBOX_TOOLS_DIR], user=user
         )
-    return token
-
-
-async def _release_install_lock(
-    sandbox: SandboxEnvironment, user: str | None, token: str
-) -> None:
-    """Release the install lock only when it is still owned by this installer."""
-    result = await sandbox.exec(
-        [
-            "sh",
-            "-c",
-            'test "$(cat "$1/token" 2>/dev/null)" = "$2" && rm -rf -- "$1"',
-            "sh",
-            _SANDBOX_TOOLS_INSTALL_LOCK,
-            token,
-        ],
-        user=user,
-    )
-    if not result.success:
-        raise RuntimeError("Sandbox tools install lock ownership changed")
-
-
-async def _write_tools_generation(
-    sandbox: SandboxEnvironment, user: str | None, artifact_identity: str
-) -> None:
-    """Record the installed artifact generation in a protected regular file."""
-    result = await sandbox.exec(
-        [
-            "sh",
-            "-c",
-            'umask 077; printf "%s\\n" "$2" > "$1"',
-            "sh",
-            _SANDBOX_TOOLS_GENERATION,
-            artifact_identity,
-        ],
-        user=user,
-    )
-    if not result.success:
-        raise RuntimeError(
-            f"Failed to record sandbox tools generation: {result.stderr}"
-        )
+    ).success
 
 
 async def _sandbox_tools_detector(sandbox: SandboxEnvironment) -> bool:
     """Authorize reuse only when both the install root and launcher are trusted."""
-    info = await detect_sandbox_os(sandbox)
-    async with _open_executable_for_arch(
-        info["architecture"], info.get("libc") == "musl"
-    ) as (name, artifact):
-        artifact_identity = _artifact_identity(name, artifact.read())
-
     try:
         probe = await sandbox.exec(["id", "-u"], user="root")
         if probe.success and probe.stdout.strip() == "0":
             if not await _tools_dir_is_verified(sandbox, "root"):
                 return False
             sandbox._tools_user = "root"
-            return await _sandbox_cli_is_valid(sandbox, "root", artifact_identity)
+            return await _sandbox_cli_is_trusted(sandbox, "root")
     except Exception:
         pass
 
     if not await _tools_dir_is_verified(sandbox, None):
         return False
     sandbox._tools_user = None
-    return await _sandbox_cli_is_valid(sandbox, None, artifact_identity)
+    return await _sandbox_cli_is_trusted(sandbox, None)
 
 
-def _sandbox_cli_validation_command(
-    artifact_identity: str | None = None,
-) -> list[str]:
-    """Build the command that validates an installed launcher and marker."""
+def _sandbox_cli_validation_command() -> list[str]:
+    """Build the command that validates an installed launcher."""
     script = """\
 validate_file() {
     test -f "$1" && test ! -L "$1" || return 1
@@ -317,9 +228,6 @@ validate_file() {
 """
     checks = ['validate_file "$1"', 'test -x "$1"']
     command = ["sh", "-c", script, "sh", SANDBOX_CLI]
-    if artifact_identity is not None:
-        checks.extend(['validate_file "$2"', 'test "$(cat "$2")" = "$3"'])
-        command.extend([_SANDBOX_TOOLS_GENERATION, artifact_identity])
     command[2] += " &&\n".join(checks) + "\n"
     return command
 
@@ -333,41 +241,28 @@ async def _sandbox_cli_is_trusted(
     ).success
 
 
-async def _sandbox_cli_is_valid(
-    sandbox: SandboxEnvironment, user: str | None, artifact_identity: str
-) -> bool:
-    """Return whether the launcher and artifact generation are trusted."""
-    return (
-        await sandbox.exec(
-            _sandbox_cli_validation_command(artifact_identity), user=user
-        )
-    ).success
-
-
-def _artifact_identity(name: str, gz_bytes: bytes) -> str:
-    """Return an identity that changes for every distinct injected artifact."""
-    return f"{name} sha256:{hashlib.sha256(gz_bytes).hexdigest()}"
-
-
 async def _extract_tools_tree(
     sandbox: SandboxEnvironment, name: str, gz_bytes: bytes, user: str | None
 ) -> None:
     """Extract the gzipped onedir tar into SANDBOX_TOOLS_DIR.
 
-    The artifact is streamed as base64 to a file inside the verified install tree,
-    using the extraction identity. Raw binary stdin through exec is not safe.
+    The provider stages the artifact at a unique path outside the protected install
+    tree. The extraction identity then reads it into the tree.
 
     Optimistic path: ship the compressed artifact and extract with `tar xzf`. If the
     container's `tar` lacks gzip support, fall back to injecting an uncompressed tar,
     which only needs plain `tar xf` (the broadest assumption). The uncompressed tar is
     cached in the binaries dir so we decompress at most once per artifact.
     """
-    gz_tmp = f"{SANDBOX_TOOLS_DIR}/.pkg.tgz"
-    await _write_archive(sandbox, gz_tmp, gz_bytes, user)
-    result = await sandbox.exec(
-        ["tar", "xzf", gz_tmp, "-C", SANDBOX_TOOLS_DIR], user=user
-    )
-    await sandbox.exec(["rm", "-f", gz_tmp], user=user)
+    staging_id = os.urandom(16).hex()
+    gz_tmp = f"/var/tmp/.inspect-sandbox-tools-{staging_id}.tgz"
+    await _write_archive(sandbox, gz_tmp, gz_bytes)
+    try:
+        result = await sandbox.exec(
+            ["tar", "xzf", gz_tmp, "-C", SANDBOX_TOOLS_DIR], user=user
+        )
+    finally:
+        await sandbox.exec(["rm", "-f", gz_tmp], user=user)
     if result.success:
         return
 
@@ -377,30 +272,23 @@ async def _extract_tools_tree(
         TRACE_SANDBOX_TOOLS,
         f"tar xzf failed ({result.stderr.strip()}); retrying with uncompressed tar",
     )
-    tar_tmp = f"{SANDBOX_TOOLS_DIR}/.pkg.tar"
-    await _write_archive(
-        sandbox, tar_tmp, _uncompressed_tar_bytes(name, gz_bytes), user
-    )
-    result = await sandbox.exec(
-        ["tar", "xf", tar_tmp, "-C", SANDBOX_TOOLS_DIR], user=user
-    )
-    await sandbox.exec(["rm", "-f", tar_tmp], user=user)
+    tar_tmp = f"/var/tmp/.inspect-sandbox-tools-{staging_id}.tar"
+    await _write_archive(sandbox, tar_tmp, _uncompressed_tar_bytes(name, gz_bytes))
+    try:
+        result = await sandbox.exec(
+            ["tar", "xf", tar_tmp, "-C", SANDBOX_TOOLS_DIR], user=user
+        )
+    finally:
+        await sandbox.exec(["rm", "-f", tar_tmp], user=user)
     if not result.success:
         raise RuntimeError(f"Failed to extract sandbox tools: {result.stderr}")
 
 
 async def _write_archive(
-    sandbox: SandboxEnvironment, path: str, contents: bytes, user: str | None
+    sandbox: SandboxEnvironment, path: str, contents: bytes
 ) -> None:
-    """Write an archive inside the verified tree as the extraction identity."""
-    result = await sandbox.exec(
-        ["sh", "-c", 'base64 -d > "$1"', "sh", path],
-        input=base64.b64encode(contents).decode("ascii"),
-        user=user,
-        timeout=600,
-    )
-    if not result.success:
-        raise RuntimeError(f"Failed to stage sandbox tools archive: {result.stderr}")
+    """Write an archive using the provider's file-transfer implementation."""
+    await sandbox.write_file(path, contents)
 
 
 def _uncompressed_tar_bytes(name: str, gz_bytes: bytes) -> bytes:

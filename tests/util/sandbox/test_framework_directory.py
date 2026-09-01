@@ -74,3 +74,9 @@ def test_framework_directory_rejects_invalid_requested_mode(mode: int) -> None:
 def test_framework_directory_rejects_unsafe_path() -> None:
     with pytest.raises(ValueError, match="contains unsafe characters"):
         framework_directory_command("framework; true")
+
+
+@pytest.mark.parametrize("path", ["", ".", ".."])
+def test_framework_directory_rejects_ambiguous_leaf(path: str) -> None:
+    with pytest.raises(ValueError, match="must name a directory"):
+        framework_directory_command(path)

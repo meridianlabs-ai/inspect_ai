@@ -25,6 +25,8 @@ def framework_directory_command(
         ValueError: If the path or mode cannot meet the security contract.
     """
     directory = PurePosixPath(path).as_posix()
+    if directory in {"", ".", ".."}:
+        raise ValueError(f"Framework directory must name a directory: {path}")
     if not directory.startswith("/") and "/" in directory:
         raise ValueError(f"Framework directory must be absolute or a leaf: {path}")
     if any(
