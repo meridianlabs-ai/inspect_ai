@@ -28,6 +28,7 @@ from inspect_sandbox_tools._util.framework_directory import ensure_framework_dir
 from inspect_sandbox_tools._util.json_rpc_chunking import (
     JSON_RPC_RESPONSE_CHUNK_METHOD,
     chunk_json_rpc_response_if_needed,
+    ensure_json_rpc_response_chunk_dir,
     handle_json_rpc_response_chunk_request,
 )
 from inspect_sandbox_tools._util.json_rpc_helpers import json_rpc_unix_call
@@ -176,6 +177,7 @@ async def _exec(request: str | None) -> None:
                     f"_run_as_user must be a string, got {type(run_as_user).__name__}"
                 )
             request_json_str = json.dumps(request_data)
+            ensure_json_rpc_response_chunk_dir()
             switch_user(run_as_user)
             os.environ["HOME"] = get_home_dir(run_as_user)
 

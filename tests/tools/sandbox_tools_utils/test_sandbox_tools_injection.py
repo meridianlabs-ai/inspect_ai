@@ -146,3 +146,45 @@ async def test_existing_server_is_stopped_only_through_trusted_launcher() -> Non
         [sandbox_tools.SANDBOX_CLI, "stop-server"],
         "root",
     )
+
+
+async def test_legacy_server_without_stop_command_uses_verified_pid_fallback() -> None:
+    class LegacySandbox(RootProbeRaisesSandbox):
+        async def exec(
+            self,
+            cmd: list[str],
+            input: str | bytes | None = None,
+            cwd: str | None = None,
+            env: dict[str, str] | None = None,
+            user: str | None = None,
+            timeout: int | None = None,
+            timeout_retry: bool = True,
+            concurrency: bool = True,
+        ) -> ExecResult[str]:
+            self.exec_calls.append((cmd, user))
+            if cmd == [sandbox_tools.SANDBOX_CLI, "stop-server"]:
+                return ExecResult(
+                    success=False,
+                    returncode=2,
+                    stdout="",
+                    stderr="invalid choice: 'stop-server'",
+                )
+            return ExecResult(success=True, returncode=0, stdout="", stderr="")
+
+    sandbox = LegacySandbox()
+
+    await sandbox_tools._stop_trusted_existing_server(sandbox, None)
+
+    assert any(
+        cmd[:2] == ["python3", "-c"] and sandbox_tools.SANDBOX_CLI in cmd
+        for cmd, _ in sandbox.exec_calls
+    )
+
+
+async def test_legacy_directory_trust_allows_safe_non_private_mode() -> None:
+    sandbox = RootProbeRaisesSandbox()
+
+    assert await sandbox_tools._legacy_tools_dir_is_trusted(sandbox, None)
+    command = sandbox.exec_calls[-1][0][2]
+    assert "& 022" in command
+    assert "0700" not in command

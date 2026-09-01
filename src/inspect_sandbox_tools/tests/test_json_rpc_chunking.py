@@ -330,15 +330,25 @@ def test_chunk_dir_accepts_agent_owned_dir_when_running_as_root(
     agent-user exec permanently breaks every subsequent root tool call.
     """
     chunking._CHUNK_DIR.mkdir(mode=0o1733)
-    stat_values = list(chunking._CHUNK_DIR.lstat())
-    stat_values[0] = stat.S_IFDIR | 0o1733
-    stat_values[4] = 1000  # created by an earlier exec running as the agent user
-    agent_owned = os.stat_result(stat_values)
+    real_fstat = chunking.os.fstat
+    fchown_calls: list[tuple[int, int]] = []
 
-    monkeypatch.setattr(chunking.os, "fstat", lambda _fd: agent_owned)
+    def reported_owner(fd: int) -> os.stat_result:
+        value = real_fstat(fd)
+        values = list(value)
+        values[4] = 1000 if not fchown_calls else 0
+        return os.stat_result(values)
+
+    def record_fchown(_fd: int, uid: int, gid: int) -> None:
+        fchown_calls.append((uid, gid))
+
+    monkeypatch.setattr(chunking.os, "fstat", reported_owner)
+    monkeypatch.setattr(chunking.os, "fchown", record_fchown)
     monkeypatch.setattr(chunking.os, "getuid", lambda: 0)
 
     chunking.ensure_json_rpc_response_chunk_dir()
+
+    assert fchown_calls == [(0, 0)]
 
 
 def test_chunk_dir_chmod_does_not_follow_a_swapped_symlink(

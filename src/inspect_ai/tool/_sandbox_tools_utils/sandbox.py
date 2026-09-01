@@ -190,6 +190,25 @@ async def _tools_dir_is_verified(sandbox: SandboxEnvironment, user: str | None) 
     return (await sandbox.exec(command, user=user)).success
 
 
+async def _legacy_tools_dir_is_trusted(
+    sandbox: SandboxEnvironment, user: str | None
+) -> bool:
+    """Return whether a pre-hardening install directory is safe to execute from."""
+    return (
+        await sandbox.exec(
+            [
+                "sh",
+                "-c",
+                f'test ! -L "{SANDBOX_TOOLS_DIR}" '
+                f'&& test -d "{SANDBOX_TOOLS_DIR}" '
+                f'&& test "$(stat -c %u "{SANDBOX_TOOLS_DIR}")" = "$(id -u)" '
+                f'&& test $(( 0$(stat -c %a "{SANDBOX_TOOLS_DIR}") & 022 )) = 0',
+            ],
+            user=user,
+        )
+    ).success
+
+
 async def _tools_install_is_current(
     sandbox: SandboxEnvironment, user: str | None
 ) -> bool:
@@ -228,15 +247,44 @@ async def _stop_trusted_existing_server(
     sandbox: SandboxEnvironment, user: str | None
 ) -> None:
     """Stop a daemon through an existing launcher only when that launcher is trusted."""
-    directory_is_trusted = await _tools_dir_is_verified(sandbox, user)
+    directory_is_trusted = await _legacy_tools_dir_is_trusted(sandbox, user)
     launcher_is_trusted = await _launcher_is_trusted(sandbox, user)
     if not directory_is_trusted or not launcher_is_trusted:
         return
     result = await sandbox.exec([SANDBOX_CLI, "stop-server"], user=user)
+    if result.success:
+        return
+    if "invalid choice" in result.stderr and "stop-server" in result.stderr:
+        await _stop_legacy_server(sandbox, user)
+        return
     if not result.success:
         raise RuntimeError(
             f"Failed to stop existing sandbox tools server: {result.stderr}"
         )
+
+
+async def _stop_legacy_server(
+    sandbox: SandboxEnvironment, user: str | None
+) -> None:
+    """Stop a legacy daemon after verifying its PID and executable identity."""
+    script = (
+        "import json,os,signal,sys,tempfile,time; "
+        "root=os.environ.get('INSPECT_SANDBOX_TOOLS_DIR', "
+        "os.path.join(tempfile.gettempdir(),'sandbox-tools')); "
+        "pid_path=os.path.join(root,'server.pid'); "
+        "sys.exit(0) if not os.path.exists(pid_path) else None; "
+        "pid=int(json.load(open(pid_path))['pid']); "
+        "expected=os.stat(sys.argv[1]); actual=os.stat(f'/proc/{pid}/exe'); "
+        "(expected.st_dev,expected.st_ino)==(actual.st_dev,actual.st_ino) "
+        "or sys.exit('legacy server executable does not match launcher'); "
+        "os.kill(pid,signal.SIGTERM); deadline=time.monotonic()+5; "
+        "exec(\"while time.monotonic() < deadline:\\n"
+        " try: os.kill(pid,0)\\n except ProcessLookupError: break\\n"
+        " time.sleep(.05)\\nelse: sys.exit('legacy server did not stop')\")"
+    )
+    result = await sandbox.exec(["python3", "-c", script, SANDBOX_CLI], user=user)
+    if not result.success:
+        raise RuntimeError(f"Failed to stop legacy sandbox tools server: {result.stderr}")
 
 
 async def _clear_tools_dir(
