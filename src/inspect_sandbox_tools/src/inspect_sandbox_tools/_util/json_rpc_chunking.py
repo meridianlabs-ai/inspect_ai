@@ -66,19 +66,22 @@ def _json_rpc_response_chunk_dir() -> Iterator[int]:
         chunk_dir_stat = os.fstat(dir_fd)
         current_uid = os.getuid()
         if current_uid == 0 and chunk_dir_stat.st_uid != 0:
-            os.fchown(dir_fd, 0, 0)
-            verified_fd = os.open(
-                _CHUNK_DIR, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW
+            writable_fd = os.open(
+                ".", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd
             )
             try:
-                verified_stat = os.fstat(verified_fd)
+                verified_stat = os.fstat(writable_fd)
                 if (verified_stat.st_dev, verified_stat.st_ino) != (
                     chunk_dir_stat.st_dev,
                     chunk_dir_stat.st_ino,
                 ):
                     raise RuntimeError("JSON-RPC response chunk directory changed")
-            finally:
-                os.close(verified_fd)
+                os.fchown(writable_fd, 0, 0)
+            except Exception:
+                os.close(writable_fd)
+                raise
+            os.close(dir_fd)
+            dir_fd = writable_fd
             chunk_dir_stat = os.fstat(dir_fd)
         elif chunk_dir_stat.st_uid not in (0, current_uid):
             raise RuntimeError(

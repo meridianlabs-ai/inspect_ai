@@ -172,15 +172,17 @@ def test_prepare_socket_parent_tolerates_concurrent_fallback_creation(
     monkeypatch.setattr(server_module, "SERVER_DIR", server_dir)
     monkeypatch.setattr(server_module, "SOCKET_PATH", fallback_dir / "server.sock")
 
-    original_mkdir = Path.mkdir
+    original_mkdir = os.mkdir
 
-    def concurrent_mkdir(path: Path, *args: object, **kwargs: object) -> None:
-        if path == fallback_dir:
-            original_mkdir(path, *args, **kwargs)
+    def concurrent_mkdir(
+        path: str, mode: int = 0o777, *, dir_fd: int | None = None
+    ) -> None:
+        if path == fallback_dir.name and dir_fd is not None:
+            original_mkdir(path, mode, dir_fd=dir_fd)
             raise FileExistsError
-        original_mkdir(path, *args, **kwargs)
+        original_mkdir(path, mode, dir_fd=dir_fd)
 
-    monkeypatch.setattr(Path, "mkdir", concurrent_mkdir)
+    monkeypatch.setattr(os, "mkdir", concurrent_mkdir)
 
     server_module._prepare_socket_parent()
 

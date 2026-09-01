@@ -271,7 +271,6 @@ async def checked_write_file(
     file: str, contents: str, executable: bool = False, user: str | None = None
 ) -> None:
     await checked_exec(["tee", "--", file], input=contents, user=user)
+    await checked_exec(["chmod", "755" if executable else "644", file], user=user)
     if user:
         await checked_exec(["chown", user, file], user="root")
-    if executable:
-        await checked_exec(["chmod", "+x", file], user=user)

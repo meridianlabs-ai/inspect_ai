@@ -268,21 +268,21 @@ async def _stop_legacy_server(
 ) -> None:
     """Stop a legacy daemon after verifying its PID and executable identity."""
     script = (
-        "import json,os,signal,sys,tempfile,time; "
-        "root=os.environ.get('INSPECT_SANDBOX_TOOLS_DIR', "
-        "os.path.join(tempfile.gettempdir(),'sandbox-tools')); "
-        "pid_path=os.path.join(root,'server.pid'); "
-        "sys.exit(0) if not os.path.exists(pid_path) else None; "
-        "pid=int(json.load(open(pid_path))['pid']); "
-        "expected=os.stat(sys.argv[1]); actual=os.stat(f'/proc/{pid}/exe'); "
-        "(expected.st_dev,expected.st_ino)==(actual.st_dev,actual.st_ino) "
-        "or sys.exit('legacy server executable does not match launcher'); "
-        "os.kill(pid,signal.SIGTERM); deadline=time.monotonic()+5; "
-        "exec(\"while time.monotonic() < deadline:\\n"
-        " try: os.kill(pid,0)\\n except ProcessLookupError: break\\n"
-        " time.sleep(.05)\\nelse: sys.exit('legacy server did not stop')\")"
+        'root="${INSPECT_SANDBOX_TOOLS_DIR:-/tmp/sandbox-tools}"; '
+        'pid_file="$root/server.pid"; test -e "$pid_file" || exit 0; '
+        "pid=$(sed -n 's/.*\"pid\"[[:space:]]*:[[:space:]]*"
+        r"\([0-9][0-9]*\).*/\1/p' \"$pid_file\"); "
+        'case "$pid" in ""|*[!0-9]*) '
+        'echo "invalid legacy server PID" >&2; exit 1;; esac; '
+        'test -e "/proc/$pid/exe" || exit 0; '
+        'test "$1" -ef "/proc/$pid/exe" || '
+        '{ echo "legacy server executable does not match launcher" >&2; exit 1; }; '
+        'kill -TERM "$pid" || exit 0; attempts=0; '
+        'while kill -0 "$pid" 2>/dev/null; do attempts=$((attempts + 1)); '
+        'test "$attempts" -lt 100 || '
+        '{ echo "legacy server did not stop" >&2; exit 1; }; sleep 0.05; done'
     )
-    result = await sandbox.exec(["python3", "-c", script, SANDBOX_CLI], user=user)
+    result = await sandbox.exec(["sh", "-c", script, "sh", SANDBOX_CLI], user=user)
     if not result.success:
         raise RuntimeError(f"Failed to stop legacy sandbox tools server: {result.stderr}")
 

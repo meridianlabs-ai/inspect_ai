@@ -176,7 +176,9 @@ async def test_legacy_server_without_stop_command_uses_verified_pid_fallback() -
     await sandbox_tools._stop_trusted_existing_server(sandbox, None)
 
     assert any(
-        cmd[:2] == ["python3", "-c"] and sandbox_tools.SANDBOX_CLI in cmd
+        cmd[:2] == ["sh", "-c"]
+        and sandbox_tools.SANDBOX_CLI in cmd
+        and "python" not in cmd[1]
         for cmd, _ in sandbox.exec_calls
     )
 
