@@ -217,6 +217,18 @@ async def test_detector_validates_root_installation_in_one_exec() -> None:
     assert "validate_owned()" in command[2]
 
 
+def test_validation_command_rejects_missing_installation(
+    tmp_path: os.PathLike[str],
+) -> None:
+    command = sandbox_tools._sandbox_tools_validation_command()
+    command[4] = os.path.join(os.fspath(tmp_path), "missing-tools")
+    command[5] = os.path.join(command[4], "inspect-sandbox-tools")
+
+    result = subprocess.run(command, check=False, capture_output=True, text=True)
+
+    assert result.returncode != 0
+
+
 def test_publish_command_rejects_destination_created_during_move(
     tmp_path: os.PathLike[str],
 ) -> None:

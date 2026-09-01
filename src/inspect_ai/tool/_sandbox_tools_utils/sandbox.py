@@ -252,6 +252,7 @@ async def _sandbox_tools_detector(sandbox: SandboxEnvironment) -> bool:
 def _sandbox_tools_validation_command() -> list[str]:
     """Build one command that validates the install root and launcher."""
     script = """\
+set -e
 validate_owned() {
     test "$1" "$2" && test ! -L "$2" || return 1
     set -- $(stat -c '%u %a' -- "$2" 2>/dev/null || stat -f '%u %Lp' "$2" 2>/dev/null) || return 1
