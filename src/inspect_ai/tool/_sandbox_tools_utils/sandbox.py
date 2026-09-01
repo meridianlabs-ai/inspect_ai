@@ -1,4 +1,5 @@
 import gzip
+import hashlib
 import os
 import subprocess
 import sys
@@ -41,6 +42,8 @@ from ._digests import lookup_digest
 _BUCKET_BASE_URL = "https://inspect-sandbox-tools.s3.us-east-2.amazonaws.com"
 
 logger = getLogger(__name__)
+
+_install_lock = anyio.Lock()
 
 
 TRACE_SANDBOX_TOOLS = "Sandbox Tools"
@@ -98,35 +101,64 @@ async def sandbox_with_injected_tools(
 
 async def _inject_container_tools_code(sandbox: SandboxEnvironment) -> None:
     try:
-        info = await detect_sandbox_os(sandbox)
-        musl = info.get("libc") == "musl"
+        async with _install_lock:
+            # Another SandboxEnvironment may have completed installation while this
+            # caller waited for the shared path.
+            if await _sandbox_tools_detector(sandbox):
+                return
+            await _inject_container_tools_code_locked(sandbox)
+    except Exception as e:
+        raise SandboxInjectionError(
+            f"Failed to inject sandbox tools into sandbox: {e}", cause=e
+        ) from e
 
-        async with _open_executable_for_arch(info["architecture"], musl) as (name, f):
-            gz_bytes = f.read()  # gzipped tar of the PyInstaller --onedir tree
 
-        tools_dir_existed = await _tools_dir_exists(sandbox)
+async def _inject_container_tools_code_locked(sandbox: SandboxEnvironment) -> None:
+    """Install tools while holding the process-wide publication lock.
 
-        # Create and verify the install dir as root if possible; fall
-        # back to the default user for rootless sandboxes (where user-switching will
-        # be disabled, auto-detected by the server). A root-owned 0700 tree prevents
-        # access by other, non-root users, but not by a process running in the
-        # sandbox as root.
-        if await _create_tools_dir_as_root(sandbox):
+    SandboxEnvironment instances can refer to the same underlying local sandbox
+    and therefore the same fixed tools path. The shared lock serializes publication
+    across those instances.
+    """
+    info = await detect_sandbox_os(sandbox)
+    musl = info.get("libc") == "musl"
+
+    async with _open_executable_for_arch(info["architecture"], musl) as (name, f):
+        gz_bytes = f.read()  # gzipped tar of the PyInstaller --onedir tree
+
+    if await _tools_dir_exists(sandbox):
+        raise RuntimeError(
+            "Existing sandbox tools installation is unsafe; recreate the sandbox "
+            "rather than replacing a potentially active installation"
+        )
+
+    install_tmp = f"{SANDBOX_TOOLS_DIR}.install-{os.urandom(16).hex()}"
+    published = False
+    try:
+        if await _create_tools_dir_as_root(sandbox, install_tmp):
             sandbox._tools_user = "root"
         else:
-            result = await sandbox.exec(_ensure_tools_dir_command())
+            result = await sandbox.exec(framework_directory_command(install_tmp))
             if not result.success:
                 raise RuntimeError(
-                    f"Failed to create or verify sandbox tools dir: {result.stderr}"
+                    f"Failed to create sandbox tools staging dir: {result.stderr}"
                 )
 
-        if tools_dir_existed:
-            raise RuntimeError(
-                "Existing sandbox tools installation is unsafe; recreate the sandbox "
-                "rather than replacing a potentially active installation"
+        await _extract_tools_tree(
+            sandbox, name, gz_bytes, sandbox._tools_user, install_tmp
+        )
+        # Once publication starts, learn its outcome before honoring cancellation so
+        # cleanup always targets the directory that was actually published.
+        with anyio.CancelScope(shield=True):
+            result = await sandbox.exec(
+                ["mv", install_tmp, SANDBOX_TOOLS_DIR], user=sandbox._tools_user
             )
+        if not result.success:
+            raise RuntimeError(
+                f"Failed to publish sandbox tools installation: {result.stderr}"
+            )
+        published = True
 
-        await _extract_tools_tree(sandbox, name, gz_bytes, sandbox._tools_user)
         if not await _sandbox_cli_is_trusted(sandbox, sandbox._tools_user):
             raise RuntimeError("Injected sandbox tools launcher failed validation")
 
@@ -135,13 +167,20 @@ async def _inject_container_tools_code(sandbox: SandboxEnvironment) -> None:
         )
         if not result.success:
             raise RuntimeError(f"Failed to start sandbox tools server: {result.stderr}")
-    except Exception as e:
-        raise SandboxInjectionError(
-            f"Failed to inject sandbox tools into sandbox: {e}", cause=e
-        ) from e
+    except BaseException:
+        cleanup_path = SANDBOX_TOOLS_DIR if published else install_tmp
+        with anyio.CancelScope(shield=True):
+            await sandbox.exec(
+                ["rm", "-rf", "--", cleanup_path],
+                user=sandbox._tools_user,
+                timeout_retry=False,
+            )
+        raise
 
 
-async def _create_tools_dir_as_root(sandbox: SandboxEnvironment) -> bool:
+async def _create_tools_dir_as_root(
+    sandbox: SandboxEnvironment, path: str = SANDBOX_TOOLS_DIR
+) -> bool:
     try:
         probe = await sandbox.exec(["id", "-u"], user="root")
     except Exception as ex:
@@ -157,7 +196,7 @@ async def _create_tools_dir_as_root(sandbox: SandboxEnvironment) -> bool:
 
     if not probe.success or probe.stdout.strip() != "0":
         return False
-    result = await sandbox.exec(_ensure_tools_dir_command(), user="root")
+    result = await sandbox.exec(framework_directory_command(path), user="root")
     if not result.success:
         raise RuntimeError(
             "Sandbox tools path exists but is not a root-owned 0700 directory"
@@ -240,7 +279,11 @@ async def _sandbox_cli_is_trusted(
 
 
 async def _extract_tools_tree(
-    sandbox: SandboxEnvironment, name: str, gz_bytes: bytes, user: str | None
+    sandbox: SandboxEnvironment,
+    name: str,
+    gz_bytes: bytes,
+    user: str | None,
+    tools_dir: str,
 ) -> None:
     """Extract the gzipped onedir tar into SANDBOX_TOOLS_DIR.
 
@@ -253,14 +296,21 @@ async def _extract_tools_tree(
     cached in the binaries dir so we decompress at most once per artifact.
     """
     staging_id = os.urandom(16).hex()
-    gz_tmp = f"/var/tmp/.inspect-sandbox-tools-{staging_id}.tgz"
-    await _write_archive(sandbox, gz_tmp, gz_bytes)
+    upload_tmp = f"/var/tmp/.inspect-sandbox-tools-upload-{staging_id}"
+    gz_tmp = f"{tools_dir}/archive.tgz"
     try:
+        await _write_archive(sandbox, upload_tmp, gz_bytes)
+        await _secure_archive(sandbox, upload_tmp, gz_tmp, gz_bytes, user)
         result = await sandbox.exec(
-            ["tar", "xzf", gz_tmp, "-C", SANDBOX_TOOLS_DIR], user=user
+            ["tar", "xzf", gz_tmp, "-C", tools_dir], user=user
         )
     finally:
-        await sandbox.exec(["rm", "-f", gz_tmp], user=user)
+        with anyio.CancelScope(shield=True):
+            await sandbox.exec(
+                ["rm", "-f", "--", upload_tmp, gz_tmp],
+                user=user,
+                timeout_retry=False,
+            )
     if result.success:
         return
 
@@ -270,14 +320,21 @@ async def _extract_tools_tree(
         TRACE_SANDBOX_TOOLS,
         f"tar xzf failed ({result.stderr.strip()}); retrying with uncompressed tar",
     )
-    tar_tmp = f"/var/tmp/.inspect-sandbox-tools-{staging_id}.tar"
-    await _write_archive(sandbox, tar_tmp, _uncompressed_tar_bytes(name, gz_bytes))
+    tar_bytes = _uncompressed_tar_bytes(name, gz_bytes)
+    tar_tmp = f"{tools_dir}/archive.tar"
     try:
+        await _write_archive(sandbox, upload_tmp, tar_bytes)
+        await _secure_archive(sandbox, upload_tmp, tar_tmp, tar_bytes, user)
         result = await sandbox.exec(
-            ["tar", "xf", tar_tmp, "-C", SANDBOX_TOOLS_DIR], user=user
+            ["tar", "xf", tar_tmp, "-C", tools_dir], user=user
         )
     finally:
-        await sandbox.exec(["rm", "-f", tar_tmp], user=user)
+        with anyio.CancelScope(shield=True):
+            await sandbox.exec(
+                ["rm", "-f", "--", upload_tmp, tar_tmp],
+                user=user,
+                timeout_retry=False,
+            )
     if not result.success:
         raise RuntimeError(f"Failed to extract sandbox tools: {result.stderr}")
 
@@ -287,6 +344,29 @@ async def _write_archive(
 ) -> None:
     """Write an archive using the provider's file-transfer implementation."""
     await sandbox.write_file(path, contents)
+
+
+async def _secure_archive(
+    sandbox: SandboxEnvironment,
+    upload_path: str,
+    protected_path: str,
+    contents: bytes,
+    user: str | None,
+) -> None:
+    """Copy an upload under the extraction identity and verify its contents."""
+    digest = hashlib.sha256(contents).hexdigest()
+    script = """\
+set -eu
+umask 077
+cp -- "$1" "$2"
+printf '%s  %s\\n' "$3" "$2" | sha256sum -c -
+rm -f -- "$1"
+"""
+    result = await sandbox.exec(
+        ["sh", "-c", script, "sh", upload_path, protected_path, digest], user=user
+    )
+    if not result.success:
+        raise RuntimeError(f"Sandbox tools archive failed secure staging: {result.stderr}")
 
 
 def _uncompressed_tar_bytes(name: str, gz_bytes: bytes) -> bytes:

@@ -6,10 +6,11 @@ from contextlib import asynccontextmanager
 from io import BytesIO
 from typing import AsyncIterator, BinaryIO, Literal, overload
 
+import anyio
 import pytest
 
 from inspect_ai.tool._sandbox_tools_utils import sandbox as sandbox_tools
-from inspect_ai.util._sandbox._cli import SANDBOX_CLI, SANDBOX_TOOLS_DIR
+from inspect_ai.util._sandbox._cli import SANDBOX_CLI
 from inspect_ai.util._sandbox.environment import (
     SandboxEnvironment,
     SandboxEnvironmentConfigType,
@@ -43,6 +44,8 @@ class RootProbeRaisesSandbox(SandboxEnvironment):
         if cmd == ["id", "-u"] and user == "root":
             raise RuntimeError("runuser: may not be used by non-root users")
         if cmd[:2] == ["sh", "-c"] and 'test -e "$1"' in cmd[2]:
+            return ExecResult(success=False, returncode=1, stdout="", stderr="")
+        if cmd[:2] == ["sh", "-c"] and 'test -d "$1"' in cmd[2]:
             return ExecResult(success=False, returncode=1, stdout="", stderr="")
         if cmd[:2] == ["sh", "-c"] and "validate_file()" in cmd[2]:
             success = (
@@ -102,6 +105,7 @@ async def test_inject_container_tools_falls_back_when_root_probe_raises(
         _name: str,
         _gz_bytes: bytes,
         user: str | None,
+        _tools_dir: str,
     ) -> None:
         sandbox.extracted_as_user = user
 
@@ -116,7 +120,6 @@ async def test_inject_container_tools_falls_back_when_root_probe_raises(
     assert sandbox._tools_user is None
     assert sandbox.extracted_as_user is None
     assert (["id", "-u"], "root") in sandbox.exec_calls
-    assert (sandbox_tools._ensure_tools_dir_command(), None) in sandbox.exec_calls
     start_index = sandbox.exec_calls.index(([SANDBOX_CLI, "start-server"], None))
     validation_index = next(
         index
@@ -134,6 +137,86 @@ async def test_write_archive_uses_provider_file_transfer() -> None:
 
     assert sandbox.exec_calls == []
     assert sandbox.writes == [(archive_path, b"archive")]
+
+
+async def test_secure_archive_copies_and_verifies_as_install_user() -> None:
+    sandbox = RootProbeRaisesSandbox()
+
+    await sandbox_tools._secure_archive(
+        sandbox, "/var/tmp/upload", "/protected/archive", b"archive", "root"
+    )
+
+    command, user = sandbox.exec_calls[-1]
+    assert user == "root"
+    assert command[:2] == ["sh", "-c"]
+    assert "sha256sum -c" in command[2]
+    assert command[4:6] == ["/var/tmp/upload", "/protected/archive"]
+
+
+async def test_extract_cancellation_removes_uploaded_archive() -> None:
+    class CancelledUploadSandbox(RootProbeRaisesSandbox):
+        def __init__(self) -> None:
+            super().__init__()
+            self.write_started = anyio.Event()
+
+        async def write_file(self, file: str, contents: str | bytes) -> None:
+            self.writes.append((file, contents))
+            self.write_started.set()
+            await anyio.sleep_forever()
+
+    sandbox = CancelledUploadSandbox()
+
+    async with anyio.create_task_group() as task_group:
+        task_group.start_soon(
+            sandbox_tools._extract_tools_tree,
+            sandbox,
+            "tools",
+            b"archive",
+            "root",
+            "/protected/install",
+        )
+        await sandbox.write_started.wait()
+        task_group.cancel_scope.cancel()
+
+    cleanup_calls = [
+        command
+        for command, user in sandbox.exec_calls
+        if command[:3] == ["rm", "-f", "--"] and user == "root"
+    ]
+    assert len(cleanup_calls) == 1
+    assert cleanup_calls[0][-1] == "/protected/install/archive.tgz"
+
+
+async def test_injection_is_serialized_across_sandbox_instances(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    installed = False
+    active_installers = 0
+    maximum_active_installers = 0
+
+    async def detector(_sandbox: SandboxEnvironment) -> bool:
+        return installed
+
+    async def injector(_sandbox: SandboxEnvironment) -> None:
+        nonlocal active_installers, installed, maximum_active_installers
+        active_installers += 1
+        maximum_active_installers = max(maximum_active_installers, active_installers)
+        await anyio.sleep(0)
+        installed = True
+        active_installers -= 1
+
+    monkeypatch.setattr(sandbox_tools, "_sandbox_tools_detector", detector)
+    monkeypatch.setattr(sandbox_tools, "_inject_container_tools_code_locked", injector)
+
+    async with anyio.create_task_group() as task_group:
+        task_group.start_soon(
+            sandbox_tools._inject_container_tools_code, RootProbeRaisesSandbox()
+        )
+        task_group.start_soon(
+            sandbox_tools._inject_container_tools_code, RootProbeRaisesSandbox()
+        )
+
+    assert maximum_active_installers == 1
 
 
 def test_launcher_validator_checks_filesystem_state(tmp_path: os.PathLike[str]) -> None:
