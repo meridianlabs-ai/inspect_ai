@@ -844,6 +844,15 @@ def math_service_after_root_setup() -> Solver:
             user="root",
         )
         assert prep.success, f"prep failed: {prep.stderr}"
+        legacy_leaf = await sandbox().exec(
+            [
+                "sh",
+                "-c",
+                "mkdir -m 0755 /var/tmp/sandbox-services/math_service",
+            ],
+            user="nonroot",
+        )
+        assert legacy_leaf.success, f"legacy service setup failed: {legacy_leaf.stderr}"
 
         # Reuse the math service flow, this time as nonroot.
         run_script = "run.py"

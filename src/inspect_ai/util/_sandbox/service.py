@@ -608,7 +608,9 @@ class SandboxService:
         )
         result = None
         for directory in directories:
-            result = await self._exec(framework_directory_command(directory))
+            result = await self._exec(
+                framework_directory_command(directory, repair_mode=True)
+            )
             if not result.success:
                 break
         assert result is not None

@@ -1,3 +1,4 @@
+import base64
 import gzip
 import os
 import subprocess
@@ -175,7 +176,9 @@ def _ensure_tools_dir_command() -> list[str]:
         f"mkdir -m 700 -- {SANDBOX_TOOLS_DIR} 2>/dev/null || "
         f"{{ test -d {SANDBOX_TOOLS_DIR} && test ! -L {SANDBOX_TOOLS_DIR} && "
         f'test "$(stat -c %u -- {SANDBOX_TOOLS_DIR})" = "$(id -u)" && '
-        f'test "$(stat -c %a -- {SANDBOX_TOOLS_DIR})" = 700; }}'
+        f'mode="$(stat -c %a -- {SANDBOX_TOOLS_DIR})" && '
+        f'case "$mode" in *[2367][0-7]|*[0-7][2367]) false;; '
+        f'esac && chmod 700 -- {SANDBOX_TOOLS_DIR}; }}'
     )
     return ["sh", "-c", script]
 
@@ -209,16 +212,17 @@ async def _extract_tools_tree(
 ) -> None:
     """Extract the gzipped onedir tar into SANDBOX_TOOLS_DIR.
 
-    The artifact is staged to a temp file via write_file (which base64-encodes binary
-    content reliably; raw binary stdin through exec is not safe) and then extracted.
+    The artifact is transferred as base64 text over stdin and decoded inside the
+    verified install directory. This ensures root extraction never opens a path in
+    an agent-writable directory.
 
     Optimistic path: ship the compressed artifact and extract with `tar xzf`. If the
     container's `tar` lacks gzip support, fall back to injecting an uncompressed tar,
     which only needs plain `tar xf` (the broadest assumption). The uncompressed tar is
     cached in the binaries dir so we decompress at most once per artifact.
     """
-    gz_tmp = f"{SANDBOX_TOOLS_DIR}.pkg.tgz"
-    await sandbox.write_file(gz_tmp, gz_bytes)
+    gz_tmp = f"{SANDBOX_TOOLS_DIR}/.pkg.tgz"
+    await _write_trusted_archive(sandbox, gz_tmp, gz_bytes, user)
     result = await sandbox.exec(
         ["tar", "xzf", gz_tmp, "-C", SANDBOX_TOOLS_DIR], user=user
     )
@@ -232,14 +236,28 @@ async def _extract_tools_tree(
         TRACE_SANDBOX_TOOLS,
         f"tar xzf failed ({result.stderr.strip()}); retrying with uncompressed tar",
     )
-    tar_tmp = f"{SANDBOX_TOOLS_DIR}.pkg.tar"
-    await sandbox.write_file(tar_tmp, _uncompressed_tar_bytes(name, gz_bytes))
+    tar_tmp = f"{SANDBOX_TOOLS_DIR}/.pkg.tar"
+    await _write_trusted_archive(
+        sandbox, tar_tmp, _uncompressed_tar_bytes(name, gz_bytes), user
+    )
     result = await sandbox.exec(
         ["tar", "xf", tar_tmp, "-C", SANDBOX_TOOLS_DIR], user=user
     )
     await sandbox.exec(["rm", "-f", tar_tmp], user=user)
     if not result.success:
         raise RuntimeError(f"Failed to extract sandbox tools: {result.stderr}")
+
+
+async def _write_trusted_archive(
+    sandbox: SandboxEnvironment, path: str, contents: bytes, user: str | None
+) -> None:
+    """Write an archive as its extraction user inside the verified directory."""
+    encoded = base64.b64encode(contents).decode("ascii")
+    result = await sandbox.exec(
+        ["sh", "-c", f"umask 077; base64 -d > {path}"], input=encoded, user=user
+    )
+    if not result.success:
+        raise RuntimeError(f"Failed to stage sandbox tools archive: {result.stderr}")
 
 
 def _uncompressed_tar_bytes(name: str, gz_bytes: bytes) -> bytes:

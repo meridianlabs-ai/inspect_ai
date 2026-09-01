@@ -27,9 +27,15 @@ def framework_directory_command(
     mode_text = format(mode, "o")
     created = "echo created" if report_creation else ":"
     verified = "echo existing" if report_creation else ":"
-    mode_check = (
-        f"chmod {mode_text} -- {directory} && " if repair_mode else ""
-    ) + f'test "$(stat -c %a -- {directory})" = {mode_text}'
+    if repair_mode:
+        mode_check = (
+            f'mode="$(stat -c %a -- {directory})" && '
+            f'{{ test "$mode" = {mode_text} || {{ '
+            'case "$mode" in *[2367][0-7]|*[0-7][2367]) false;; esac && '
+            f"chmod {mode_text} -- {directory}; }}; }}"
+        )
+    else:
+        mode_check = f'test "$(stat -c %a -- {directory})" = {mode_text}'
     script = (
         f"umask 077; if mkdir -m {mode_text} -- {directory} 2>/dev/null; "
         f"then {created}; else test -d {directory} && test ! -L {directory} && "

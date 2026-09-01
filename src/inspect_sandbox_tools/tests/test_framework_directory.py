@@ -52,6 +52,24 @@ def test_framework_directory_safely_replaces_non_directory(tmp_path: Path) -> No
     assert list(tmp_path.glob(".framework.untrusted-*"))
 
 
+def test_framework_directory_replaces_legacy_world_writable_directory(
+    tmp_path: Path,
+) -> None:
+    directory = tmp_path / "framework"
+    directory.mkdir(mode=0o777)
+    directory.chmod(0o777)
+    planted_file = directory / "server.pid"
+    planted_file.write_text("123")
+
+    ensure_framework_directory(directory)
+
+    assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+    assert not planted_file.exists()
+    quarantined = list(tmp_path.glob(".framework.untrusted-*"))
+    assert len(quarantined) == 1
+    assert (quarantined[0] / "server.pid").read_text() == "123"
+
+
 def test_framework_directory_descriptor_survives_path_replacement(
     tmp_path: Path,
 ) -> None:

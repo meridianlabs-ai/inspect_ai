@@ -53,7 +53,12 @@ def framework_directory(
             if directory_fd is None:
                 continue
             status = os.fstat(directory_fd)
-            if stat.S_ISDIR(status.st_mode) and status.st_uid == owner_uid:
+            unsafe_permissions = stat.S_IMODE(status.st_mode) & 0o022
+            if (
+                stat.S_ISDIR(status.st_mode)
+                and status.st_uid == owner_uid
+                and not unsafe_permissions
+            ):
                 os.fchmod(directory_fd, mode)
                 status = os.fstat(directory_fd)
                 if stat.S_IMODE(status.st_mode) == mode:
@@ -61,7 +66,13 @@ def framework_directory(
 
             os.close(directory_fd)
             directory_fd = None
-            if existing != "replace":
+            # A same-owner legacy directory that was writable by other users may
+            # contain planted sockets or metadata. Never adopt its contents.
+            if existing != "replace" and not (
+                stat.S_ISDIR(status.st_mode)
+                and status.st_uid == owner_uid
+                and unsafe_permissions
+            ):
                 raise RuntimeError(
                     f"Framework directory has unexpected owner or mode: {path}"
                 )

@@ -1,7 +1,10 @@
 """Tests for sandbox tools injection."""
 
+import stat
+import subprocess
 from contextlib import asynccontextmanager
 from io import BytesIO
+from pathlib import Path
 from typing import AsyncIterator, BinaryIO, Literal, overload
 
 import pytest
@@ -13,6 +16,31 @@ from inspect_ai.util._sandbox.environment import (
 )
 from inspect_ai.util._sandbox.recon import Architecture, SupportedContainerOSInfo
 from inspect_ai.util._subprocess import ExecResult
+
+
+def test_tools_directory_repairs_legacy_private_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tools_dir = tmp_path / "sandbox-tools"
+    tools_dir.mkdir(mode=0o755)
+    monkeypatch.setattr(sandbox_tools, "SANDBOX_TOOLS_DIR", str(tools_dir))
+
+    subprocess.run(sandbox_tools._ensure_tools_dir_command(), check=True)
+
+    assert stat.S_IMODE(tools_dir.stat().st_mode) == 0o700
+
+
+def test_tools_directory_rejects_legacy_writable_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tools_dir = tmp_path / "sandbox-tools"
+    tools_dir.mkdir(mode=0o777)
+    tools_dir.chmod(0o777)
+    monkeypatch.setattr(sandbox_tools, "SANDBOX_TOOLS_DIR", str(tools_dir))
+
+    result = subprocess.run(sandbox_tools._ensure_tools_dir_command(), check=False)
+
+    assert result.returncode != 0
 
 
 class RootProbeRaisesSandbox(SandboxEnvironment):

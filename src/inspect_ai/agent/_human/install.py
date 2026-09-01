@@ -23,30 +23,38 @@ async def install_human_agent(
     bashrc_content: str | None,
     record_session: bool,
 ) -> None:
-    # see if we have already installed
+    if not user:
+        user = (await sandbox().exec(["whoami"])).stdout.strip()
+
+    # Root owns new installations until setup is complete. Existing non-root
+    # installations are verified as their configured owner and remain reusable.
     install_result = await sandbox().exec(
         framework_directory_command(HUMAN_AGENT_DIR, report_creation=True), user="root"
     )
+    if not install_result.success and user != "root":
+        install_result = await sandbox().exec(
+            framework_directory_command(
+                HUMAN_AGENT_DIR, report_creation=True, repair_mode=True
+            ),
+            user=user,
+        )
     if not install_result.success:
         raise RuntimeError(f"Unsafe human-agent directory: {HUMAN_AGENT_DIR}")
     if install_result.stdout.strip() == "existing":
         return
 
-    if not user:
-        user = (await sandbox().exec(["whoami"])).stdout.strip()
-
     if user != "root":
         await checked_exec(["chown", user, HUMAN_AGENT_DIR], user="root")
 
     # setup installation directory
-    await checked_exec(framework_directory_command(INSTALL_DIR), user="root")
-    if user != "root":
-        await checked_exec(["chown", user, INSTALL_DIR], user="root")
+    await checked_exec(
+        framework_directory_command(INSTALL_DIR, repair_mode=True), user=user
+    )
 
     if record_session:
-        await checked_exec(framework_directory_command(RECORD_SESSION_DIR), user="root")
-        if user != "root":
-            await checked_exec(["chown", user, RECORD_SESSION_DIR], user="root")
+        await checked_exec(
+            framework_directory_command(RECORD_SESSION_DIR, repair_mode=True), user=user
+        )
 
     # generate task.py
     task_py = human_agent_commands(commands)
