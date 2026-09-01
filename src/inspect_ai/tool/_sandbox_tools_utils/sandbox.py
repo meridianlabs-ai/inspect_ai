@@ -24,6 +24,7 @@ from inspect_ai._util.trace import trace_message
 from inspect_ai.util import input_screen
 from inspect_ai.util._concurrency import concurrency
 from inspect_ai.util._sandbox._cli import SANDBOX_CLI, SANDBOX_TOOLS_DIR
+from inspect_ai.util._sandbox._framework_directory import framework_directory_command
 from inspect_ai.util._sandbox.context import (
     SandboxInjectable,
     sandbox_file_detector,
@@ -88,7 +89,7 @@ async def sandbox_with_injected_tools(
     """
     return await sandbox_with_injection(
         SandboxInjectable(
-            sandbox_file_detector(SANDBOX_CLI),
+            _sandbox_tools_detector,
             _inject_container_tools_code,
         ),
         name=sandbox_name,
@@ -104,7 +105,7 @@ async def _inject_container_tools_code(sandbox: SandboxEnvironment) -> None:
         async with _open_executable_for_arch(info["architecture"], musl) as (name, f):
             gz_bytes = f.read()  # gzipped tar of the PyInstaller --onedir tree
 
-        # Create the install dir as root if possible, and restrict it to 0700; fall
+        # Create and verify the install dir as root if possible; fall
         # back to the default user for rootless sandboxes (where user-switching will
         # be disabled, auto-detected by the server). A root-owned 0700 tree prevents
         # access by other, non-root users, but not by a process running in the
@@ -112,26 +113,16 @@ async def _inject_container_tools_code(sandbox: SandboxEnvironment) -> None:
         if await _create_tools_dir_as_root(sandbox):
             sandbox._tools_user = "root"
         else:
-            result = await sandbox.exec(["mkdir", "-p", SANDBOX_TOOLS_DIR])
+            result = await sandbox.exec(_ensure_tools_dir_command())
             if not result.success:
                 raise RuntimeError(
-                    f"Failed to create sandbox tools dir: {result.stderr}"
+                    f"Failed to create or verify sandbox tools dir: {result.stderr}"
                 )
 
         await _extract_tools_tree(sandbox, name, gz_bytes, sandbox._tools_user)
 
-        # When running as root, restrict the tree to 0700. A root-owned 0700 tree
-        # prevents access by other, non-root users, but not by a process running in
-        # the sandbox as root. Inspect invokes the launcher as root, so this does
-        # not impede tool calls.
-        if sandbox._tools_user == "root":
-            result = await sandbox.exec(
-                ["chmod", "700", SANDBOX_TOOLS_DIR], user="root"
-            )
-            if not result.success:
-                raise RuntimeError(
-                    f"Failed to chmod sandbox tools dir: {result.stderr}"
-                )
+        if not await _tools_dir_is_verified(sandbox, sandbox._tools_user):
+            raise RuntimeError("Sandbox tools directory changed during extraction")
 
         # Start the server as root so it can setuid to any user for exec_remote.
         # If root isn't available, fall back to the sandbox's default user —
@@ -149,9 +140,7 @@ async def _inject_container_tools_code(sandbox: SandboxEnvironment) -> None:
 
 async def _create_tools_dir_as_root(sandbox: SandboxEnvironment) -> bool:
     try:
-        return (
-            await sandbox.exec(["mkdir", "-p", SANDBOX_TOOLS_DIR], user="root")
-        ).success
+        probe = await sandbox.exec(["id", "-u"], user="root")
     except Exception as ex:
         # Broad catch is deliberate: providers signal "cannot exec as root" by
         # raising provider-specific exception types, so no narrower type is
@@ -162,6 +151,44 @@ async def _create_tools_dir_as_root(sandbox: SandboxEnvironment) -> bool:
             f"root sandbox tools dir probe failed; falling back to default user: {ex}",
         )
         return False
+
+    if not probe.success or probe.stdout.strip() != "0":
+        return False
+    result = await sandbox.exec(_ensure_tools_dir_command(), user="root")
+    if not result.success:
+        raise RuntimeError(
+            "Sandbox tools path exists but is not a root-owned 0700 directory"
+        )
+    return True
+
+
+def _ensure_tools_dir_command() -> list[str]:
+    """Return the command enforcing the sandbox-tools directory contract."""
+    return framework_directory_command(SANDBOX_TOOLS_DIR)
+
+
+async def _tools_dir_is_verified(sandbox: SandboxEnvironment, user: str | None) -> bool:
+    return (await sandbox.exec(_ensure_tools_dir_command(), user=user)).success
+
+
+async def _sandbox_tools_detector(sandbox: SandboxEnvironment) -> bool:
+    """Authorize reuse only when both the install root and launcher are trusted."""
+    try:
+        probe = await sandbox.exec(["id", "-u"], user="root")
+        if probe.success and probe.stdout.strip() == "0":
+            if not await _tools_dir_is_verified(sandbox, "root"):
+                return False
+            sandbox._tools_user = "root"
+            return (
+                await sandbox.exec(["test", "-x", SANDBOX_CLI], user="root")
+            ).success
+    except Exception:
+        pass
+
+    if not await _tools_dir_is_verified(sandbox, None):
+        return False
+    sandbox._tools_user = None
+    return await sandbox_file_detector(SANDBOX_CLI)(sandbox)
 
 
 async def _extract_tools_tree(
