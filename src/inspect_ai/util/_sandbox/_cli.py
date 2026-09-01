@@ -20,6 +20,10 @@ prevents access by other, non-root users, but not by a process running in the
 sandbox as root.
 """
 
+import hashlib
+import os
+from pathlib import Path
+
 # Also defined in inspect_ai.tool._sandbox_tools_utils._build_config — keep in sync.
 SANDBOX_TOOLS_BASE_NAME = "inspect-sandbox-tools"
 
@@ -28,13 +32,23 @@ SANDBOX_TOOLS_DIR = "/var/tmp/.da7be258e003d428"
 SANDBOX_CLI = f"{SANDBOX_TOOLS_DIR}/{SANDBOX_TOOLS_BASE_NAME}"
 
 
-def local_sandbox_tools_dir(uid: int) -> str:
+def local_sandbox_tools_namespace() -> str:
+    """Return a stable, portable namespace for the current OS user."""
+    getuid = getattr(os, "getuid", None)
+    if getuid is not None:
+        return str(getuid())
+
+    identity = f"{os.environ.get('USERNAME', '')}\0{Path.home()}"
+    return hashlib.sha256(identity.encode()).hexdigest()[:16]
+
+
+def local_sandbox_tools_dir(user_namespace: str) -> str:
     """Return the host-local tools directory isolated to an OS user.
 
     Args:
-        uid: Numeric host operating-system user ID.
+        user_namespace: Stable namespace for the host operating-system user.
 
     Returns:
         The per-user sandbox tools installation path.
     """
-    return f"{SANDBOX_TOOLS_DIR}-{uid}"
+    return f"{SANDBOX_TOOLS_DIR}-{user_namespace}"

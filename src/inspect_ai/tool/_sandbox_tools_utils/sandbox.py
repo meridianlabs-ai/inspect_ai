@@ -29,6 +29,7 @@ from inspect_ai.util._sandbox._cli import (
     SANDBOX_TOOLS_BASE_NAME,
     SANDBOX_TOOLS_DIR,
     local_sandbox_tools_dir,
+    local_sandbox_tools_namespace,
 )
 from inspect_ai.util._sandbox._framework_directory import framework_directory_command
 from inspect_ai.util._sandbox.context import (
@@ -149,9 +150,7 @@ async def _inject_container_tools_code_impl(sandbox: SandboxEnvironment) -> None
                     f"Failed to create sandbox tools staging dir: {result.stderr}"
                 )
 
-        await _extract_tools_tree(
-            sandbox, name, gz_bytes, tools_user, install_tmp
-        )
+        await _extract_tools_tree(sandbox, name, gz_bytes, tools_user, install_tmp)
         if not await _sandbox_cli_is_trusted(
             sandbox, tools_user, tools_dir=install_tmp
         ):
@@ -256,7 +255,17 @@ async def _sandbox_tools_detector(sandbox: SandboxEnvironment) -> bool:
     """Authorize reuse and select the identity that owns a trusted install."""
     tools_dir = _sandbox_tools_dir(sandbox)
     command = _sandbox_tools_validation_command(tools_dir)
-    for user in (None, "root"):
+    root_available = False
+    try:
+        probe = await sandbox.exec(["id", "-u"], user="root", timeout_retry=False)
+        root_available = probe.success and probe.stdout.strip() == "0"
+    except SandboxUnavailableError:
+        raise
+    except Exception:
+        pass
+
+    users: tuple[str | None, ...] = ("root",) if root_available else (None,)
+    for user in users:
         try:
             result = await sandbox.exec(command, user=user, timeout_retry=False)
         except SandboxUnavailableError:
@@ -307,7 +316,7 @@ def _sandbox_tools_dir(sandbox: SandboxEnvironment) -> str:
     except TypeError:
         pass
     else:
-        return local_sandbox_tools_dir(os.getuid())
+        return local_sandbox_tools_dir(local_sandbox_tools_namespace())
     return SANDBOX_TOOLS_DIR
 
 

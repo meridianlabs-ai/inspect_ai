@@ -11,6 +11,7 @@ import anyio
 import pytest
 
 from inspect_ai.tool._sandbox_tools_utils import sandbox as sandbox_tools
+from inspect_ai.util._sandbox import _cli as sandbox_cli
 from inspect_ai.util._sandbox._cli import SANDBOX_CLI
 from inspect_ai.util._sandbox.environment import (
     SandboxEnvironment,
@@ -68,17 +69,15 @@ class RootProbeRaisesSandbox(SandboxEnvironment):
                 stdout="",
                 stderr="",
             )
-        if cmd[:2] == ["sh", "-c"] and "validate_file()" in cmd[2]:
-            success = (
-                self.validation_results.pop(0) if self.validation_results else False
-            )
-            return ExecResult(
-                success=success,
-                returncode=0 if success else 1,
-                stdout="",
-                stderr="",
-            )
         if cmd[:2] == ["sh", "-c"] and "validate_owned()" in cmd[2]:
+            if self.validation_results:
+                success = self.validation_results.pop(0)
+                return ExecResult(
+                    success=success,
+                    returncode=0 if success else 1,
+                    stdout="1000\n" if success else "",
+                    stderr="",
+                )
             return ExecResult(
                 success=self.tools_dir_exists,
                 returncode=0 if self.tools_dir_exists else 1,
@@ -114,7 +113,7 @@ async def test_inject_container_tools_falls_back_when_root_probe_raises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sandbox = RootProbeRaisesSandbox()
-    sandbox.validation_results = [True, True]
+    sandbox.validation_results = [False, True, True]
 
     async def fake_detect_sandbox_os(
         _sandbox: SandboxEnvironment,
@@ -152,7 +151,7 @@ async def test_inject_container_tools_falls_back_when_root_probe_raises(
     validation_index = next(
         index
         for index, (command, _) in enumerate(sandbox.exec_calls)
-        if command[:2] == ["sh", "-c"] and "validate_file()" in command[2]
+        if command[:2] == ["sh", "-c"] and "validate_owned()" in command[2]
     )
     assert validation_index < start_index
 
@@ -179,9 +178,7 @@ async def test_injection_accepts_trusted_installation_appearing_late(
     async def fake_detector(_sandbox: SandboxEnvironment) -> bool:
         return next(detector_results)
 
-    async def tools_dir_exists(
-        _sandbox: SandboxEnvironment, _tools_dir: str
-    ) -> bool:
+    async def tools_dir_exists(_sandbox: SandboxEnvironment, _tools_dir: str) -> bool:
         return True
 
     monkeypatch.setattr(sandbox_tools, "detect_sandbox_os", fake_detect_sandbox_os)
@@ -196,7 +193,7 @@ async def test_injection_accepts_trusted_installation_appearing_late(
     assert all(command != ["id", "-u"] for command, _ in sandbox.exec_calls)
 
 
-async def test_detector_preserves_successful_default_root_identity() -> None:
+async def test_detector_uses_root_identity_when_root_is_available() -> None:
     class TrustedRootSandbox(RootProbeRaisesSandbox):
         async def exec(
             self,
@@ -215,14 +212,14 @@ async def test_detector_preserves_successful_default_root_identity() -> None:
     sandbox = TrustedRootSandbox()
 
     assert await sandbox_tools._sandbox_tools_detector(sandbox)
-    assert sandbox._tools_user is None
-    assert len(sandbox.exec_calls) == 1
-    command, user = sandbox.exec_calls[0]
-    assert user is None
+    assert sandbox._tools_user == "root"
+    assert len(sandbox.exec_calls) == 2
+    command, user = sandbox.exec_calls[1]
+    assert user == "root"
     assert "validate_owned()" in command[2]
 
 
-async def test_detector_uses_explicit_root_only_after_default_fails() -> None:
+async def test_detector_rejects_default_user_install_when_root_is_available() -> None:
     class ExplicitRootSandbox(RootProbeRaisesSandbox):
         async def exec(
             self,
@@ -236,7 +233,7 @@ async def test_detector_uses_explicit_root_only_after_default_fails() -> None:
             concurrency: bool = True,
         ) -> ExecResult[str]:
             self.exec_calls.append((cmd, user))
-            success = user == "root"
+            success = cmd == ["id", "-u"]
             return ExecResult(
                 success=success,
                 returncode=0 if success else 1,
@@ -246,9 +243,8 @@ async def test_detector_uses_explicit_root_only_after_default_fails() -> None:
 
     sandbox = ExplicitRootSandbox()
 
-    assert await sandbox_tools._sandbox_tools_detector(sandbox)
-    assert sandbox._tools_user == "root"
-    assert [user for _, user in sandbox.exec_calls] == [None, "root"]
+    assert not await sandbox_tools._sandbox_tools_detector(sandbox)
+    assert [user for _, user in sandbox.exec_calls] == ["root", "root"]
 
 
 async def test_injection_preserves_sandbox_unavailable_error() -> None:
@@ -277,7 +273,9 @@ def test_local_sandbox_tools_install_is_namespaced_per_os_user() -> None:
     finally:
         sandbox.directory.cleanup()
 
-    assert tools_dir == f"{sandbox_tools.SANDBOX_TOOLS_DIR}-{os.getuid()}"
+    assert tools_dir == sandbox_tools.local_sandbox_tools_dir(
+        sandbox_tools.local_sandbox_tools_namespace()
+    )
 
 
 def test_proxied_local_sandbox_tools_install_is_namespaced_per_os_user() -> None:
@@ -288,7 +286,20 @@ def test_proxied_local_sandbox_tools_install_is_namespaced_per_os_user() -> None
     finally:
         local.directory.cleanup()
 
-    assert tools_dir == f"{sandbox_tools.SANDBOX_TOOLS_DIR}-{os.getuid()}"
+    assert tools_dir == sandbox_tools.local_sandbox_tools_dir(
+        sandbox_tools.local_sandbox_tools_namespace()
+    )
+
+
+def test_local_sandbox_tools_namespace_without_getuid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delattr(os, "getuid")
+
+    namespace = sandbox_cli.local_sandbox_tools_namespace()
+
+    assert len(namespace) == 16
+    assert namespace.isalnum()
 
 
 async def test_cancelled_root_staging_creation_cleans_up_as_root(
