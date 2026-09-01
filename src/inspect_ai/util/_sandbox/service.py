@@ -582,15 +582,20 @@ class SandboxService:
                 timeout=600,
                 concurrency=False,
             )
-            if not parent_result.success:
-                parent_result = await self._sandbox.exec(
-                    command, timeout=600, concurrency=False
-                )
         except TimeoutError:
             raise RuntimeError(
                 f"Timed out preparing shared services directory {SERVICES_DIR}"
             )
         except Exception:
+            try:
+                root_probe = await self._sandbox.exec(
+                    ["id", "-u"], user="root", timeout=600, concurrency=False
+                )
+            except Exception:
+                root_probe = None
+            if root_probe is not None and root_probe.success:
+                if root_probe.stdout.strip() == "0":
+                    raise
             parent_result = await self._sandbox.exec(
                 command, timeout=600, concurrency=False
             )

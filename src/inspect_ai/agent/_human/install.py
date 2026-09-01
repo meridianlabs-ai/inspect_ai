@@ -23,17 +23,22 @@ async def install_human_agent(
     bashrc_content: str | None,
     record_session: bool,
 ) -> None:
+    if not user:
+        user = (await sandbox().exec(["whoami"])).stdout.strip()
+
     # see if we have already installed
     install_result = await sandbox().exec(
         framework_directory_command(HUMAN_AGENT_DIR, report_creation=True), user="root"
     )
     if not install_result.success:
-        raise RuntimeError(f"Unsafe human-agent directory: {HUMAN_AGENT_DIR}")
+        install_result = await sandbox().exec(
+            framework_directory_command(HUMAN_AGENT_DIR, report_creation=True),
+            user=user,
+        )
+        if not install_result.success or install_result.stdout.strip() != "existing":
+            raise RuntimeError(f"Unsafe human-agent directory: {HUMAN_AGENT_DIR}")
     if install_result.stdout.strip() == "existing":
         return
-
-    if not user:
-        user = (await sandbox().exec(["whoami"])).stdout.strip()
 
     if user != "root":
         await checked_exec(["chown", user, HUMAN_AGENT_DIR], user="root")

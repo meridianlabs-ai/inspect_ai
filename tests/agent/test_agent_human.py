@@ -4,16 +4,59 @@ import subprocess
 import sys
 import time
 from argparse import Namespace
+from dataclasses import dataclass, field
 from io import StringIO
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 from test_helpers.utils import skip_if_no_docker
 
 from inspect_ai import Task, eval
+from inspect_ai.agent._human import install as human_install
 from inspect_ai.agent._human.agent import human_cli
 from inspect_ai.agent._human.commands import submit
 from inspect_ai.agent._human.commands.submit import QuitCommand, SubmitCommand
+from inspect_ai.util import SandboxEnvironment
+from inspect_ai.util._sandbox.environment import ExecResult
+
+
+@dataclass
+class _InstallSandbox:
+    calls: list[tuple[list[str], str | None]] = field(default_factory=list)
+    human_directory_created: bool = False
+
+    async def exec(
+        self, cmd: list[str], *, user: str | None = None, **kwargs: Any
+    ) -> ExecResult[str]:
+        self.calls.append((cmd, user))
+        if cmd[:2] == ["sh", "-c"] and human_install.HUMAN_AGENT_DIR in cmd[2]:
+            if not self.human_directory_created:
+                self.human_directory_created = True
+                return ExecResult(True, 0, "created\n", "")
+            if user == "root":
+                return ExecResult(False, 1, "", "")
+            return ExecResult(True, 0, "existing\n", "")
+        return ExecResult(True, 0, "", "")
+
+
+async def test_human_agent_reuses_directory_owned_by_selected_user(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _InstallSandbox()
+    monkeypatch.setattr(
+        human_install, "sandbox", lambda: cast(SandboxEnvironment, fake)
+    )
+
+    await human_install.install_human_agent("agent", [], None, False)
+    await human_install.install_human_agent("agent", [], None, False)
+
+    directory_checks = [
+        user
+        for cmd, user in fake.calls
+        if cmd[:2] == ["sh", "-c"] and human_install.HUMAN_AGENT_DIR in cmd[2]
+    ]
+    assert directory_checks == ["root", "root", "agent"]
 
 
 @pytest.mark.parametrize(

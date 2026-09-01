@@ -272,6 +272,24 @@ async def test_ensure_service_dir_raises_when_dir_not_owned() -> None:
     assert fake.calls[2]["user"] == "agent"
 
 
+async def test_ensure_service_dir_does_not_fallback_after_root_rejection() -> None:
+    """An unsafe parent found as root is not retried as its untrusted owner."""
+    fake = FakeSandboxEnvironment(
+        results=[FakeExecResult(success=False, returncode=1)]
+    )
+    service = SandboxService(
+        name="squatted-parent",
+        sandbox=cast(SandboxEnvironment, fake),
+        user="agent",
+    )
+
+    with pytest.raises(PrerequisiteError, match="unsafe"):
+        await service.start()
+
+    assert len(fake.calls) == 1
+    assert fake.calls[0]["user"] == "root"
+
+
 async def test_ensure_service_dir_checks_root_service_dir_when_instance_set() -> None:
     """With instance set, both <name>/<instance> and <name> are ownership-checked."""
     fake = FakeSandboxEnvironment(
