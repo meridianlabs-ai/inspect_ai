@@ -10,8 +10,7 @@ from .._subprocess import ExecResult, subprocess
 from ._cli import (
     SANDBOX_CLI,
     SANDBOX_TOOLS_BASE_NAME,
-    local_sandbox_tools_dir,
-    local_sandbox_tools_namespace,
+    LOCAL_SANDBOX_TOOLS_DIR,
 )
 from .environment import (
     SandboxEnvironment,
@@ -25,7 +24,7 @@ from .registry import sandboxenv
 
 logger = getLogger(__name__)
 
-_LOCAL_SANDBOX_TOOLS_DIR = local_sandbox_tools_dir(local_sandbox_tools_namespace())
+_LOCAL_SANDBOX_TOOLS_DIR = LOCAL_SANDBOX_TOOLS_DIR
 _LOCAL_SANDBOX_CLI = f"{_LOCAL_SANDBOX_TOOLS_DIR}/{SANDBOX_TOOLS_BASE_NAME}"
 
 

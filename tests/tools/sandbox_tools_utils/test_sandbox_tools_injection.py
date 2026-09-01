@@ -412,20 +412,17 @@ async def test_injection_preserves_unavailability_during_root_staging_probe(
     assert sandbox.root_probes == 2
 
 
-def test_local_sandbox_tools_install_is_namespaced_per_os_user() -> None:
+def test_local_sandbox_tools_install_uses_resolved_local_path() -> None:
     sandbox = LocalSandboxEnvironment()
     try:
         tools_dir = sandbox_tools._sandbox_tools_dir(sandbox)
     finally:
         sandbox.directory.cleanup()
 
-    assert tools_dir == sandbox_cli.local_sandbox_tools_dir(
-        sandbox_cli.local_sandbox_tools_namespace()
-    )
-    assert Path(tools_dir).parent == Path.home()
+    assert tools_dir == sandbox_cli.LOCAL_SANDBOX_TOOLS_DIR
 
 
-def test_proxied_local_sandbox_tools_install_is_namespaced_per_os_user() -> None:
+def test_proxied_local_sandbox_tools_install_uses_resolved_local_path() -> None:
     local = LocalSandboxEnvironment()
     sandbox = SandboxEnvironmentProxy(local)
     try:
@@ -433,20 +430,20 @@ def test_proxied_local_sandbox_tools_install_is_namespaced_per_os_user() -> None
     finally:
         local.directory.cleanup()
 
-    assert tools_dir == sandbox_cli.local_sandbox_tools_dir(
-        sandbox_cli.local_sandbox_tools_namespace()
-    )
+    assert tools_dir == sandbox_cli.LOCAL_SANDBOX_TOOLS_DIR
 
 
-def test_local_sandbox_tools_namespace_without_getuid(
-    monkeypatch: pytest.MonkeyPatch,
+def test_local_sandbox_tools_path_supports_spaces(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.delattr(os, "getuid")
+    home = tmp_path / "home with spaces"
+    home.mkdir(mode=0o700)
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.setenv("HOME", os.fspath(home))
 
-    namespace = sandbox_cli.local_sandbox_tools_namespace()
+    tools_dir = sandbox_cli._local_sandbox_tools_dir()
 
-    assert len(namespace) == 16
-    assert namespace.isalnum()
+    assert Path(tools_dir).parent == home
 
 
 async def test_cancelled_root_staging_creation_cleans_up_as_root(
@@ -572,7 +569,7 @@ def test_publish_command_recovers_stale_lock(tmp_path: os.PathLike[str]) -> None
     assert not os.path.exists(lock)
 
 
-def test_publish_command_expires_live_looking_lock(
+def test_publish_command_does_not_expire_live_lock(
     tmp_path: os.PathLike[str],
 ) -> None:
     base = os.fspath(tmp_path)
@@ -607,9 +604,10 @@ def test_publish_command_expires_live_looking_lock(
         env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
     )
 
-    assert result.returncode == 0
-    assert os.path.isdir(destination)
-    assert not os.path.exists(lock)
+    assert result.returncode == 18
+    assert os.path.isdir(staging)
+    assert not os.path.exists(destination)
+    assert os.path.isdir(lock)
 
 
 def test_publish_command_creates_owner_with_restrictive_mode(
@@ -647,9 +645,12 @@ def test_publish_command_creates_owner_with_restrictive_mode(
             assert process.poll() is None
             time.sleep(0.01)
         assert os.stat(owner_file).st_mode & 0o777 == 0o600
+        with open(owner_file, "w") as owner:
+            owner.write("999999999:1\n")
     finally:
         os.killpg(process.pid, signal.SIGTERM)
         process.wait(timeout=5)
+    assert Path(owner_file).read_text() == "999999999:1\n"
 
 
 def test_publish_command_recovers_empty_owner_file(

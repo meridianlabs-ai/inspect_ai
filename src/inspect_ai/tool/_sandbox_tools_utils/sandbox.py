@@ -25,13 +25,11 @@ from inspect_ai._util.trace import trace_message
 from inspect_ai.util import input_screen
 from inspect_ai.util._concurrency import concurrency
 from inspect_ai.util._sandbox._cli import (
+    LOCAL_SANDBOX_TOOLS_DIR,
     SANDBOX_CLI,
     SANDBOX_TOOLS_BASE_NAME,
     SANDBOX_TOOLS_DIR,
-    local_sandbox_tools_dir,
-    local_sandbox_tools_namespace,
 )
-from inspect_ai.util._sandbox._framework_directory import framework_directory_command
 from inspect_ai.util._sandbox.context import (
     SandboxInjectable,
     sandbox_with_injection,
@@ -144,7 +142,7 @@ async def _inject_container_tools_code_impl(sandbox: SandboxEnvironment) -> None
         if not await _create_tools_dir_as_root(sandbox, install_tmp):
             tools_user = None
             sandbox._tools_user = tools_user
-            result = await sandbox.exec(framework_directory_command(install_tmp))
+            result = await sandbox.exec(["mkdir", "-m", "700", "--", install_tmp])
             if not result.success:
                 raise RuntimeError(
                     f"Failed to create sandbox tools staging dir: {result.stderr}"
@@ -193,6 +191,7 @@ lock_dir=$2
 owner_file=$lock_dir/owner
 lock_uid=$(id -u)
 cleanup_lock() {
+    test "$(cat -- "$owner_file" 2>/dev/null || true)" = "$lock_owner" || return
     rm -f -- "$owner_file"
     rmdir -- "$lock_dir" 2>/dev/null || true
 }
@@ -230,10 +229,6 @@ while ! mkdir -m 700 -- "$2" 2>/dev/null; do
             rm -f -- "$owner_file"
             rmdir -- "$lock_dir" 2>/dev/null || exit 18
             continue
-        elif test "$i" -ge 90; then
-            rm -f -- "$owner_file"
-            rmdir -- "$lock_dir" 2>/dev/null || exit 18
-            continue
         fi
     elif test -e "$owner_file" || test -L "$owner_file"; then
         exit 18
@@ -244,14 +239,15 @@ while ! mkdir -m 700 -- "$2" 2>/dev/null; do
     sleep .1
 done
 umask 077
+lock_owner="$$:$(process_start "$$")"
 trap cleanup_lock EXIT
 trap 'cleanup_lock; exit 129' HUP
 trap 'cleanup_lock; exit 130' INT
 trap 'cleanup_lock; exit 143' TERM
-printf '%s:%s\n' "$$" "$(process_start "$$")" > "$owner_file"
+printf '%s\n' "$lock_owner" > "$owner_file"
 if test -e "$3" || test -L "$3"; then exit 17; fi
 source_id=$(stat -c '%d:%i' -- "$1" 2>/dev/null || stat -f '%d:%i' "$1")
-mv -nT -- "$1" "$3"
+mv -nT -- "$1" "$3" || exit 17
 target_id=$(stat -c '%d:%i' -- "$3" 2>/dev/null || stat -f '%d:%i' "$3")
 test "$source_id" = "$target_id" || exit 17
 """
@@ -278,7 +274,7 @@ async def _create_tools_dir_as_root(
 
     if not probe.success or probe.stdout.strip() != "0":
         return False
-    result = await sandbox.exec(framework_directory_command(path), user="root")
+    result = await sandbox.exec(["mkdir", "-m", "700", "--", path], user="root")
     if not result.success:
         raise RuntimeError(
             "Sandbox tools path exists but is not a root-owned 0700 directory"
@@ -376,7 +372,7 @@ def _sandbox_tools_dir(sandbox: SandboxEnvironment) -> str:
     except TypeError:
         pass
     else:
-        return local_sandbox_tools_dir(local_sandbox_tools_namespace())
+        return LOCAL_SANDBOX_TOOLS_DIR
     return SANDBOX_TOOLS_DIR
 
 

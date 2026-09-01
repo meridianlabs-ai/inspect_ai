@@ -17,13 +17,13 @@ We additionally choose a dot-prefixed random hash sub-directory to reduce
 accidental discovery. When Inspect can run commands in the sandbox as root, it
 installs the tree as root and restricts it to 0700. A root-owned 0700 tree
 prevents access by other, non-root users, but not by a process running in the
-sandbox as root. Local sandboxes instead place the directory under the user's
-home directory so another user cannot reserve its name in a shared sticky
-directory.
+sandbox as root. Local sandboxes instead choose a private runtime or home
+directory, with an unpredictable private temporary directory as a fallback.
 """
 
-import hashlib
 import os
+import subprocess
+import tempfile
 from pathlib import Path
 
 # Also defined in inspect_ai.tool._sandbox_tools_utils._build_config — keep in sync.
@@ -34,24 +34,58 @@ SANDBOX_TOOLS_DIR = "/var/tmp/.da7be258e003d428"
 SANDBOX_CLI = f"{SANDBOX_TOOLS_DIR}/{SANDBOX_TOOLS_BASE_NAME}"
 
 
-def local_sandbox_tools_namespace() -> str:
-    """Return a stable, portable namespace for the current OS user."""
-    getuid = getattr(os, "getuid", None)
-    if getuid is not None:
-        return str(getuid())
+def _supports_executables(parent: Path) -> bool:
+    """Return whether executables can run from a writable directory."""
+    probe_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile("w", dir=parent, delete=False) as probe:
+            probe.write("#!/bin/sh\nexit 0\n")
+            probe_path = probe.name
+        os.chmod(probe_path, 0o700)
+        return subprocess.run(
+            [probe_path],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=1,
+            check=False,
+        ).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+    finally:
+        if probe_path is not None:
+            Path(probe_path).unlink(missing_ok=True)
 
-    identity = f"{os.environ.get('USERNAME', '')}\0{Path.home()}"
-    return hashlib.sha256(identity.encode()).hexdigest()[:16]
+
+def _local_sandbox_tools_dir() -> str:
+    """Choose a private, executable host-local installation directory."""
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+    candidates = [Path(runtime_dir)] if runtime_dir else []
+    candidates.append(Path.home())
+    for parent in candidates:
+        try:
+            stat = parent.stat()
+        except OSError:
+            continue
+        getuid = getattr(os, "getuid", None)
+        owned = getuid is None or stat.st_uid == getuid()
+        if (
+            owned
+            and stat.st_mode & 0o022 == 0
+            and os.access(parent, os.W_OK | os.X_OK)
+            and _supports_executables(parent)
+        ):
+            return str(parent / f".{Path(SANDBOX_TOOLS_DIR).name}")
+
+    # The fallback is unpredictable and created with mode 0700, so another user
+    # cannot reserve or replace it in the shared temporary directory.
+    private_parent = tempfile.mkdtemp(prefix="inspect-ai-tools-")
+    if not _supports_executables(Path(private_parent)):
+        raise RuntimeError(
+            "Local sandbox tools require an executable runtime, home, or temporary "
+            "directory"
+        )
+    return str(Path(private_parent) / f".{Path(SANDBOX_TOOLS_DIR).name}")
 
 
-def local_sandbox_tools_dir(user_namespace: str) -> str:
-    """Return the host-local tools directory isolated to an OS user.
-
-    Args:
-        user_namespace: Stable namespace for the host operating-system user.
-
-    Returns:
-        The per-user sandbox tools installation path.
-    """
-    name = f".{Path(SANDBOX_TOOLS_DIR).name}-{user_namespace}"
-    return str(Path.home() / name)
+LOCAL_SANDBOX_TOOLS_DIR = _local_sandbox_tools_dir()
