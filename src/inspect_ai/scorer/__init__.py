@@ -1,6 +1,7 @@
 from inspect_ai._util.deprecation import relocated_module_attribute
 
 from ._answer import AnswerPattern, answer
+from ._cascade import cascade
 from ._choice import choice
 from ._classification import exact, f1
 from ._match import includes, match
@@ -13,6 +14,7 @@ from ._metric import (
     UNCHANGED,
     Metric,
     MetricProtocol,
+    Reference,
     SampleScore,
     Score,
     ScoreEdit,
@@ -62,6 +64,7 @@ __all__ = [
     "MetricProtocol",
     "NOANSWER",
     "PARTIAL",
+    "Reference",
     "SampleScore",
     "Score",
     "ScoreEdit",
@@ -78,6 +81,7 @@ __all__ = [
     "answer",
     "at_least",
     "bootstrap_stderr",
+    "cascade",
     "categorical",
     "choice",
     "ci",
