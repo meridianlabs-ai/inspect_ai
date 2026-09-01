@@ -2,10 +2,11 @@ import inspect
 from textwrap import dedent
 
 from inspect_ai.util import sandbox
+from inspect_ai.util._sandbox._framework_directory import framework_directory_command
 
 from .commands.command import HumanAgentCommand
 
-INSTALL_DIR = "human_agent_install"
+INSTALL_DIR = "/var/tmp/human_agent_install"
 HUMAN_AGENT_DIR = "/opt/human_agent"
 TASK_PY = "task.py"
 INSTALL_SH = "install.sh"
@@ -22,20 +23,38 @@ async def install_human_agent(
     bashrc_content: str | None,
     record_session: bool,
 ) -> None:
-    # see if we have already installed
-    if not (await sandbox().exec(["mkdir", HUMAN_AGENT_DIR], user="root")).success:
-        return
-
     if not user:
         user = (await sandbox().exec(["whoami"])).stdout.strip()
+
+    # Root owns new installations until setup is complete. Existing non-root
+    # installations are verified as their configured owner and remain reusable.
+    install_result = await sandbox().exec(
+        framework_directory_command(HUMAN_AGENT_DIR, report_creation=True), user="root"
+    )
+    if not install_result.success and user != "root":
+        install_result = await sandbox().exec(
+            framework_directory_command(
+                HUMAN_AGENT_DIR, report_creation=True, repair_mode=True
+            ),
+            user=user,
+        )
+    if not install_result.success:
+        raise RuntimeError(f"Unsafe human-agent directory: {HUMAN_AGENT_DIR}")
+    if install_result.stdout.strip() == "existing":
+        return
 
     if user != "root":
         await checked_exec(["chown", user, HUMAN_AGENT_DIR], user="root")
 
     # setup installation directory
-    await checked_exec(["mkdir", "-p", INSTALL_DIR], user="root")
-    if user != "root":
-        await checked_exec(["chown", user, INSTALL_DIR], user="root")
+    await checked_exec(
+        framework_directory_command(INSTALL_DIR, repair_mode=True), user=user
+    )
+
+    if record_session:
+        await checked_exec(
+            framework_directory_command(RECORD_SESSION_DIR, repair_mode=True), user=user
+        )
 
     # generate task.py
     task_py = human_agent_commands(commands)
@@ -178,7 +197,6 @@ def human_agent_bashrc(
         if [ -z "$SCRIPT_RUNNING" ]; then
             export SCRIPT_RUNNING=1
             LOGDIR={RECORD_SESSION_DIR}
-            mkdir -p "$LOGDIR"
             TIMESTAMP=$(date +%Y%m%d_%H%M%S)
             INPUTFILE="$LOGDIR/$(whoami)_$TIMESTAMP.input"
             OUTPUTFILE="$LOGDIR/$(whoami)_$TIMESTAMP.output"
@@ -210,9 +228,7 @@ def human_agent_install_sh(user: str | None) -> str:
     return dedent(f"""
     #!/usr/bin/env bash
 
-    # create installation directory
     HUMAN_AGENT="{HUMAN_AGENT_DIR}"
-    mkdir -p $HUMAN_AGENT
 
     # copy command script
     cp {TASK_PY} $HUMAN_AGENT

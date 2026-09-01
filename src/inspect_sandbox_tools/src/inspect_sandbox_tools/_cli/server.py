@@ -4,7 +4,6 @@ import json
 import os
 import signal
 import socket
-import stat
 import sys
 
 from aiohttp.web import Application, Request, Response, run_app
@@ -17,6 +16,7 @@ from inspect_sandbox_tools._util.constants import (
     SHUTDOWN_STATUS_PATH,
     SOCKET_PATH,
 )
+from inspect_sandbox_tools._util.framework_directory import ensure_framework_directory
 from inspect_sandbox_tools._util.load_tools import load_tools
 
 _shutdown_errors: list[str] = []
@@ -111,21 +111,11 @@ def _prepare_socket_parent() -> None:
         return
 
     try:
-        status = SOCKET_PATH.parent.lstat()
-    except FileNotFoundError:
-        try:
-            SOCKET_PATH.parent.mkdir(mode=0o700)
-        except FileExistsError:
-            # Another long-path sample created the shared per-user directory.
-            pass
-        status = SOCKET_PATH.parent.lstat()
-
-    if not stat.S_ISDIR(status.st_mode) or status.st_uid != os.getuid():
+        ensure_framework_directory(SOCKET_PATH.parent, owner_uid=os.getuid())
+    except (OSError, RuntimeError) as ex:
         raise RuntimeError(
             f"Unsafe sandbox-tools socket directory: {SOCKET_PATH.parent}"
-        )
-
-    os.chmod(SOCKET_PATH.parent, 0o700)
+        ) from ex
 
 
 def main() -> None:
@@ -138,12 +128,9 @@ def main() -> None:
     os.environ.pop(SERVER_DIR_ENV, None)
     load_tools("inspect_sandbox_tools._remote_tools")
 
-    # Create server directory with permissions based on privilege level.
-    # Root: 0o700 prevents the agent from accessing socket/logs.
-    # Non-root: 0o777 allows any user (no privilege to escalate anyway).
-    directory_mode = 0o700 if os.getuid() == 0 else 0o777
-    SERVER_DIR.mkdir(exist_ok=True)
-    os.chmod(SERVER_DIR, directory_mode)
+    # Rootless sandboxes use their default UID and do not establish a separate
+    # agent/tools UID boundary, but the framework directory remains private.
+    ensure_framework_directory(SERVER_DIR, owner_uid=os.getuid())
     _prepare_socket_parent()
 
     # Remove stale socket file

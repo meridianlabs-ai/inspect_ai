@@ -11,6 +11,8 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
+from inspect_sandbox_tools._util.framework_directory import ensure_framework_directory
+
 JSON_RPC_RESPONSE_CHUNK_METHOD = "__inspect_json_rpc_response_chunk__"
 JSON_RPC_RESPONSE_CHUNK_FIELD = "__inspect_json_rpc_response_chunk__"
 JSON_RPC_RESPONSE_CHUNK_VERSION = 1
@@ -89,21 +91,7 @@ def _current_user_chunk_dir() -> Path:
 
     current_uid = os.getuid()
     chunk_dir = _CHUNK_DIR / str(current_uid)
-    try:
-        chunk_dir.mkdir(mode=0o700)
-    except FileExistsError:
-        pass
-
-    chunk_dir_stat = chunk_dir.lstat()
-    if (
-        stat.S_ISLNK(chunk_dir_stat.st_mode)
-        or not stat.S_ISDIR(chunk_dir_stat.st_mode)
-        or chunk_dir_stat.st_uid != current_uid
-    ):
-        raise RuntimeError(
-            f"JSON-RPC response chunk directory has unexpected owner: {chunk_dir}"
-        )
-    chunk_dir.chmod(0o700)
+    ensure_framework_directory(chunk_dir, owner_uid=current_uid)
     _remove_stale_chunks(chunk_dir)
     return chunk_dir
 

@@ -1,19 +1,46 @@
 """Tests for sandbox tools injection."""
 
+import stat
+import subprocess
 from contextlib import asynccontextmanager
 from io import BytesIO
+from pathlib import Path
 from typing import AsyncIterator, BinaryIO, Literal, overload
 
 import pytest
 
 from inspect_ai.tool._sandbox_tools_utils import sandbox as sandbox_tools
-from inspect_ai.util._sandbox._cli import SANDBOX_TOOLS_DIR
 from inspect_ai.util._sandbox.environment import (
     SandboxEnvironment,
     SandboxEnvironmentConfigType,
 )
 from inspect_ai.util._sandbox.recon import Architecture, SupportedContainerOSInfo
 from inspect_ai.util._subprocess import ExecResult
+
+
+def test_tools_directory_repairs_legacy_private_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tools_dir = tmp_path / "sandbox-tools"
+    tools_dir.mkdir(mode=0o755)
+    monkeypatch.setattr(sandbox_tools, "SANDBOX_TOOLS_DIR", str(tools_dir))
+
+    subprocess.run(sandbox_tools._ensure_tools_dir_command(), check=True)
+
+    assert stat.S_IMODE(tools_dir.stat().st_mode) == 0o700
+
+
+def test_tools_directory_rejects_legacy_writable_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tools_dir = tmp_path / "sandbox-tools"
+    tools_dir.mkdir(mode=0o777)
+    tools_dir.chmod(0o777)
+    monkeypatch.setattr(sandbox_tools, "SANDBOX_TOOLS_DIR", str(tools_dir))
+
+    result = subprocess.run(sandbox_tools._ensure_tools_dir_command(), check=False)
+
+    assert result.returncode != 0
 
 
 class RootProbeRaisesSandbox(SandboxEnvironment):
@@ -34,7 +61,7 @@ class RootProbeRaisesSandbox(SandboxEnvironment):
         concurrency: bool = True,
     ) -> ExecResult[str]:
         self.exec_calls.append((cmd, user))
-        if cmd == ["mkdir", "-p", SANDBOX_TOOLS_DIR] and user == "root":
+        if cmd == ["id", "-u"] and user == "root":
             raise RuntimeError("runuser: may not be used by non-root users")
         return ExecResult(success=True, returncode=0, stdout="", stderr="")
 
@@ -96,4 +123,5 @@ async def test_inject_container_tools_falls_back_when_root_probe_raises(
 
     assert sandbox._tools_user is None
     assert sandbox.extracted_as_user is None
-    assert (["mkdir", "-p", SANDBOX_TOOLS_DIR], "root") in sandbox.exec_calls
+    assert (["id", "-u"], "root") in sandbox.exec_calls
+    assert (sandbox_tools._ensure_tools_dir_command(), None) in sandbox.exec_calls
