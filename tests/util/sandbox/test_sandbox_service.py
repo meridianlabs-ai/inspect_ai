@@ -272,6 +272,75 @@ async def test_ensure_service_dir_raises_when_dir_not_owned() -> None:
     assert fake.calls[2]["user"] == "agent"
 
 
+async def test_ensure_service_dir_does_not_fallback_after_root_rejection() -> None:
+    """A root verification failure cannot authorize a default-user-owned parent."""
+    fake = FakeSandboxEnvironment(
+        results=[
+            FakeExecResult(success=False, returncode=1),  # unsafe parent
+            FakeExecResult(stdout="0\n"),  # root execution is available
+        ]
+    )
+    service = SandboxService(
+        name="unsafe_parent",
+        sandbox=cast(SandboxEnvironment, fake),
+        user="agent",
+    )
+
+    with pytest.raises(PrerequisiteError, match="owned by root with mode 1777"):
+        await service._ensure_service_dir()
+
+    assert len(fake.calls) == 2
+    assert fake.calls[0]["user"] == "root"
+    assert fake.calls[1] == {"cmd": ["id", "-u"], "user": "root"}
+
+
+async def test_ensure_service_dir_rootless_requires_default_user() -> None:
+    """Rootless sandboxes cannot create a service for a different UID."""
+    fake = FakeSandboxEnvironment(
+        results=[
+            FakeExecResult(success=False, returncode=1),  # root parent setup
+            FakeExecResult(success=False, returncode=1),  # root probe
+            FakeExecResult(stdout="1000\n"),  # default UID
+            FakeExecResult(stdout="1001\n"),  # requested service UID
+        ]
+    )
+    service = SandboxService(
+        name="other_user",
+        sandbox=cast(SandboxEnvironment, fake),
+        user="agent",
+    )
+
+    with pytest.raises(PrerequisiteError, match="root user switching is unavailable"):
+        await service._ensure_service_dir()
+
+
+async def test_ensure_service_dir_rootless_accepts_root_owned_parent() -> None:
+    """A rootless provider may use a pre-provisioned root-owned 1777 parent."""
+    fake = FakeSandboxEnvironment(
+        results=[
+            FakeExecResult(success=False, returncode=1),  # root parent setup
+            FakeExecResult(success=False, returncode=1),  # root probe
+            FakeExecResult(stdout="1000\n"),  # default UID
+            FakeExecResult(stdout="1000\n"),  # service UID
+            FakeExecResult(),  # root-owned parent verification
+            FakeExecResult(),  # service directory creation
+            FakeExecResult(),  # service directory ownership
+        ]
+    )
+    service = SandboxService(
+        name="rootless",
+        sandbox=cast(SandboxEnvironment, fake),
+        user="agent",
+    )
+
+    await service._ensure_service_dir()
+
+    parent_command = fake.calls[4]["cmd"]
+    assert parent_command[:2] == ["sh", "-c"]
+    assert f'stat -c %u -- {SERVICES_DIR})" = 0' in parent_command[2]
+    assert f'stat -c %a -- {SERVICES_DIR})" = 1777' in parent_command[2]
+
+
 async def test_ensure_service_dir_checks_root_service_dir_when_instance_set() -> None:
     """With instance set, both <name>/<instance> and <name> are ownership-checked."""
     fake = FakeSandboxEnvironment(

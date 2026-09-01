@@ -1,6 +1,5 @@
 """Tests for task cancellation via the cancel button during eval_set runs."""
 
-import asyncio
 import os
 import signal
 import tempfile
@@ -595,7 +594,7 @@ def test_external_interrupt_with_pending_resolution_logs_cancelled(
             log_dir=str(tmp_path),
             model="mockllm/model",
         )
-    except (KeyboardInterrupt, asyncio.CancelledError):
+    except KeyboardInterrupt:
         pass
     sigint_thread.join(timeout=5)
 

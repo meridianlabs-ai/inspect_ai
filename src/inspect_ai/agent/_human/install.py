@@ -29,7 +29,10 @@ async def install_human_agent(
     # Root owns new installations until setup is complete. Existing non-root
     # installations are verified as their configured owner and remain reusable.
     install_result = await sandbox().exec(
-        framework_directory_command(HUMAN_AGENT_DIR, report_creation=True), user="root"
+        framework_directory_command(
+            HUMAN_AGENT_DIR, report_creation=True, repair_mode=True
+        ),
+        user="root",
     )
     if not install_result.success and user != "root":
         install_result = await sandbox().exec(
@@ -58,17 +61,23 @@ async def install_human_agent(
 
     # generate task.py
     task_py = human_agent_commands(commands)
-    await checked_write_file(f"{INSTALL_DIR}/{TASK_PY}", task_py, executable=True)
+    await checked_write_file(
+        f"{INSTALL_DIR}/{TASK_PY}", task_py, executable=True, user=user
+    )
 
     # generate .bashrc
     bash_rc = human_agent_bashrc(commands, bashrc_content, record_session)
-    await checked_write_file(f"{INSTALL_DIR}/{BASHRC}", bash_rc, executable=True)
+    await checked_write_file(
+        f"{INSTALL_DIR}/{BASHRC}", bash_rc, executable=True, user=user
+    )
 
     # write and run installation script
     install_sh = human_agent_install_sh(user)
-    await checked_write_file(f"{INSTALL_DIR}/{INSTALL_SH}", install_sh, executable=True)
-    await checked_exec(["bash", f"./{INSTALL_SH}"], cwd=INSTALL_DIR)
-    await checked_exec(["rm", "-rf", INSTALL_DIR])
+    await checked_write_file(
+        f"{INSTALL_DIR}/{INSTALL_SH}", install_sh, executable=True, user=user
+    )
+    await checked_exec(["bash", f"./{INSTALL_SH}"], cwd=INSTALL_DIR, user=user)
+    await checked_exec(["rm", "-rf", INSTALL_DIR], user=user)
 
 
 def human_agent_commands(commands: list[HumanAgentCommand]) -> str:
@@ -260,8 +269,6 @@ async def checked_exec(
 async def checked_write_file(
     file: str, contents: str, executable: bool = False, user: str | None = None
 ) -> None:
-    await checked_exec(["tee", "--", file], input=contents)
-    if user:
-        await checked_exec(["chown", user, file], user="root")
+    await checked_exec(["tee", "--", file], input=contents, user=user)
     if executable:
-        await checked_exec(["chmod", "+x", file])
+        await checked_exec(["chmod", "+x", file], user=user)

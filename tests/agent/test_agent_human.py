@@ -11,9 +11,59 @@ import pytest
 from test_helpers.utils import skip_if_no_docker
 
 from inspect_ai import Task, eval
+from inspect_ai.agent._human import install
 from inspect_ai.agent._human.agent import human_cli
 from inspect_ai.agent._human.commands import submit
 from inspect_ai.agent._human.commands.submit import QuitCommand, SubmitCommand
+from inspect_ai.util._subprocess import ExecResult
+
+
+async def test_install_human_agent_repairs_legacy_root_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A safe legacy root installation is repaired and reused."""
+    calls: list[tuple[list[str], str | None]] = []
+
+    class FakeSandbox:
+        async def exec(
+            self, cmd: list[str], *, user: str | None = None, **kwargs: object
+        ) -> ExecResult[str]:
+            calls.append((cmd, user))
+            return ExecResult(True, 0, "existing\n", "")
+
+    monkeypatch.setattr(install, "sandbox", lambda: FakeSandbox())
+
+    await install.install_human_agent("root", [], None, False)
+
+    assert len(calls) == 1
+    command, user = calls[0]
+    assert user == "root"
+    assert "chmod 700" in command[2]
+
+
+async def test_checked_write_file_runs_as_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Staged files are written and made executable without privilege changes."""
+    calls: list[tuple[list[str], str | None]] = []
+
+    async def fake_checked_exec(
+        cmd: list[str],
+        input: str | bytes | None = None,
+        cwd: str | None = None,
+        user: str | None = None,
+    ) -> str:
+        calls.append((cmd, user))
+        return ""
+
+    monkeypatch.setattr(install, "checked_exec", fake_checked_exec)
+
+    await install.checked_write_file("/tmp/staged", "contents", True, "agent")
+
+    assert calls == [
+        (["tee", "--", "/tmp/staged"], "agent"),
+        (["chmod", "+x", "/tmp/staged"], "agent"),
+    ]
 
 
 @pytest.mark.parametrize(

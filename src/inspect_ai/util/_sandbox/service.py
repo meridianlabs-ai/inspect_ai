@@ -582,17 +582,56 @@ class SandboxService:
                 timeout=600,
                 concurrency=False,
             )
-            if not parent_result.success:
-                parent_result = await self._sandbox.exec(
-                    command, timeout=600, concurrency=False
-                )
         except TimeoutError:
             raise RuntimeError(
                 f"Timed out preparing shared services directory {SERVICES_DIR}"
             )
         except Exception:
+            parent_result = None
+
+        if parent_result is None or not parent_result.success:
+            try:
+                root_probe = await self._sandbox.exec(
+                    ["id", "-u"],
+                    user="root",
+                    timeout=600,
+                    concurrency=False,
+                )
+            except Exception:
+                root_probe = None
+            if (
+                root_probe is not None
+                and root_probe.success
+                and root_probe.stdout.strip() == "0"
+            ):
+                raise PrerequisiteError(
+                    f"Shared sandbox services directory '{SERVICES_DIR}' is unsafe: "
+                    "it must be owned by root with mode 1777."
+                )
+            default_uid = await self._sandbox.exec(
+                ["id", "-u"], timeout=600, concurrency=False
+            )
+            service_uid = await self._exec(["id", "-u"])
+            if (
+                not default_uid.success
+                or not service_uid.success
+                or default_uid.stdout.strip() != service_uid.stdout.strip()
+            ):
+                user = self._user or "the sandbox default user"
+                raise PrerequisiteError(
+                    f"Sandbox service '{self._name}' cannot run as user '{user}' "
+                    "because root user switching is unavailable."
+                )
+            rootless_command = [
+                "sh",
+                "-c",
+                f"if test -d {SERVICES_DIR} && test ! -L {SERVICES_DIR} && "
+                f'test "$(stat -c %u -- {SERVICES_DIR})" = 0 && '
+                f'test "$(stat -c %a -- {SERVICES_DIR})" = {SERVICES_DIR_MODE}; '
+                f"then :; else {command[2]}; fi",
+            ]
             parent_result = await self._sandbox.exec(
-                command, timeout=600, concurrency=False
+                rootless_command, timeout=600, concurrency=False
             )
         if not parent_result.success:
             raise PrerequisiteError(
