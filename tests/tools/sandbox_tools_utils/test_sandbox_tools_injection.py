@@ -225,9 +225,7 @@ async def test_injection_accepts_valid_install_after_publication_failure(
     monkeypatch.setattr(sandbox_tools, "_extract_tools_tree", fake_extract_tools_tree)
     monkeypatch.setattr(sandbox_tools, "_sandbox_cli_is_trusted", trusted_staging)
 
-    await sandbox_tools._inject_container_tools_code_impl(
-        ConcurrentPublisherSandbox()
-    )
+    await sandbox_tools._inject_container_tools_code_impl(ConcurrentPublisherSandbox())
 
 
 async def test_injection_accepts_trusted_installation_appearing_late(
@@ -419,7 +417,7 @@ def test_local_sandbox_tools_install_uses_resolved_local_path() -> None:
     finally:
         sandbox.directory.cleanup()
 
-    assert tools_dir == sandbox_cli.LOCAL_SANDBOX_TOOLS_DIR
+    assert tools_dir == sandbox_cli.local_sandbox_tools_dir()
 
 
 def test_proxied_local_sandbox_tools_install_uses_resolved_local_path() -> None:
@@ -430,7 +428,14 @@ def test_proxied_local_sandbox_tools_install_uses_resolved_local_path() -> None:
     finally:
         local.directory.cleanup()
 
-    assert tools_dir == sandbox_cli.LOCAL_SANDBOX_TOOLS_DIR
+    assert tools_dir == sandbox_cli.local_sandbox_tools_dir()
+
+
+def test_local_sandbox_tools_path_is_not_resolved_at_import() -> None:
+    # Resolution probes the filesystem (writes and executes a shell script), which
+    # must only happen when a local sandbox actually needs the path.
+    assert not hasattr(sandbox_cli, "LOCAL_SANDBOX_TOOLS_DIR")
+    assert callable(sandbox_cli.local_sandbox_tools_dir)
 
 
 def test_local_sandbox_tools_path_supports_spaces(
@@ -444,6 +449,37 @@ def test_local_sandbox_tools_path_supports_spaces(
     tools_dir = sandbox_cli._local_sandbox_tools_dir()
 
     assert Path(tools_dir).parent == home
+
+
+def test_local_sandbox_tools_path_ignores_relative_runtime_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "runtime")
+    monkeypatch.setenv("HOME", os.fspath(home))
+
+    tools_dir = sandbox_cli._local_sandbox_tools_dir()
+
+    assert Path(tools_dir).parent == home
+
+    monkeypatch.setenv("XDG_RUNTIME_DIR", os.fspath(runtime))
+    assert Path(sandbox_cli._local_sandbox_tools_dir()).parent == runtime
+
+
+def test_local_sandbox_tools_path_fails_without_suitable_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.setenv("HOME", os.fspath(tmp_path / "missing"))
+
+    with pytest.raises(RuntimeError, match="Local sandbox tools require"):
+        sandbox_cli._local_sandbox_tools_dir()
+
+    assert list(tmp_path.iterdir()) == []
 
 
 async def test_cancelled_root_staging_creation_cleans_up_as_root(
@@ -581,9 +617,7 @@ def test_publish_command_does_not_expire_live_lock(
     os.mkdir(lock)
     os.chmod(lock, 0o700)
     os.mkdir(bin_dir)
-    process_fields = (
-        Path(f"/proc/{os.getpid()}/stat").read_text().split(") ", 1)[1]
-    )
+    process_fields = Path(f"/proc/{os.getpid()}/stat").read_text().split(") ", 1)[1]
     process_start = process_fields.split()[19]
     with open(os.path.join(lock, "owner"), "w") as owner:
         owner.write(f"{os.getpid()}:{process_start}\n")

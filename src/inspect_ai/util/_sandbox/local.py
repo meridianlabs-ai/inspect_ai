@@ -7,11 +7,7 @@ from typing import Literal, Union, overload
 from typing_extensions import override
 
 from .._subprocess import ExecResult, subprocess
-from ._cli import (
-    SANDBOX_CLI,
-    SANDBOX_TOOLS_BASE_NAME,
-    LOCAL_SANDBOX_TOOLS_DIR,
-)
+from ._cli import SANDBOX_CLI, local_sandbox_cli
 from .environment import (
     SandboxEnvironment,
     SandboxEnvironmentConfigType,
@@ -23,9 +19,6 @@ from .limits import (
 from .registry import sandboxenv
 
 logger = getLogger(__name__)
-
-_LOCAL_SANDBOX_TOOLS_DIR = LOCAL_SANDBOX_TOOLS_DIR
-_LOCAL_SANDBOX_CLI = f"{_LOCAL_SANDBOX_TOOLS_DIR}/{SANDBOX_TOOLS_BASE_NAME}"
 
 
 @sandboxenv(name="local")
@@ -99,9 +92,11 @@ class LocalSandboxEnvironment(SandboxEnvironment):
 
         final_cmd = cmd
         final_env = env
-        if cmd and cmd[0] in {SANDBOX_CLI, _LOCAL_SANDBOX_CLI}:
+        if cmd and cmd[0] == SANDBOX_CLI:
+            # The tools are installed in a per-user directory rather than at the
+            # shared container path, so redirect the launcher.
             self._sandbox_tools_used = True
-            final_cmd = [_LOCAL_SANDBOX_CLI, *cmd[1:]]
+            final_cmd = [local_sandbox_cli(), *cmd[1:]]
             final_env = {
                 **(env or {}),
                 self._SANDBOX_TOOLS_DIR_ENV: str(self._sandbox_tools_dir),
@@ -121,11 +116,11 @@ class LocalSandboxEnvironment(SandboxEnvironment):
     async def _stop_sandbox_tools(self, *, timeout: int) -> None:
         if not self._sandbox_tools_used or not self._sandbox_tools_dir.exists():
             return
-        if not Path(_LOCAL_SANDBOX_CLI).exists():
+        if not Path(local_sandbox_cli()).exists():
             raise RuntimeError("Cannot stop local sandbox-tools server: CLI is missing")
 
         result = await self.exec(
-            [_LOCAL_SANDBOX_CLI, "stop-server"],
+            [SANDBOX_CLI, "stop-server"],
             cwd="/",
             timeout=timeout,
             timeout_retry=False,

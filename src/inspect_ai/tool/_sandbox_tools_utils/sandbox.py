@@ -25,10 +25,10 @@ from inspect_ai._util.trace import trace_message
 from inspect_ai.util import input_screen
 from inspect_ai.util._concurrency import concurrency
 from inspect_ai.util._sandbox._cli import (
-    LOCAL_SANDBOX_TOOLS_DIR,
     SANDBOX_CLI,
     SANDBOX_TOOLS_BASE_NAME,
     SANDBOX_TOOLS_DIR,
+    local_sandbox_tools_dir,
 )
 from inspect_ai.util._sandbox.context import (
     SandboxInjectable,
@@ -309,9 +309,7 @@ async def _sandbox_tools_detector(sandbox: SandboxEnvironment) -> bool:
         sandbox.as_type(LocalSandboxEnvironment)
     except TypeError:
         try:
-            probe = await sandbox.exec(
-                ["id", "-u"], user="root", timeout_retry=False
-            )
+            probe = await sandbox.exec(["id", "-u"], user="root", timeout_retry=False)
             root_available = probe.success and probe.stdout.strip() == "0"
         except SandboxUnavailableError:
             raise
@@ -372,7 +370,7 @@ def _sandbox_tools_dir(sandbox: SandboxEnvironment) -> str:
     except TypeError:
         pass
     else:
-        return LOCAL_SANDBOX_TOOLS_DIR
+        return local_sandbox_tools_dir()
     return SANDBOX_TOOLS_DIR
 
 
