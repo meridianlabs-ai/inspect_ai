@@ -11,7 +11,10 @@ from inspect_ai.model._compaction.types import CompactionStrategy
 from inspect_ai.model._model import GenerateFilter, Model, ModelEventSink
 from inspect_ai.tool._mcp._config import MCPServerConfigHTTP
 from inspect_ai.tool._mcp._tools_bridge import BridgedToolsSpec
-from inspect_ai.tool._sandbox_tools_utils.sandbox import sandbox_with_injected_tools
+from inspect_ai.tool._sandbox_tools_utils.sandbox import (
+    sandbox_tools_cli,
+    sandbox_with_injected_tools,
+)
 from inspect_ai.tool._tool_def import ToolDef
 from inspect_ai.tool._tools._code_execution import CodeExecutionProviders
 from inspect_ai.tool._tools._web_search._web_search import (
@@ -19,7 +22,6 @@ from inspect_ai.tool._tools._web_search._web_search import (
 )
 from inspect_ai.util._anyio import inner_exception
 from inspect_ai.util._checkpoint.checkpointer import Checkpointer
-from inspect_ai.util._sandbox._cli import SANDBOX_CLI
 from inspect_ai.util._sandbox.exec_remote import (
     ExecCompleted,
     ExecRemoteProcess,
@@ -205,7 +207,7 @@ async def sandbox_agent_bridge(
 
             # proxy server that runs in container and forwards to sandbox service
             proxy = await sandbox_env.exec_remote(
-                cmd=[SANDBOX_CLI, "model_proxy"],
+                cmd=[sandbox_tools_cli(sandbox_env), "model_proxy"],
                 options=ExecRemoteStreamingOptions(
                     concurrency=False,
                     env={

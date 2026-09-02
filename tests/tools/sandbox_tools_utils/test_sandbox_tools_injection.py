@@ -4,6 +4,7 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import time
 import warnings
 from contextlib import asynccontextmanager
@@ -30,6 +31,13 @@ from inspect_ai.util._sandbox.events import SandboxEnvironmentProxy
 from inspect_ai.util._sandbox.local import LocalSandboxEnvironment
 from inspect_ai.util._sandbox.recon import Architecture, SupportedContainerOSInfo
 from inspect_ai.util._subprocess import ExecResult
+
+# The publication script runs only inside Linux sandboxes (see `detect_sandbox_os`),
+# and its tests exercise it directly: GNU/BusyBox `mv -T` and `/proc/<pid>/stat`
+# have no macOS equivalents.
+publish_script_test = pytest.mark.skipif(
+    sys.platform != "linux", reason="publication script requires Linux mv and /proc"
+)
 
 
 @pytest.fixture
@@ -576,25 +584,37 @@ async def test_injection_preserves_unavailability_during_root_staging_probe(
     assert sandbox.root_probes == 1
 
 
-def test_local_sandbox_tools_install_uses_resolved_local_path() -> None:
+def test_local_sandbox_tools_install_uses_resolved_local_path(
+    local_tools_dir: Path,
+) -> None:
     sandbox = LocalSandboxEnvironment()
     try:
         tools_dir = sandbox_tools._sandbox_tools_dir(sandbox)
+        cli = sandbox_tools.sandbox_tools_cli(sandbox)
     finally:
         sandbox.directory.cleanup()
 
-    assert tools_dir == sandbox_cli.local_sandbox_tools_dir()
+    assert tools_dir == str(local_tools_dir)
+    assert cli == str(local_tools_dir / SANDBOX_TOOLS_BASE_NAME)
 
 
-def test_proxied_local_sandbox_tools_install_uses_resolved_local_path() -> None:
+def test_proxied_local_sandbox_tools_install_uses_resolved_local_path(
+    local_tools_dir: Path,
+) -> None:
     local = LocalSandboxEnvironment()
     sandbox = SandboxEnvironmentProxy(local)
     try:
         tools_dir = sandbox_tools._sandbox_tools_dir(sandbox)
+        cli = sandbox_tools.sandbox_tools_cli(sandbox)
     finally:
         local.directory.cleanup()
 
-    assert tools_dir == sandbox_cli.local_sandbox_tools_dir()
+    assert tools_dir == str(local_tools_dir)
+    assert cli == str(local_tools_dir / SANDBOX_TOOLS_BASE_NAME)
+
+
+def test_container_sandbox_tools_cli_is_shared_path() -> None:
+    assert sandbox_tools.sandbox_tools_cli(RootProbeRaisesSandbox()) == SANDBOX_CLI
 
 
 def test_local_sandbox_tools_path_is_not_resolved_at_import() -> None:
@@ -719,6 +739,7 @@ def test_validation_command_rejects_missing_installation(
     assert result.returncode != 0
 
 
+@publish_script_test
 def test_publish_command_rejects_destination_created_during_move(
     tmp_path: os.PathLike[str],
 ) -> None:
@@ -749,6 +770,7 @@ def test_publish_command_rejects_destination_created_during_move(
     assert os.listdir(destination) == []
 
 
+@publish_script_test
 def test_publish_command_reports_move_failure_distinctly(
     tmp_path: os.PathLike[str],
 ) -> None:
@@ -781,6 +803,7 @@ def test_publish_command_reports_move_failure_distinctly(
     assert not os.path.exists(destination)
 
 
+@publish_script_test
 def test_publish_command_recovers_stale_lock(tmp_path: os.PathLike[str]) -> None:
     base = os.fspath(tmp_path)
     staging = os.path.join(base, "staging")
@@ -803,6 +826,7 @@ def test_publish_command_recovers_stale_lock(tmp_path: os.PathLike[str]) -> None
     assert not os.path.exists(lock)
 
 
+@publish_script_test
 def test_publish_command_does_not_expire_live_lock(
     tmp_path: os.PathLike[str],
 ) -> None:
@@ -837,11 +861,13 @@ def test_publish_command_does_not_expire_live_lock(
     )
 
     assert result.returncode == 18
+    assert "timed out waiting for another installation" in result.stderr
     assert os.path.isdir(staging)
     assert not os.path.exists(destination)
     assert os.path.isdir(lock)
 
 
+@publish_script_test
 def test_publish_command_creates_owner_with_restrictive_mode(
     tmp_path: os.PathLike[str],
 ) -> None:
@@ -885,6 +911,7 @@ def test_publish_command_creates_owner_with_restrictive_mode(
     assert Path(owner_file).read_text() == "999999999:1\n"
 
 
+@publish_script_test
 def test_publish_command_recovers_empty_owner_file(
     tmp_path: os.PathLike[str],
 ) -> None:
@@ -910,6 +937,7 @@ def test_publish_command_recovers_empty_owner_file(
     assert not os.path.exists(lock)
 
 
+@publish_script_test
 def test_publish_command_rejects_lock_symlink_without_deleting_target(
     tmp_path: os.PathLike[str],
 ) -> None:
@@ -931,10 +959,12 @@ def test_publish_command_rejects_lock_symlink_without_deleting_target(
     result = subprocess.run(command, check=False, capture_output=True, text=True)
 
     assert result.returncode == 18
+    assert f"{lock} is not a directory owned by uid {os.getuid()}" in result.stderr
     assert os.path.isfile(owner_file)
     assert not os.path.exists(destination)
 
 
+@publish_script_test
 def test_publish_command_rejects_malformed_lock_without_retrying(
     tmp_path: os.PathLike[str],
 ) -> None:
@@ -956,9 +986,11 @@ def test_publish_command_rejects_malformed_lock_without_retrying(
     )
 
     assert result.returncode == 18
+    assert f"cannot remove unclaimed lock {lock}" in result.stderr
     assert not os.path.exists(destination)
 
 
+@publish_script_test
 def test_publish_command_cancellation_releases_lock(
     tmp_path: os.PathLike[str],
 ) -> None:

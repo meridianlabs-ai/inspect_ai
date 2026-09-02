@@ -220,9 +220,10 @@ def _publish_tools_command(
 ) -> list[str]:
     """Return a collision-safe, sandbox-scoped publication command.
 
-    Exits 17 when the destination is (or becomes) occupied and 18 when the lock
-    cannot be acquired safely; any other failure (e.g. `mv` itself failing) keeps
-    its own status and stderr so the real cause reaches the error message.
+    Exits 17 when the destination is (or becomes) occupied and 18 (with a one-line
+    reason on stderr) when the lock cannot be acquired safely; any other failure
+    (e.g. `mv` itself failing) keeps its own status and stderr so the real cause
+    reaches the error message.
     """
     lock_dir = _publish_lock_dir(tools_dir)
     script = """\
@@ -230,6 +231,7 @@ set -eu
 lock_dir=$2
 owner_file=$lock_dir/owner
 lock_uid=$(id -u)
+lock_fail() { printf '%s\\n' "$1" >&2; exit 18; }
 cleanup_lock() {
     test "$(cat -- "$owner_file" 2>/dev/null || true)" = "$lock_owner" || return
     rm -f -- "$owner_file"
@@ -253,27 +255,27 @@ process_start() {
 i=0
 while ! mkdir -m 700 -- "$2" 2>/dev/null; do
     i=$((i + 1))
-    test "$i" -lt 100 || exit 18
-    safe_lock_dir || exit 18
+    test "$i" -lt 100 || lock_fail "timed out waiting for another installation holding $lock_dir"
+    safe_lock_dir || lock_fail "$lock_dir is not a directory owned by uid $lock_uid with mode 700"
     if safe_owner_file; then
         owner=$(cat -- "$owner_file")
         case "$owner" in *:*) owner_pid=${owner%%:*}; owner_start=${owner#*:};; *) owner_pid=; owner_start=;; esac
-        case "$owner_pid$owner_start" in *[!0-9]*) exit 18;; esac
+        case "$owner_pid$owner_start" in *[!0-9]*) lock_fail "$owner_file has malformed contents";; esac
         if test -z "$owner_pid" || test -z "$owner_start"; then
             if test "$i" -ge 10; then
                 rm -f -- "$owner_file"
-                rmdir -- "$lock_dir" 2>/dev/null || exit 18
+                rmdir -- "$lock_dir" 2>/dev/null || lock_fail "cannot remove unclaimed lock $lock_dir"
                 continue
             fi
         elif test "$(process_start "$owner_pid" 2>/dev/null || true)" != "$owner_start"; then
             rm -f -- "$owner_file"
-            rmdir -- "$lock_dir" 2>/dev/null || exit 18
+            rmdir -- "$lock_dir" 2>/dev/null || lock_fail "cannot remove stale lock $lock_dir"
             continue
         fi
     elif test -e "$owner_file" || test -L "$owner_file"; then
-        exit 18
+        lock_fail "$owner_file is not a regular file owned by uid $lock_uid with mode 600"
     elif test "$i" -ge 10; then
-        rmdir -- "$lock_dir" 2>/dev/null || exit 18
+        rmdir -- "$lock_dir" 2>/dev/null || lock_fail "cannot remove unclaimed lock $lock_dir"
         continue
     fi
     sleep .1
@@ -475,6 +477,17 @@ def _sandbox_tools_dir(sandbox: SandboxEnvironment) -> str:
     if _is_local_sandbox(sandbox):
         return local_sandbox_tools_dir()
     return SANDBOX_TOOLS_DIR
+
+
+def sandbox_tools_cli(sandbox: SandboxEnvironment) -> str:
+    """Return the launcher path as installed in ``sandbox``.
+
+    ``LocalSandboxEnvironment.exec`` redirects ``SANDBOX_CLI`` to the host-local
+    install itself, but a command handed to the tools server as a payload (e.g. via
+    ``exec_remote``) is spawned by the server, so it must name the launcher where it
+    actually lives.
+    """
+    return f"{_sandbox_tools_dir(sandbox)}/{SANDBOX_TOOLS_BASE_NAME}"
 
 
 async def _extract_tools_tree(
