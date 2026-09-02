@@ -142,7 +142,10 @@ async def _inject_container_tools_code_impl(sandbox: SandboxEnvironment) -> None
         gz_bytes = f.read()  # gzipped tar of the PyInstaller --onedir tree
 
     install_tmp = f"{tools_dir}.install-{os.urandom(16).hex()}"
-    published = False
+    # The tree this call owns and removes if it fails: the staging tree until it is
+    # published, then the published tree until it passes verification. Leaving an
+    # unverified tree at tools_dir would make every later detector pass reject it.
+    owned_path: str | None = install_tmp
     # Record the intended owner before the cancellable creation so an interrupted
     # root mkdir is still cleaned up as root. Local sandboxes ignore `user`, so they
     # never probe for root (and never emit LocalSandboxEnvironment's warning).
@@ -182,20 +185,22 @@ async def _inject_container_tools_code_impl(sandbox: SandboxEnvironment) -> None
             raise RuntimeError(
                 f"Failed to publish sandbox tools installation: {result.stderr}"
             )
+        owned_path = tools_dir
         verification = await _verify_installation(sandbox, tools_dir)
         if not verification.trusted:
             raise RuntimeError(
-                "Published sandbox tools installation failed validation: "
-                f"{verification.reason}"
+                "Published sandbox tools installation failed validation "
+                f"({verification.reason}); it was removed so the next tool call "
+                "reinstalls"
             )
-        published = True
+        owned_path = None
 
         result = await sandbox.exec([SANDBOX_CLI, "start-server"], user=tools_user)
         if not result.success:
             raise RuntimeError(f"Failed to start sandbox tools server: {result.stderr}")
     except BaseException:
-        if not published:
-            await _cleanup_paths(sandbox, tools_user, install_tmp)
+        if owned_path is not None:
+            await _cleanup_paths(sandbox, tools_user, owned_path)
         raise
 
 

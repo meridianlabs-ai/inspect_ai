@@ -32,6 +32,21 @@ from inspect_ai.util._sandbox.recon import Architecture, SupportedContainerOSInf
 from inspect_ai.util._subprocess import ExecResult
 
 
+@pytest.fixture
+def local_tools_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point local sandbox tools at a temp directory instead of the real home dir.
+
+    The real resolver would find whatever is installed under the developer's
+    ``$HOME`` / ``$XDG_RUNTIME_DIR`` (and cache it process-wide).
+    """
+    tools_dir = tmp_path / "tools"
+    monkeypatch.setattr(
+        sandbox_tools, "local_sandbox_tools_dir", lambda: str(tools_dir)
+    )
+    monkeypatch.setattr(sandbox_cli, "local_sandbox_tools_dir", lambda: str(tools_dir))
+    return tools_dir
+
+
 class RootProbeRaisesSandbox(SandboxEnvironment):
     def __init__(self) -> None:
         super().__init__()
@@ -234,6 +249,93 @@ async def test_injection_accepts_valid_install_after_publication_failure(
     assert validated_dirs[-1] == SANDBOX_TOOLS_DIR
 
 
+async def test_injection_removes_published_tree_that_fails_verification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class TransientRootProbeSandbox(RootProbeRaisesSandbox):
+        """Root `id -u` raises (transiently), but root exec works afterwards."""
+
+        async def exec(
+            self,
+            cmd: list[str],
+            input: str | bytes | None = None,
+            cwd: str | None = None,
+            env: dict[str, str] | None = None,
+            user: str | None = None,
+            timeout: int | None = None,
+            timeout_retry: bool = True,
+            concurrency: bool = True,
+        ) -> ExecResult[str]:
+            if (
+                user == "root"
+                and cmd[:2] == ["sh", "-c"]
+                and "validate_owned()" in cmd[2]
+            ):
+                self.exec_calls.append((cmd, user))
+                # root is available now, and rejects the user-owned tree
+                return ExecResult(
+                    success=False,
+                    returncode=1,
+                    stdout="0\n",
+                    stderr=f"{cmd[4]} is owned by uid 1000",
+                )
+            if cmd[:3] == ["rm", "-rf", "--"]:
+                self.exec_calls.append((cmd, user))
+                if SANDBOX_TOOLS_DIR in cmd[3:]:
+                    self.tools_dir_exists = False
+                return ExecResult(success=True, returncode=0, stdout="", stderr="")
+            return await super().exec(
+                cmd, input, cwd, env, user, timeout, timeout_retry, concurrency
+            )
+
+    async def fake_detect_sandbox_os(
+        _sandbox: SandboxEnvironment,
+    ) -> SupportedContainerOSInfo:
+        return {"architecture": "amd64", "libc": "glibc"}
+
+    @asynccontextmanager
+    async def fake_open_executable_for_arch(
+        _arch: Architecture,
+        _musl: bool,
+    ) -> AsyncIterator[tuple[str, BinaryIO]]:
+        yield "inspect-sandbox-tools", BytesIO(b"binary")
+
+    async def fake_extract_tools_tree(
+        _sandbox: SandboxEnvironment,
+        _name: str,
+        _gz_bytes: bytes,
+        _user: str | None,
+        _tools_dir: str,
+    ) -> None:
+        pass
+
+    monkeypatch.setattr(sandbox_tools, "detect_sandbox_os", fake_detect_sandbox_os)
+    monkeypatch.setattr(
+        sandbox_tools, "_open_executable_for_arch", fake_open_executable_for_arch
+    )
+    monkeypatch.setattr(sandbox_tools, "_extract_tools_tree", fake_extract_tools_tree)
+
+    sandbox = TransientRootProbeSandbox()
+    sandbox.validation_results = [True]  # staging validation as the default user
+
+    with pytest.raises(
+        sandbox_tools.SandboxInjectionError,
+        match="Published sandbox tools installation failed validation",
+    ):
+        await sandbox_tools._inject_container_tools_code(sandbox)
+
+    # the tree this call published is removed (as its owner) rather than left in
+    # place for every later detector pass to reject
+    removals = [
+        command for command, _ in sandbox.exec_calls if command[:2] == ["rm", "-rf"]
+    ]
+    assert removals == [["rm", "-rf", "--", SANDBOX_TOOLS_DIR]]
+    assert not sandbox.tools_dir_exists
+    assert all(
+        command != [SANDBOX_CLI, "start-server"] for command, _ in sandbox.exec_calls
+    )
+
+
 async def test_injection_accepts_trusted_installation_appearing_late(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -380,7 +482,9 @@ async def test_detector_falls_back_to_default_user_when_root_is_unavailable() ->
     assert [user for _, user in sandbox.exec_calls] == ["root", None]
 
 
-async def test_detector_does_not_warn_about_user_for_local_sandbox() -> None:
+async def test_detector_does_not_warn_about_user_for_local_sandbox(
+    local_tools_dir: Path,
+) -> None:
     sandbox = LocalSandboxEnvironment()
     try:
         with warnings.catch_warnings():
@@ -390,7 +494,9 @@ async def test_detector_does_not_warn_about_user_for_local_sandbox() -> None:
         sandbox.directory.cleanup()
 
 
-async def test_detector_does_not_warn_about_user_for_proxied_local_sandbox() -> None:
+async def test_detector_does_not_warn_about_user_for_proxied_local_sandbox(
+    local_tools_dir: Path,
+) -> None:
     local = LocalSandboxEnvironment()
     sandbox = SandboxEnvironmentProxy(local)
     try:
@@ -1020,13 +1126,9 @@ def test_launcher_validator_checks_filesystem_state(tmp_path: os.PathLike[str]) 
 
 
 async def test_local_sandbox_injection_skips_root_probe(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    local_tools_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    tools_dir = tmp_path / "tools"
-    monkeypatch.setattr(
-        sandbox_tools, "local_sandbox_tools_dir", lambda: str(tools_dir)
-    )
-    monkeypatch.setattr(sandbox_cli, "local_sandbox_tools_dir", lambda: str(tools_dir))
+    tools_dir = local_tools_dir
 
     async def fake_detect_sandbox_os(
         _sandbox: SandboxEnvironment,
@@ -1069,7 +1171,7 @@ async def test_local_sandbox_injection_skips_root_probe(
 
     assert sandbox._tools_user is None
     assert (tools_dir / SANDBOX_TOOLS_BASE_NAME).is_file()
-    assert list(tmp_path.iterdir()) == [tools_dir]
+    assert list(tools_dir.parent.iterdir()) == [tools_dir]
 
 
 def test_launcher_validator_accepts_safe_root_owned_install_for_nonroot_user(
