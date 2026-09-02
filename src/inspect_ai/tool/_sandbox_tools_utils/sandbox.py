@@ -1,6 +1,7 @@
 import gzip
 import hashlib
 import os
+import posixpath
 import subprocess
 import sys
 import tempfile
@@ -9,7 +10,7 @@ from contextlib import asynccontextmanager
 from importlib import resources
 from logging import getLogger
 from pathlib import Path
-from typing import AsyncIterator, BinaryIO, Literal, get_args
+from typing import AsyncIterator, BinaryIO, Literal, NamedTuple, get_args
 from urllib.parse import unquote, urlparse
 
 import anyio
@@ -40,6 +41,7 @@ from inspect_ai.util._sandbox.environment import (
 )
 from inspect_ai.util._sandbox.local import LocalSandboxEnvironment
 from inspect_ai.util._sandbox.recon import Architecture, detect_sandbox_os
+from inspect_ai.util._subprocess import ExecResult
 
 from ._build_config import (
     SandboxToolsBuildConfig,
@@ -106,8 +108,6 @@ async def sandbox_with_injected_tools(
 
 async def _inject_container_tools_code(sandbox: SandboxEnvironment) -> None:
     try:
-        if await _sandbox_tools_detector(sandbox):
-            return
         await _inject_container_tools_code_impl(sandbox)
     except SandboxUnavailableError:
         raise
@@ -118,14 +118,21 @@ async def _inject_container_tools_code(sandbox: SandboxEnvironment) -> None:
 
 
 async def _inject_container_tools_code_impl(sandbox: SandboxEnvironment) -> None:
-    """Stage tools independently and atomically publish into the sandbox."""
+    """Stage tools independently and atomically publish into the sandbox.
+
+    The caller (``sandbox_with_injection``) has just run the detector under the
+    injection lock, so this starts from "no trusted install" and only re-checks the
+    install path to distinguish an absent install from an occupied-but-untrusted one.
+    """
     tools_dir = _sandbox_tools_dir(sandbox)
     if await _tools_dir_exists(sandbox, tools_dir):
-        if await _sandbox_tools_detector(sandbox):
+        verification = await _verify_installation(sandbox, tools_dir)
+        if verification.trusted:
             return
         raise RuntimeError(
-            "Existing sandbox tools installation is unsafe; recreate the sandbox "
-            "rather than replacing a potentially active installation"
+            f"Existing sandbox tools installation at {tools_dir} failed validation "
+            f"({verification.reason}). Inspect does not replace a potentially active "
+            "installation; remove that directory or recreate the sandbox."
         )
 
     info = await detect_sandbox_os(sandbox)
@@ -136,23 +143,26 @@ async def _inject_container_tools_code_impl(sandbox: SandboxEnvironment) -> None
 
     install_tmp = f"{tools_dir}.install-{os.urandom(16).hex()}"
     published = False
-    tools_user: str | None = "root"
+    # Record the intended owner before the cancellable creation so an interrupted
+    # root mkdir is still cleaned up as root. Local sandboxes ignore `user`, so they
+    # never probe for root (and never emit LocalSandboxEnvironment's warning).
+    tools_user: str | None = None if _is_local_sandbox(sandbox) else "root"
     try:
         sandbox._tools_user = tools_user
-        if not await _create_tools_dir_as_root(sandbox, install_tmp):
+        if tools_user is None or not await _create_tools_dir_as_root(
+            sandbox, install_tmp
+        ):
             tools_user = None
             sandbox._tools_user = tools_user
-            result = await sandbox.exec(["mkdir", "-m", "700", "--", install_tmp])
-            if not result.success:
-                raise RuntimeError(
-                    f"Failed to create sandbox tools staging dir: {result.stderr}"
-                )
+            await _create_staging_dir(sandbox, install_tmp, user=None)
 
         await _extract_tools_tree(sandbox, name, gz_bytes, tools_user, install_tmp)
-        if not await _sandbox_cli_is_trusted(
-            sandbox, tools_user, tools_dir=install_tmp
-        ):
-            raise RuntimeError("Injected sandbox tools launcher failed validation")
+        result = await _validate_installation_as(sandbox, tools_user, install_tmp)
+        if not result.success:
+            raise RuntimeError(
+                "Injected sandbox tools launcher failed validation: "
+                f"{result.stderr.strip()}"
+            )
         result = await sandbox.exec(
             _publish_tools_command(install_tmp, tools_dir),
             user=tools_user,
@@ -161,14 +171,23 @@ async def _inject_container_tools_code_impl(sandbox: SandboxEnvironment) -> None
         if not result.success and await _sandbox_tools_detector(sandbox):
             await _cleanup_paths(sandbox, tools_user, install_tmp)
             return
-        if result.returncode == 17:
+        if result.returncode == _PUBLISH_COLLISION_EXIT:
             raise RuntimeError("Concurrent sandbox tools installation is unsafe")
+        if result.returncode == _PUBLISH_LOCK_EXIT:
+            raise RuntimeError(
+                "Could not acquire the sandbox tools publication lock "
+                f"{_publish_lock_dir(tools_dir)}: {result.stderr.strip()}"
+            )
         if not result.success:
             raise RuntimeError(
                 f"Failed to publish sandbox tools installation: {result.stderr}"
             )
-        if not await _sandbox_tools_detector(sandbox):
-            raise RuntimeError("Published sandbox tools installation failed validation")
+        verification = await _verify_installation(sandbox, tools_dir)
+        if not verification.trusted:
+            raise RuntimeError(
+                "Published sandbox tools installation failed validation: "
+                f"{verification.reason}"
+            )
         published = True
 
         result = await sandbox.exec([SANDBOX_CLI, "start-server"], user=tools_user)
@@ -180,11 +199,27 @@ async def _inject_container_tools_code_impl(sandbox: SandboxEnvironment) -> None
         raise
 
 
+# Exit codes of the publication script (keep in sync with `_publish_tools_command`).
+_PUBLISH_COLLISION_EXIT = 17
+"""Another installation occupies (or appeared at) the destination."""
+_PUBLISH_LOCK_EXIT = 18
+"""The publication lock could not be acquired safely."""
+
+
+def _publish_lock_dir(tools_dir: str) -> str:
+    return f"{tools_dir}.publish-lock"
+
+
 def _publish_tools_command(
     install_tmp: str, tools_dir: str = SANDBOX_TOOLS_DIR
 ) -> list[str]:
-    """Return a collision-safe, sandbox-scoped publication command."""
-    lock_dir = f"{tools_dir}.publish-lock"
+    """Return a collision-safe, sandbox-scoped publication command.
+
+    Exits 17 when the destination is (or becomes) occupied and 18 when the lock
+    cannot be acquired safely; any other failure (e.g. `mv` itself failing) keeps
+    its own status and stderr so the real cause reaches the error message.
+    """
+    lock_dir = _publish_lock_dir(tools_dir)
     script = """\
 set -eu
 lock_dir=$2
@@ -247,7 +282,10 @@ trap 'cleanup_lock; exit 143' TERM
 printf '%s\n' "$lock_owner" > "$owner_file"
 if test -e "$3" || test -L "$3"; then exit 17; fi
 source_id=$(stat -c '%d:%i' -- "$1" 2>/dev/null || stat -f '%d:%i' "$1")
-mv -nT -- "$1" "$3" || exit 17
+if ! mv -nT -- "$1" "$3"; then
+    if test -e "$3" || test -L "$3"; then exit 17; fi
+    exit 1
+fi
 target_id=$(stat -c '%d:%i' -- "$3" 2>/dev/null || stat -f '%d:%i' "$3")
 test "$source_id" = "$target_id" || exit 17
 """
@@ -274,12 +312,35 @@ async def _create_tools_dir_as_root(
 
     if not probe.success or probe.stdout.strip() != "0":
         return False
-    result = await sandbox.exec(["mkdir", "-m", "700", "--", path], user="root")
+    await _create_staging_dir(sandbox, path, user="root")
+    return True
+
+
+async def _create_staging_dir(
+    sandbox: SandboxEnvironment, path: str, user: str | None
+) -> None:
+    """Create a fresh 0700 staging directory at ``path`` as ``user``.
+
+    The parent is created if missing (images without ``/var/tmp`` relied on the
+    previous ``mkdir -p``); the leaf itself is created without ``-p`` so an entry that
+    already occupies the random staging name fails instead of being adopted.
+    """
+    result = await sandbox.exec(
+        [
+            "sh",
+            "-c",
+            'mkdir -p -- "$1" && mkdir -m 700 -- "$2"',
+            "sh",
+            posixpath.dirname(path),
+            path,
+        ],
+        user=user,
+    )
     if not result.success:
         raise RuntimeError(
-            "Sandbox tools path exists but is not a root-owned 0700 directory"
+            f"Failed to create sandbox tools staging dir {path}: "
+            f"{result.stderr.strip()}"
         )
-    return True
 
 
 async def _tools_dir_exists(
@@ -302,74 +363,111 @@ async def _tools_dir_exists(
 
 async def _sandbox_tools_detector(sandbox: SandboxEnvironment) -> bool:
     """Authorize reuse and select the identity that owns a trusted install."""
-    tools_dir = _sandbox_tools_dir(sandbox)
-    command = _sandbox_tools_validation_command(tools_dir)
-    root_available = False
-    try:
-        sandbox.as_type(LocalSandboxEnvironment)
-    except TypeError:
-        try:
-            probe = await sandbox.exec(["id", "-u"], user="root", timeout_retry=False)
-            root_available = probe.success and probe.stdout.strip() == "0"
-        except SandboxUnavailableError:
-            raise
-        except Exception:
-            pass
+    verification = await _verify_installation(sandbox, _sandbox_tools_dir(sandbox))
+    return verification.trusted
 
-    users: tuple[str | None, ...] = ("root",) if root_available else (None,)
-    for user in users:
+
+class _InstallVerification(NamedTuple):
+    trusted: bool
+    """Whether the install root and launcher passed validation."""
+    reason: str
+    """Why validation failed (empty when trusted)."""
+
+
+async def _verify_installation(
+    sandbox: SandboxEnvironment, tools_dir: str
+) -> _InstallVerification:
+    """Validate an installation in one round trip and select the identity that owns it.
+
+    The validation script prints the effective UID before validating, so a single
+    exec as root establishes both whether root is available (stdout ``0``) and whether
+    the install is trusted. A root-capable sandbox only trusts a root-validated
+    install, so a launcher pre-positioned by the default user cannot be adopted; the
+    default user is tried only when root is unavailable. Local sandboxes ignore
+    ``user`` (and warn about it), so they validate as the default user directly.
+
+    On success, records the validating identity as ``sandbox._tools_user``.
+    """
+    if not _is_local_sandbox(sandbox):
         try:
-            result = await sandbox.exec(command, user=user, timeout_retry=False)
+            result = await _validate_installation_as(sandbox, "root", tools_dir)
         except SandboxUnavailableError:
             raise
-        except Exception:
-            continue
-        if result.success:
-            sandbox._tools_user = user
-            return True
-    return False
+        except Exception as ex:
+            # Broad catch is deliberate: providers signal "cannot exec as root" by
+            # raising provider-specific exception types.
+            trace_message(
+                logger,
+                TRACE_SANDBOX_TOOLS,
+                f"root sandbox tools validation failed; trying default user: {ex}",
+            )
+        else:
+            if result.stdout.strip() == "0":
+                if result.success:
+                    sandbox._tools_user = "root"
+                return _InstallVerification(result.success, result.stderr.strip())
+
+    try:
+        result = await _validate_installation_as(sandbox, None, tools_dir)
+    except SandboxUnavailableError:
+        raise
+    except Exception as ex:
+        return _InstallVerification(False, str(ex))
+    if result.success:
+        sandbox._tools_user = None
+    return _InstallVerification(result.success, result.stderr.strip())
+
+
+async def _validate_installation_as(
+    sandbox: SandboxEnvironment, user: str | None, tools_dir: str
+) -> ExecResult[str]:
+    """Run the validation script for ``tools_dir`` as ``user``."""
+    return await sandbox.exec(
+        _sandbox_tools_validation_command(tools_dir), user=user, timeout_retry=False
+    )
 
 
 def _sandbox_tools_validation_command(
     tools_dir: str = SANDBOX_TOOLS_DIR,
 ) -> list[str]:
-    """Build one command that validates the install root and launcher."""
+    """Build one command that validates the install root and launcher.
+
+    Prints the effective UID to stdout first (see ``_verify_installation``), then
+    exits non-zero with a one-line reason on stderr at the first failed check.
+    """
     script = """\
 set -e
-validate_owned() {
-    test "$1" "$2" && test ! -L "$2" || return 1
-    set -- $(stat -c '%u %a' -- "$2" 2>/dev/null || stat -f '%u %Lp' "$2" 2>/dev/null) || return 1
-    test "$1" = "$(id -u)" || test "$1" = 0 || return 1
-    test $((0$2 & 022)) -eq 0
-}
-validate_owned -d "$1"
-validate_owned -f "$2"
-test -x "$1"
-test -x "$2"
 id -u
+fail() { printf '%s\\n' "$1" >&2; exit 1; }
+validate_owned() {
+    test ! -L "$2" || fail "$2 is a symbolic link"
+    test "$1" "$2" || fail "$2 is missing or not a $3"
+    attrs=$(stat -c '%u %a' -- "$2" 2>/dev/null || stat -f '%u %Lp' "$2" 2>/dev/null) || fail "cannot stat $2"
+    owner=${attrs% *}
+    mode=${attrs#* }
+    test "$owner" = "$(id -u)" || test "$owner" = 0 || fail "$2 is owned by uid $owner"
+    test $((0$mode & 022)) -eq 0 || fail "$2 is writable by other users (mode $mode)"
+    test -x "$2" || fail "$2 is not executable"
+}
+validate_owned -d "$1" directory
+validate_owned -f "$2" "regular file"
 """
     sandbox_cli = f"{tools_dir}/{SANDBOX_TOOLS_BASE_NAME}"
     return ["sh", "-c", script, "sh", tools_dir, sandbox_cli]
 
 
-async def _sandbox_cli_is_trusted(
-    sandbox: SandboxEnvironment,
-    user: str | None,
-    *,
-    tools_dir: str = SANDBOX_TOOLS_DIR,
-) -> bool:
-    """Return whether the existing launcher is safe to execute."""
-    command = _sandbox_tools_validation_command(tools_dir)
-    return (await sandbox.exec(command, user=user)).success
+def _is_local_sandbox(sandbox: SandboxEnvironment) -> bool:
+    """Return whether the sandbox is host-local (directly or behind a proxy)."""
+    try:
+        sandbox.as_type(LocalSandboxEnvironment)
+    except TypeError:
+        return False
+    return True
 
 
 def _sandbox_tools_dir(sandbox: SandboxEnvironment) -> str:
     """Return the install directory, namespaced for host-local sandboxes."""
-    try:
-        sandbox.as_type(LocalSandboxEnvironment)
-    except TypeError:
-        pass
-    else:
+    if _is_local_sandbox(sandbox):
         return local_sandbox_tools_dir()
     return SANDBOX_TOOLS_DIR
 
@@ -461,14 +559,17 @@ async def _secure_archive(
     contents: bytes,
     user: str | None,
 ) -> None:
-    """Copy an upload under the extraction identity and verify its contents."""
+    """Copy an upload under the extraction identity and verify its contents.
+
+    The upload itself is left in place: the caller removes it (best-effort) together
+    with the protected copy, so a removal problem can't fail the injection here.
+    """
     digest = hashlib.sha256(contents).hexdigest()
     script = """\
 set -eu
 umask 077
 cp -- "$1" "$2"
 printf '%s  %s\\n' "$3" "$2" | sha256sum -c -
-rm -f -- "$1"
 """
     result = await sandbox.exec(
         ["sh", "-c", script, "sh", upload_path, protected_path, digest], user=user

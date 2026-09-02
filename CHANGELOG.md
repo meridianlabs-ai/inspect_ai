@@ -42,7 +42,7 @@
 - OpenAI: Responses API requests now omit the `id` key on synthesized message and reasoning items rather than sending an explicit null, which backends like vLLM reject.
 - Hooks: Fixed hooks published by extension packages silently not loading when another hook was already registered at startup.
 - Bugfix: Model calls no longer time out during long samples with realtime logging or bounded transcripts enabled.
-- Sandbox: Sandbox-tools injection now rejects install directories that are symlinks, owned by another user, or writable by other users.
+- Sandbox: Sandbox-tools injection now rejects install directories that are symlinks, owned by another user, or writable by other users, and local sandboxes install the tools under `$XDG_RUNTIME_DIR` or the home directory (failing if neither is a private, executable directory) instead of `/var/tmp`.
 - Control Channel: `inspect ctl sample cancel --action cancel` now works on samples that haven't started — cancelling a never-started sample before it runs and withdrawing (un-requeuing) a queued re-run so its prior outcome stands.
 - Metrics: Add `ci_wilson()` metric reporting the Wilson score confidence interval for the mean of binary scores (as `{"lower", "upper"}`), with bounds always within [0, 1]; `cluster=` computes an effective-sample-size interval accounting for within-cluster correlation.
 - Agent Bridge: Image tool results now reach sandboxed agents as MCP image content instead of being flattened to text.

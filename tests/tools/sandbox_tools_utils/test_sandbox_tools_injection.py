@@ -16,7 +16,11 @@ import pytest
 
 from inspect_ai.tool._sandbox_tools_utils import sandbox as sandbox_tools
 from inspect_ai.util._sandbox import _cli as sandbox_cli
-from inspect_ai.util._sandbox._cli import SANDBOX_CLI
+from inspect_ai.util._sandbox._cli import (
+    SANDBOX_CLI,
+    SANDBOX_TOOLS_BASE_NAME,
+    SANDBOX_TOOLS_DIR,
+)
 from inspect_ai.util._sandbox.environment import (
     SandboxEnvironment,
     SandboxEnvironmentConfigType,
@@ -117,7 +121,8 @@ async def test_inject_container_tools_falls_back_when_root_probe_raises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sandbox = RootProbeRaisesSandbox()
-    sandbox.validation_results = [False, True, True]
+    # staging validation, then post-publication validation
+    sandbox.validation_results = [True, True]
 
     async def fake_detect_sandbox_os(
         _sandbox: SandboxEnvironment,
@@ -209,23 +214,24 @@ async def test_injection_accepts_valid_install_after_publication_failure(
     ) -> None:
         pass
 
-    async def trusted_staging(
-        _sandbox: SandboxEnvironment,
-        _user: str | None,
-        *,
-        tools_dir: str,
-    ) -> bool:
-        assert ".install-" in tools_dir
-        return True
-
     monkeypatch.setattr(sandbox_tools, "detect_sandbox_os", fake_detect_sandbox_os)
     monkeypatch.setattr(
         sandbox_tools, "_open_executable_for_arch", fake_open_executable_for_arch
     )
     monkeypatch.setattr(sandbox_tools, "_extract_tools_tree", fake_extract_tools_tree)
-    monkeypatch.setattr(sandbox_tools, "_sandbox_cli_is_trusted", trusted_staging)
 
-    await sandbox_tools._inject_container_tools_code_impl(ConcurrentPublisherSandbox())
+    sandbox = ConcurrentPublisherSandbox()
+    sandbox.validation_results = [True]  # staging validation
+
+    await sandbox_tools._inject_container_tools_code_impl(sandbox)
+
+    validated_dirs = [
+        command[4]
+        for command, _ in sandbox.exec_calls
+        if command[:2] == ["sh", "-c"] and "validate_owned()" in command[2]
+    ]
+    assert any(".install-" in tools_dir for tools_dir in validated_dirs)
+    assert validated_dirs[-1] == SANDBOX_TOOLS_DIR
 
 
 async def test_injection_accepts_trusted_installation_appearing_late(
@@ -245,10 +251,10 @@ async def test_injection_accepts_trusted_installation_appearing_late(
     ) -> AsyncIterator[tuple[str, BinaryIO]]:
         yield "inspect-sandbox-tools", BytesIO(b"binary")
 
-    detector_results = iter((False, True))
-
-    async def fake_detector(_sandbox: SandboxEnvironment) -> bool:
-        return next(detector_results)
+    async def trusted_verification(
+        _sandbox: SandboxEnvironment, _tools_dir: str
+    ) -> sandbox_tools._InstallVerification:
+        return sandbox_tools._InstallVerification(trusted=True, reason="")
 
     async def tools_dir_exists(_sandbox: SandboxEnvironment, _tools_dir: str) -> bool:
         return True
@@ -257,12 +263,35 @@ async def test_injection_accepts_trusted_installation_appearing_late(
     monkeypatch.setattr(
         sandbox_tools, "_open_executable_for_arch", fake_open_executable_for_arch
     )
-    monkeypatch.setattr(sandbox_tools, "_sandbox_tools_detector", fake_detector)
+    monkeypatch.setattr(sandbox_tools, "_verify_installation", trusted_verification)
     monkeypatch.setattr(sandbox_tools, "_tools_dir_exists", tools_dir_exists)
 
     await sandbox_tools._inject_container_tools_code(sandbox)
 
     assert all(command != ["id", "-u"] for command, _ in sandbox.exec_calls)
+
+
+async def test_injection_error_names_untrusted_installation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sandbox = RootProbeRaisesSandbox()
+    sandbox.tools_dir_exists = True
+
+    async def untrusted_verification(
+        _sandbox: SandboxEnvironment, tools_dir: str
+    ) -> sandbox_tools._InstallVerification:
+        return sandbox_tools._InstallVerification(
+            trusted=False, reason=f"{tools_dir} is owned by uid 1000"
+        )
+
+    monkeypatch.setattr(sandbox_tools, "_verify_installation", untrusted_verification)
+
+    with pytest.raises(sandbox_tools.SandboxInjectionError) as excinfo:
+        await sandbox_tools._inject_container_tools_code(sandbox)
+
+    message = str(excinfo.value)
+    assert SANDBOX_TOOLS_DIR in message
+    assert "is owned by uid 1000" in message
 
 
 async def test_detector_uses_root_identity_when_root_is_available() -> None:
@@ -285,8 +314,9 @@ async def test_detector_uses_root_identity_when_root_is_available() -> None:
 
     assert await sandbox_tools._sandbox_tools_detector(sandbox)
     assert sandbox._tools_user == "root"
-    assert len(sandbox.exec_calls) == 2
-    command, user = sandbox.exec_calls[1]
+    # a single round trip establishes both root availability and trust
+    assert len(sandbox.exec_calls) == 1
+    command, user = sandbox.exec_calls[0]
     assert user == "root"
     assert "validate_owned()" in command[2]
 
@@ -305,18 +335,49 @@ async def test_detector_rejects_default_user_install_when_root_is_available() ->
             concurrency: bool = True,
         ) -> ExecResult[str]:
             self.exec_calls.append((cmd, user))
-            success = cmd == ["id", "-u"]
+            # root is available (uid 0 printed) but the install fails validation
             return ExecResult(
-                success=success,
-                returncode=0 if success else 1,
-                stdout="0\n" if success else "",
-                stderr="",
+                success=False,
+                returncode=1,
+                stdout="0\n",
+                stderr="/var/tmp/tools is owned by uid 1000",
             )
 
     sandbox = ExplicitRootSandbox()
 
     assert not await sandbox_tools._sandbox_tools_detector(sandbox)
-    assert [user for _, user in sandbox.exec_calls] == ["root", "root"]
+    # no fallback to the default user: that could adopt a pre-positioned launcher
+    assert [user for _, user in sandbox.exec_calls] == ["root"]
+
+
+async def test_detector_falls_back_to_default_user_when_root_is_unavailable() -> None:
+    class RootlessSandbox(RootProbeRaisesSandbox):
+        async def exec(
+            self,
+            cmd: list[str],
+            input: str | bytes | None = None,
+            cwd: str | None = None,
+            env: dict[str, str] | None = None,
+            user: str | None = None,
+            timeout: int | None = None,
+            timeout_retry: bool = True,
+            concurrency: bool = True,
+        ) -> ExecResult[str]:
+            self.exec_calls.append((cmd, user))
+            if user == "root":
+                return ExecResult(
+                    success=False,
+                    returncode=1,
+                    stdout="",
+                    stderr="runuser: may not be used by non-root users",
+                )
+            return ExecResult(success=True, returncode=0, stdout="1000\n", stderr="")
+
+    sandbox = RootlessSandbox()
+
+    assert await sandbox_tools._sandbox_tools_detector(sandbox)
+    assert sandbox._tools_user is None
+    assert [user for _, user in sandbox.exec_calls] == ["root", None]
 
 
 async def test_detector_does_not_warn_about_user_for_local_sandbox() -> None:
@@ -380,8 +441,7 @@ async def test_injection_preserves_unavailability_during_root_staging_probe(
         ) -> ExecResult[str]:
             if cmd == ["id", "-u"] and user == "root":
                 self.root_probes += 1
-                if self.root_probes == 2:
-                    raise SandboxUnavailableError("sandbox stopped during staging")
+                raise SandboxUnavailableError("sandbox stopped during staging")
             return await super().exec(
                 cmd, input, cwd, env, user, timeout, timeout_retry, concurrency
             )
@@ -407,7 +467,7 @@ async def test_injection_preserves_unavailability_during_root_staging_probe(
     with pytest.raises(SandboxUnavailableError, match="sandbox stopped during staging"):
         await sandbox_tools._inject_container_tools_code(sandbox)
 
-    assert sandbox.root_probes == 2
+    assert sandbox.root_probes == 1
 
 
 def test_local_sandbox_tools_install_uses_resolved_local_path() -> None:
@@ -581,6 +641,38 @@ def test_publish_command_rejects_destination_created_during_move(
     assert result.returncode == 17
     assert os.path.isdir(staging)
     assert os.listdir(destination) == []
+
+
+def test_publish_command_reports_move_failure_distinctly(
+    tmp_path: os.PathLike[str],
+) -> None:
+    base = os.fspath(tmp_path)
+    staging = os.path.join(base, "staging")
+    destination = os.path.join(base, "tools")
+    bin_dir = os.path.join(base, "bin")
+    os.mkdir(staging)
+    os.mkdir(bin_dir)
+    mv_wrapper = os.path.join(bin_dir, "mv")
+    with open(mv_wrapper, "w") as wrapper:
+        wrapper.write("#!/bin/sh\necho 'mv: unrecognized option' >&2\nexit 1\n")
+    os.chmod(mv_wrapper, 0o700)
+    command = sandbox_tools._publish_tools_command(staging)
+    command[5] = os.path.join(base, "lock")
+    command[6] = destination
+
+    result = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
+    )
+
+    # not reported as a collision: the real cause reaches the error message
+    assert result.returncode not in (0, 17, 18)
+    assert "unrecognized option" in result.stderr
+    assert os.path.isdir(staging)
+    assert not os.path.exists(destination)
 
 
 def test_publish_command_recovers_stale_lock(tmp_path: os.PathLike[str]) -> None:
@@ -901,15 +993,83 @@ def test_launcher_validator_checks_filesystem_state(tmp_path: os.PathLike[str]) 
     command = sandbox_tools._sandbox_tools_validation_command(tools_dir)
     command[5] = launcher
 
-    assert subprocess.run(command, check=False).returncode == 0
+    def validate() -> subprocess.CompletedProcess[str]:
+        return subprocess.run(command, check=False, capture_output=True, text=True)
+
+    result = validate()
+    assert result.returncode == 0
+    assert result.stdout.strip() == str(os.getuid())
 
     os.chmod(launcher, 0o722)
-    assert subprocess.run(command, check=False).returncode != 0
+    result = validate()
+    assert result.returncode != 0
+    assert result.stdout.strip() == str(os.getuid())
+    assert f"{launcher} is writable by other users" in result.stderr
+    os.chmod(launcher, 0o600)
+    assert f"{launcher} is not executable" in validate().stderr
     os.chmod(launcher, 0o700)
 
     os.unlink(launcher)
     os.symlink("missing", launcher)
-    assert subprocess.run(command, check=False).returncode != 0
+    result = validate()
+    assert result.returncode != 0
+    assert f"{launcher} is a symbolic link" in result.stderr
+
+    os.unlink(launcher)
+    assert f"{launcher} is missing or not a regular file" in validate().stderr
+
+
+async def test_local_sandbox_injection_skips_root_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tools_dir = tmp_path / "tools"
+    monkeypatch.setattr(
+        sandbox_tools, "local_sandbox_tools_dir", lambda: str(tools_dir)
+    )
+    monkeypatch.setattr(sandbox_cli, "local_sandbox_tools_dir", lambda: str(tools_dir))
+
+    async def fake_detect_sandbox_os(
+        _sandbox: SandboxEnvironment,
+    ) -> SupportedContainerOSInfo:
+        return {"architecture": "amd64", "libc": "glibc"}
+
+    @asynccontextmanager
+    async def fake_open_executable_for_arch(
+        _arch: Architecture,
+        _musl: bool,
+    ) -> AsyncIterator[tuple[str, BinaryIO]]:
+        yield "inspect-sandbox-tools", BytesIO(b"binary")
+
+    async def fake_extract_tools_tree(
+        _sandbox: SandboxEnvironment,
+        _name: str,
+        _gz_bytes: bytes,
+        user: str | None,
+        staging_dir: str,
+    ) -> None:
+        assert user is None
+        launcher = Path(staging_dir) / SANDBOX_TOOLS_BASE_NAME
+        launcher.write_text("#!/bin/sh\nexit 0\n")
+        launcher.chmod(0o700)
+
+    monkeypatch.setattr(sandbox_tools, "detect_sandbox_os", fake_detect_sandbox_os)
+    monkeypatch.setattr(
+        sandbox_tools, "_open_executable_for_arch", fake_open_executable_for_arch
+    )
+    monkeypatch.setattr(sandbox_tools, "_extract_tools_tree", fake_extract_tools_tree)
+
+    sandbox = LocalSandboxEnvironment()
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", UserWarning)
+            await sandbox_tools._inject_container_tools_code(sandbox)
+            assert await sandbox_tools._sandbox_tools_detector(sandbox)
+    finally:
+        sandbox.directory.cleanup()
+
+    assert sandbox._tools_user is None
+    assert (tools_dir / SANDBOX_TOOLS_BASE_NAME).is_file()
+    assert list(tmp_path.iterdir()) == [tools_dir]
 
 
 def test_launcher_validator_accepts_safe_root_owned_install_for_nonroot_user(
