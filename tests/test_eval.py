@@ -831,14 +831,12 @@ def test_retry_sample_source_seed_set_only_when_eligible(tmp_path: Path) -> None
 
     file_source = eval_log_sample_source(prior_log, log_info, dataset)
     assert file_source.seed is not None
-    assert file_source.seed.location == prior_log.location
-    assert file_source.seed.samples is None
+    assert file_source.seed.source == prior_log.location
 
     memory_source = eval_log_sample_source(prior_log, None, dataset)
     assert memory_source.seed is not None
-    assert memory_source.seed.location is None
-    assert memory_source.seed.samples is not None
-    assert [s.id for s in memory_source.seed.samples] == [1]
+    assert isinstance(memory_source.seed.source, list)
+    assert [s.id for s in memory_source.seed.source] == [1]
 
     bigger = MemoryDataset(
         [Sample(id=1, input="x", target="y"), Sample(id=2, input="x", target="y")]

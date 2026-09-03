@@ -926,7 +926,10 @@ def _prior_samples() -> list[EvalSample]:
 def _seed_logger(recorder: Recorder) -> TaskLoggerShim:
     logger = TaskLoggerShim(_FlushBufferDB())
     logger.recorder = recorder
-    logger.eval = _eval_spec().model_copy(update={"eval_id": "retry-attempt"})
+    # a later `created` so the attempt's log path differs from the prior's
+    logger.eval = _eval_spec().model_copy(
+        update={"eval_id": "retry-attempt", "created": "2026-05-18T00:00:01+00:00"}
+    )
     logger.header_only = False
     logger.flush_buffer = 10
     logger.flush_pending = []
@@ -938,20 +941,20 @@ async def test_task_logger_seed_from_prior_log(
     recorder_type: type, tmp_path: Path
 ) -> None:
     # same-format seed (a byte copy for .eval, a re-log for .json): the kept
-    # keys are in the log and counted before any sample runs, minus the
-    # planned key the prior never held and the cancelled one; the first
-    # destination write (log_start) already carries them
+    # keys are in the log before any sample runs, minus the planned key the
+    # prior never held; the first destination write (log_start) already
+    # carries them. Seeded records are not this attempt's resolutions until
+    # the sweep accepts them (a drained attempt must not read complete on the
+    # strength of a prior attempt's errored record it never re-ran)
     recorder = recorder_type(str(tmp_path))
     prior = await _write_prior_log(recorder, _prior_samples())
     logger = _seed_logger(recorder)
     logger._location = await recorder.log_init(logger.eval)
 
-    await logger.seed_from_prior(
-        prior, None, keep={(1, 1), (2, 1), (3, 1), (5, 1)}, log_images=True
-    )
+    await logger.seed_from_prior(prior, keep={(1, 1), (2, 1), (3, 1), (5, 1)})
 
     assert logger.prior_seeded
-    assert logger.samples_logged == 2  # 1 and 2 (3 is cancelled, 4 unplanned)
+    assert logger.samples_logged == 0
     assert logger.samples_completed == 0
     summaries = await logger.sample_summaries()
     assert summaries is not None
@@ -966,7 +969,7 @@ async def test_task_logger_seed_from_prior_log(
 
     logger.note_reused_sample(clean)
     assert logger.samples_completed == 1
-    assert logger.samples_logged == 2
+    assert logger.samples_logged == 1
 
     await logger.log_start(EvalPlan())
     assert {
@@ -989,10 +992,9 @@ async def test_task_logger_seed_from_prior_relogs_across_formats(
     logger = _seed_logger(recorder)
     logger._location = await recorder.log_init(logger.eval)
 
-    await logger.seed_from_prior(prior, None, keep={(1, 1), (2, 1)}, log_images=True)
+    await logger.seed_from_prior(prior, keep={(1, 1), (2, 1)})
 
     assert logger.prior_seeded
-    assert logger.samples_logged == 2
     summaries = await logger.sample_summaries()
     assert summaries is not None and {s.id for s in summaries} == {1, 2}
     clean = await logger.read_prior_sample(1, 1)
@@ -1010,9 +1012,9 @@ async def test_task_logger_seed_from_prior_in_memory_samples(tmp_path: Path) -> 
     logger = _seed_logger(recorder)
     logger._location = await recorder.log_init(logger.eval)
 
-    await logger.seed_from_prior(None, _prior_samples(), keep=None, log_images=True)
+    await logger.seed_from_prior(_prior_samples(), keep=None)
 
-    assert logger.samples_logged == 3  # all four keys minus the cancelled one
+    assert logger.prior_seeded
     prior = await logger.read_prior_sample(4, 1)
     assert prior is not None and prior.input == "q4"
     await logger.log_start(EvalPlan())
@@ -1026,22 +1028,47 @@ async def test_task_logger_seed_from_prior_in_memory_samples(tmp_path: Path) -> 
     }
 
 
-async def test_task_logger_seed_from_prior_missing_log_raises_before_any_write(
+async def test_task_logger_seed_from_prior_missing_log_runs_unseeded(
     tmp_path: Path,
 ) -> None:
-    # the attempt fails without a destination file, so its retry keeps the
-    # prior source rather than chaining to an empty newest log
+    # a prior log that no longer exists is not a storage failure worth burning
+    # the attempt (and every later retry, which would keep the same missing
+    # source) on: the attempt runs unseeded, as the reuse sweep's own lookup
+    # degrades for a missing log
     recorder = EvalRecorder(str(tmp_path))
     logger = _seed_logger(recorder)
     logger._location = await recorder.log_init(logger.eval)
 
-    with pytest.raises(FileNotFoundError):
-        await logger.seed_from_prior(
-            str(tmp_path / "never-written.eval"), None, keep=None, log_images=True
-        )
+    with patch.object(task_log_module.logger, "warning") as warning:
+        await logger.seed_from_prior(str(tmp_path / "never-written.eval"), keep=None)
 
     assert not logger.prior_seeded
-    assert logger.samples_logged == 0
+    assert any("not found" in str(call.args[0]) for call in warning.call_args_list)
+    assert not Path(logger.location).exists()
+    await logger.log_start(EvalPlan())
+    assert Path(logger.location).exists()
+
+
+async def test_task_logger_seed_from_prior_storage_failure_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # any other read failure (after the recorder's retries) fails the attempt
+    # before its first destination write, so the retry keeps the prior source
+    import inspect_ai.log._recorders.eval as eval_recorder_module
+
+    async def failing_copy(prior_log: str, dest: object) -> None:
+        raise OSError("simulated storage failure")
+
+    monkeypatch.setattr(eval_recorder_module, "_copy_prior_log", failing_copy)
+    recorder = EvalRecorder(str(tmp_path))
+    prior = await _write_prior_log(recorder, _prior_samples())
+    logger = _seed_logger(recorder)
+    logger._location = await recorder.log_init(logger.eval)
+
+    with pytest.raises(OSError, match="simulated storage failure"):
+        await logger.seed_from_prior(prior, keep=None)
+
+    assert not logger.prior_seeded
     assert not Path(logger.location).exists()
 
 

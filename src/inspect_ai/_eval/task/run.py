@@ -269,16 +269,15 @@ class SeedSource(NamedTuple):
     eligibility checks (see `eval_log_sample_source`), so `task_run` can
     seed the attempt's log before `log_start` — every prior record is then
     in the attempt's log from its first flush, whatever ends the attempt
-    (see `design/retry-seeded-attempt-log.md`). Exactly one of `location`
-    (a prior log file, copied as bytes when the recorder's format matches)
-    and `samples` (an in-memory prior log, re-logged sample by sample) is
-    set. `classify` resolves a seeded record read back from the attempt's
-    own log — clean, errored, invalidated, or absent — the same way
-    `EvalSampleSource.lookup` resolves one read from the prior source.
+    (see `design/retry-seeded-attempt-log.md`). `source` is the prior log's
+    location (copied as bytes when the recorder's format matches, re-logged
+    otherwise) or an in-memory prior log's samples (re-logged). `classify`
+    resolves a seeded record read back from the attempt's own log — clean,
+    errored, invalidated, or absent — the same way `EvalSampleSource.lookup`
+    resolves one read from the prior source.
     """
 
-    location: str | None
-    samples: list[EvalSample] | None
+    source: str | list[EvalSample]
     classify: PriorClassifier
 
 
@@ -890,6 +889,24 @@ async def task_run(options: TaskRunOptions, task_cancel: TaskCancel | None) -> E
     if task_retry_abandoned(logger.eval.task_id):
         raise TaskRetryAbandonedError()
 
+    # seed a retry attempt's log from the prior attempt before anything that
+    # needs unwinding is set up (a seed failure fails the attempt without a
+    # log, and this precedes the paged sample store and the display row).
+    # With sample logging off nothing is seeded (as nothing is re-logged) and
+    # the reuse sweep falls back to reading the prior source.
+    if sample_source is not None and sample_source.seed is not None and log_samples:
+        await logger.seed_from_prior(
+            sample_source.seed.source,
+            # a SampleSource-driven task has no upfront plan: keep everything
+            keep=None
+            if sample_feed is not None
+            else {
+                (sample_id, epoch)
+                for sample_id in sample_ids
+                for epoch in range(1, epochs + 1)
+            },
+        )
+
     # optionally page dataset to disk if it exceeds the memory budget
     sample_store = maybe_page_to_disk(dataset, config.max_dataset_memory)
 
@@ -999,28 +1016,6 @@ async def task_run(options: TaskRunOptions, task_cancel: TaskCancel | None) -> E
         # start the log (do this outside fo the try b/c the try/except assumes
         # that the log is initialized)
         eval_plan = plan_to_eval_plan(plan, generate_config)
-        # a retry attempt seeds its log with the prior attempt's sample
-        # records before the first destination write, so from log_start's
-        # flush on the log is a superset of the prior log however the attempt
-        # ends (design/retry-seeded-attempt-log.md). A failure here (the prior
-        # log unreadable after retries) escapes before any destination write,
-        # so the attempt leaves no log and its retry keeps the same source.
-        # With sample logging off nothing is seeded (as nothing is re-logged)
-        # and the sweep below falls back to reading the prior source.
-        if sample_source is not None and sample_source.seed is not None and log_samples:
-            await logger.seed_from_prior(
-                sample_source.seed.location,
-                sample_source.seed.samples,
-                # a SampleSource-driven task has no upfront plan: keep everything
-                keep=None
-                if sample_feed is not None
-                else {
-                    (sample_id, epoch)
-                    for sample_id in sample_ids
-                    for epoch in range(1, epochs + 1)
-                },
-                log_images=log_images,
-            )
         await logger.log_start(eval_plan)
 
         try:
@@ -1311,22 +1306,20 @@ async def task_run(options: TaskRunOptions, task_cancel: TaskCancel | None) -> E
                                 epoch,
                                 await logger.read_prior_sample(sample_id, epoch),
                             )
-                            if isinstance(previous_sample, EvalSample):
-                                reporter.progress()
-                                logger.note_reused_sample(previous_sample)
                         else:
                             previous_sample = await sample_source.lookup(
                                 sample_id, epoch
                             )
-                            if isinstance(previous_sample, EvalSample):
-                                reporter.progress()
-                                if log_samples:
-                                    await logger.complete_sample(
-                                        condense_sample(previous_sample, log_images),
-                                        flush=False,
-                                    )
 
                     if isinstance(previous_sample, EvalSample):
+                        reporter.progress()
+                        if logger.prior_seeded:
+                            logger.note_reused_sample(previous_sample)
+                        elif log_samples:
+                            await logger.complete_sample(
+                                condense_sample(previous_sample, log_images),
+                                flush=True,
+                            )
                         sample_scores = (
                             {
                                 key: SampleScore(
@@ -3481,8 +3474,7 @@ def eval_log_sample_source(
             return await classify(id, epoch, sample)
 
         return EvalSampleSource(
-            read_from_file,
-            SeedSource(location=eval_log_info.name, samples=None, classify=classify),
+            read_from_file, SeedSource(source=eval_log_info.name, classify=classify)
         )
     else:
 
@@ -3499,9 +3491,7 @@ def eval_log_sample_source(
 
         return EvalSampleSource(
             read_from_memory,
-            SeedSource(
-                location=None, samples=list(eval_log.samples or []), classify=classify
-            ),
+            SeedSource(source=list(eval_log.samples or []), classify=classify),
         )
 
 

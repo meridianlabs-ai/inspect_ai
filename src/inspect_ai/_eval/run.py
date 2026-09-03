@@ -9,7 +9,7 @@ from typing import Any, Awaitable, Callable, Iterable, NamedTuple, Set, cast
 from inspect_ai._eval.task.constants import TASK_ALL_PARAMS_ATTR
 from inspect_ai._util._async import Wake
 from inspect_ai._util.environ import environ_vars
-from inspect_ai._util.file import cleanup_s3_sessions, filesystem
+from inspect_ai._util.file import cleanup_s3_sessions
 from inspect_ai._util.task import task_display_name
 from inspect_ai._util.trace import trace_action
 from inspect_ai.util._anyio import inner_exception
@@ -868,14 +868,15 @@ async def run_task_retry_attempts(
 
                         # build sample_source from the failed log so completed
                         # samples are reused on retry (mirrors legacy eval_set
-                        # retry). An attempt that wrote no log — its prior-log
-                        # seed failed, or its log_start() flush did — has
+                        # retry). An attempt whose log never finished — its
+                        # prior-log seed failed, or a log write did — has
                         # nothing newer to offer: the retry keeps the source
                         # this attempt ran with (the same prior log), rather
-                        # than a source over an absent file that reuses nothing
+                        # than a source over an absent or partial file that
+                        # reuses nothing
                         failed_location = options.logger.location
                         sample_source: EvalSampleSource | None
-                        if filesystem(failed_location).exists(failed_location):
+                        if options.logger.finished:
                             failed_log_info = EvalLogInfo(
                                 name=failed_location,
                                 type="file",
@@ -897,8 +898,9 @@ async def run_task_retry_attempts(
                             )
                         else:
                             log.info(
-                                f"Task '{options.task.name}' wrote no log for this "
-                                "attempt; retrying with the prior attempt's sample source"
+                                f"Task '{options.task.name}' did not finish its log "
+                                "for this attempt; retrying with the prior attempt's "
+                                "sample source"
                             )
                             sample_source = options.sample_source
 

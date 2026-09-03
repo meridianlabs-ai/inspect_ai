@@ -29,6 +29,13 @@ from zipfile import ZipFile
 import anyio
 from anyio import EndOfStream
 from pydantic import BaseModel, Field, JsonValue
+from tenacity import (
+    AsyncRetrying,
+    RetryCallState,
+    retry_if_not_exception_type,
+    stop_after_attempt,
+    wait_exponential_jitter,
+)
 from typing_extensions import override
 
 from inspect_ai._util._async import current_async_backend, tg_collect
@@ -177,16 +184,17 @@ class EvalRecorder(FileRecorder):
     async def log_seed(
         self,
         eval: EvalSpec,
-        prior_log: str,
+        prior: "str | Sequence[EvalSample]",
         keep: set[tuple[str | int, int]] | None,
-    ) -> bool:
+    ) -> None:
         # a byte copy is only valid same-format: a `.json` prior (a retry with
-        # an explicit `log_format="eval"`) goes through the caller's re-log path
-        if not self.handles_location(prior_log):
-            return False
-        log = self.data[self._log_file_key(eval)]
-        await log.seed_from_prior_log(prior_log, keep)
-        return True
+        # an explicit `log_format="eval"`) or in-memory samples take the
+        # generic re-log path
+        if isinstance(prior, str) and self.handles_location(prior):
+            log = self.data[self._log_file_key(eval)]
+            await log.seed_from_prior_log(prior, keep)
+        else:
+            await super().log_seed(eval, prior, keep)
 
     @override
     async def log_start(self, eval: EvalSpec, plan: EvalPlan) -> None:
@@ -279,8 +287,6 @@ class EvalRecorder(FileRecorder):
         # write the buffered samples
         await log.write_buffered_samples()
 
-        # a successful finish is the log's last write, so reclaim the dead
-        # bytes a prior-log seed and superseded members left behind before it
         if status == "success":
             await log.compact()
 
@@ -561,21 +567,35 @@ def _rewrite_eval_zip_with_new_header(zip_bytes: bytes, log: EvalLog) -> bytes:
         ZipFile(BytesIO(zip_bytes), "r") as src,
         ZipFile(out, "w", **zipfile_compress_kwargs) as dst,
     ):
-        # Dedupe by member name, last entry winning — a requeued sample's
-        # fresh record supersedes the prior one as a duplicate zip member
-        # (see _zip_writestr), and read-by-name resolves to the last entry;
-        # copying every info would write those superseded bytes twice.
-        infos = {info.filename: info for info in src.infolist()}
-        for info in infos.values():
-            if info.filename == HEADER_JSON:
-                continue
-            # writestr with a ZipInfo preserves the original compression
-            # type / date_time / external_attr. The data still round-trips
-            # through decompress + recompress, but member metadata is
-            # carried over verbatim.
-            dst.writestr(info, src.read(info.filename))
+        _copy_live_members(src, dst, exclude=frozenset({HEADER_JSON}))
         dst.writestr(HEADER_JSON, to_json_safe(eval_header, indent=None))
     return out.getvalue()
+
+
+def _copy_live_members(
+    src: ZipFile, dst: ZipFile, exclude: frozenset[str] = frozenset()
+) -> None:
+    """Copy each name's last member from ``src`` to ``dst``, streaming.
+
+    Dedupes by member name, last entry winning — a requeued or re-run
+    sample's fresh record supersedes the prior one as a duplicate zip member
+    (see ``_zip_writestr``), and read-by-name resolves to the last entry;
+    copying every info would write those superseded bytes twice. Opening
+    the destination entry with the source ``ZipInfo`` preserves the
+    original compression type / date_time / external_attr; the data still
+    round-trips through decompress + recompress, streamed in chunks so a
+    large member never sits in memory whole. Blocking — run in a worker
+    thread when called from the event loop.
+    """
+    infos = {info.filename: info for info in src.infolist()}
+    for info in infos.values():
+        if info.filename in exclude:
+            continue
+        with (
+            src.open(info, "r") as reader,
+            dst.open(info, "w", force_zip64=True) as writer,
+        ):
+            shutil.copyfileobj(reader, writer, length=1024 * 1024)
 
 
 def _eval_log_header(log: EvalLog) -> EvalLog:
@@ -798,7 +818,8 @@ def _copy_temp_to_local(temp_file: BinaryIO, dest: str, fsync: bool) -> None:
 COMPACT_DEAD_BYTES_FRACTION = 0.1
 
 # A prior-log copy failing on a storage blip should not burn a retry attempt:
-# the copy is retried this many times, sleeping BACKOFF * attempt between.
+# the copy is retried this many times with exponential jittered backoff
+# starting from this many seconds.
 SEED_COPY_ATTEMPTS = 3
 SEED_COPY_BACKOFF_SECONDS = 1.0
 _SEED_COPY_CHUNK_SIZE = 1024 * 1024
@@ -810,33 +831,41 @@ async def _copy_prior_log(prior_log: str, dest: BinaryIO) -> None:
     Local files copy in a worker thread. Remote files pump
     ``AsyncFilesystem.read_file_bytes`` — a byte stream for S3 under asyncio,
     otherwise the whole object buffered in memory, the same limits
-    ``read_log``'s download has — into ``dest`` with the writes in a worker
-    thread (``dest`` is an anonymous temp file, so it has no path a
-    filesystem download could target). Transient failures are retried with
-    backoff; a missing prior log raises ``FileNotFoundError`` immediately.
+    ``read_log``'s download has — into ``dest`` (an anonymous temp file, so
+    it has no path a filesystem download could target). Transient failures
+    are retried with backoff (the same ``AsyncRetrying`` idiom as the S3
+    put retry in ``asyncfiles``); a missing prior log raises
+    ``FileNotFoundError`` immediately.
     """
     fs = filesystem(prior_log)
-    for attempt in range(1, SEED_COPY_ATTEMPTS + 1):
-        try:
+
+    def reset_before_retry(state: RetryCallState) -> None:
+        dest.seek(0)
+        dest.truncate()
+        outcome = state.outcome
+        logger.warning(
+            f"Copying prior log {prior_log} failed (attempt {state.attempt_number} "
+            f"of {SEED_COPY_ATTEMPTS}), retrying: "
+            f"{outcome.exception() if outcome is not None else 'unknown error'}"
+        )
+
+    async for attempt in AsyncRetrying(
+        retry=retry_if_not_exception_type(FileNotFoundError),
+        wait=wait_exponential_jitter(
+            initial=SEED_COPY_BACKOFF_SECONDS, jitter=SEED_COPY_BACKOFF_SECONDS
+        ),
+        stop=stop_after_attempt(SEED_COPY_ATTEMPTS),
+        sleep=anyio.sleep,
+        before_sleep=reset_before_retry,
+        reraise=True,
+    ):
+        with attempt:
             if fs.is_local():
                 await anyio.to_thread.run_sync(
                     _copy_local_file, local_path(prior_log), dest
                 )
             else:
                 await _copy_remote_file(prior_log, dest)
-            return
-        except FileNotFoundError:
-            raise
-        except Exception as ex:
-            dest.seek(0)
-            dest.truncate()
-            if attempt == SEED_COPY_ATTEMPTS:
-                raise
-            logger.warning(
-                f"Copying prior log {prior_log} failed (attempt {attempt} of "
-                f"{SEED_COPY_ATTEMPTS}), retrying: {ex}"
-            )
-            await anyio.sleep(SEED_COPY_BACKOFF_SECONDS * attempt)
 
 
 def _copy_local_file(path: str, dest: BinaryIO) -> None:
@@ -853,9 +882,24 @@ async def _copy_remote_file(location: str, dest: BinaryIO) -> None:
                     chunk = await stream.receive(_SEED_COPY_CHUNK_SIZE)
                 except EndOfStream:
                     break
-                await anyio.to_thread.run_sync(dest.write, chunk)
+                # a buffered write of one chunk into an anonymous temp file
+                # lands in the page cache far faster than a thread hop would
+                dest.write(chunk)
         finally:
             await stream.aclose()
+
+
+def _read_prior_summaries(prior: BinaryIO) -> list[EvalSampleSummary]:
+    """Read a copied prior log's summaries, validating it is a zip.
+
+    Opened read-only: unlike append mode, which treats anything that is not
+    a zip as an empty archive to append to, this raises ``BadZipFile`` for a
+    corrupt or truncated copy rather than seeding nothing. Blocking — run in
+    a worker thread.
+    """
+    prior.seek(0)
+    with ZipFile(prior, "r") as zip:
+        return _read_all_summaries(zip)
 
 
 def _read_all_summaries(zip: ZipFile) -> list[EvalSampleSummary]:
@@ -870,16 +914,26 @@ def _read_all_summaries(zip: ZipFile) -> list[EvalSampleSummary]:
     if SUMMARIES_JSON in names:
         with zip.open(SUMMARIES_JSON, "r") as f:
             return _dedupe_summaries(_parse_summaries(json.load(f), SUMMARIES_JSON))
-    prefix = _journal_summary_path() + "/"
-    journal = sorted(
-        (n for n in names if n.startswith(prefix) and n.endswith(".json")),
-        key=lambda n: int(n.split("/")[-1].split(".")[0]),
-    )
     summaries: list[EvalSampleSummary] = []
-    for name in journal:
+    for name in _sorted_journal_entries(names, _journal_summary_path()):
         with zip.open(name, "r") as f:
             summaries.extend(_parse_summaries(json.load(f), name))
     return _dedupe_summaries(summaries)
+
+
+def _parse_sample_bytes(data: bytes) -> EvalSample:
+    """Parse a sample member read from the zip, resolved as a log read is.
+
+    The same read-time resolution ``read_eval_log_sample`` applies
+    (``events_data`` references bound back into the events, timelines
+    rebound), so a sample served from the recorder's local copy and one read
+    from the destination log look alike. Blocking (JSON parse + validation
+    of a whole transcript) — run in a worker thread.
+    """
+    sample = EvalSample.model_validate(
+        json.loads(data), context=get_deserializing_context()
+    )
+    return rebind_sample_timelines(resolve_sample_events_data(sample))
 
 
 def _compact_zip(src_file: BinaryIO) -> BinaryIO:
@@ -896,9 +950,7 @@ def _compact_zip(src_file: BinaryIO) -> BinaryIO:
             ZipFile(src_file, "r") as src,
             ZipFile(out, "w", **zipfile_compress_kwargs) as dst,
         ):
-            infos = {info.filename: info for info in src.infolist()}
-            for info in infos.values():
-                dst.writestr(info, src.read(info.filename))
+            _copy_live_members(src, dst)
     except BaseException:
         out.close()
         raise
@@ -1045,22 +1097,14 @@ class ZipLogFile:
         until the next flush (anything in the temp zip reaches the
         destination on any later flush, which copies the whole file). The
         member is registered for :meth:`buffered_sample`, which serves it
-        whole from the local zip; only an event-less copy is retained in
-        ``_streaming_samples`` (cleared by ``flush`` once the sample is
-        on-disk-readable) as the fallback for readers that arrive while the
-        zip is unavailable, and the summary is journalled immediately with
-        the same replace-by-``(id, epoch)`` dedupe. Nothing is appended to
-        ``_samples``.
+        whole from the local zip, and the summary is journalled immediately
+        with the same replace-by-``(id, epoch)`` dedupe. Nothing is appended
+        to ``_samples``.
         """
         async with self._lock:
             name = _sample_filename(sample.id, sample.epoch)
             self._zip_writestr(name, sample)
             self._local_sample_names.add(name)
-
-            self._streaming_samples[(sample.id, sample.epoch)] = sample.model_copy(
-                update={"events": [], "events_data": None}
-            )
-
             self._journal_summary(sample)
 
     def _journal_summary(self, sample: EvalSample) -> None:
@@ -1191,8 +1235,9 @@ class ZipLogFile:
         - the local temp zip, for members a prior-log seed copied in or a
           write-through re-logged (``_local_sample_names``): the freshest
           complete record under that name (a re-run's superseding member
-          wins, as for every zip reader), decompressed in a worker thread
-          while the lock is held — the same contention a flush imposes.
+          wins, as for every zip reader), read and decompressed in a worker
+          thread while the lock is held — the same contention a flush
+          imposes — then parsed and resolved like a log read outside it.
         - ``_streaming_samples`` — event-less samples from the streaming path
           (their events live in the buffer database, so this carries error
           detail / scores but not events).
@@ -1213,10 +1258,7 @@ class ZipLogFile:
                 data = await anyio.to_thread.run_sync(self._zip.read, name)
             else:
                 return self._streaming_samples.get((id, epoch))
-        # parse outside the lock so writers aren't held up by validation
-        return EvalSample.model_validate(
-            json.loads(data), context=get_deserializing_context()
-        )
+        return await anyio.to_thread.run_sync(_parse_sample_bytes, data)
 
     async def write(self, filename: str, data: Any) -> None:
         async with self._lock:
@@ -1375,41 +1417,44 @@ class ZipLogFile:
         upfront plan). Matching is by generated member name, as the sample
         readers match.
 
-        Must run before :meth:`start`. ``init`` has already opened an
-        append-mode ``ZipFile`` over the empty temp file, and closing such a
-        handle writes an end-of-central-directory record at offset 0 (a
-        dropped handle does the same from ``__del__``), so the handle is
-        closed explicitly and the temp file truncated *before* the copy —
-        the copied bytes are never written over. A copy failure leaves the
-        log empty and usable and re-raises for the caller to decide; a
-        missing prior log raises ``FileNotFoundError`` without retrying.
+        Must run before :meth:`start`. The copy lands in a *fresh* temp file
+        outside ``_lock`` (a multi-GB download must not stall the other lock
+        users), which then replaces the one ``init`` opened: that handle is
+        an append-mode ``ZipFile`` over an empty file, and closing it writes
+        an end-of-central-directory record at offset 0 (a dropped handle
+        does the same from ``__del__``), so it is closed explicitly over the
+        old file before the swap — the copied bytes are never written over.
+        The copy is validated as a zip before it is adopted (append mode
+        would treat a corrupt copy as an empty archive and seed nothing).
+        A failure leaves the log exactly as it was and re-raises for the
+        caller to decide; a missing prior log raises ``FileNotFoundError``
+        without retrying.
         """
+        if (
+            self._log_start is not None
+            or self._destination_written
+            or self._destination_seeded
+        ):
+            raise RuntimeError("An eval log can only be seeded before it starts")
+        seeded: BinaryIO = tempfile.TemporaryFile()
+        try:
+            await _copy_prior_log(prior_log, seeded)
+            summaries = await anyio.to_thread.run_sync(_read_prior_summaries, seeded)
+        except BaseException:
+            seeded.close()
+            raise
+
         async with self._lock:
-            if (
-                self._log_start is not None
-                or self._destination_written
-                or self._destination_seeded
-            ):
+            if self._log_start is not None:
+                seeded.close()
                 raise RuntimeError("An eval log can only be seeded before it starts")
             assert self._zip is not None
             self._zip.close()
             self._zip = None
-            self._temp_file.seek(0)
-            self._temp_file.truncate()
-            try:
-                await _copy_prior_log(prior_log, self._temp_file)
-                self._open()
-                assert self._zip is not None
-                summaries = await anyio.to_thread.run_sync(
-                    _read_all_summaries, self._zip
-                )
-            except BaseException:
-                self._zip = None
-                self._temp_file.seek(0)
-                self._temp_file.truncate()
-                self._open()
-                self._rejournal_config_updates()
-                raise
+            self._temp_file.close()
+            self._temp_file = seeded
+            self._open()
+            assert self._zip is not None
 
             if keep is not None:
                 keep_names = {_sample_filename(id, epoch) for id, epoch in keep}
@@ -1474,7 +1519,7 @@ class ZipLogFile:
     def _rejournal_config_updates(self) -> None:
         """Re-append the config updates recorded so far as journal members 1..n.
 
-        A prior-log seed truncates the temp zip, taking with it any
+        A prior-log seed replaces the temp zip, leaving behind any
         ``_journal/config_updates/*`` written between ``init`` and the seed
         (inherited process-scoped retunes); this puts them back. Caller holds
         ``_lock``.
@@ -1878,7 +1923,12 @@ def _journal_config_update_file(index: int) -> str:
 
 def _sorted_config_update_entries(entry_names: set[str]) -> list[str]:
     """Journal config-update entries in write order (by their integer index)."""
-    prefix = _journal_config_update_path() + "/"
+    return _sorted_journal_entries(entry_names, _journal_config_update_path())
+
+
+def _sorted_journal_entries(entry_names: set[str], journal_dir: str) -> list[str]:
+    """The ``{n}.json`` members under a journal directory, in index order."""
+    prefix = journal_dir + "/"
     entries = [
         name
         for name in entry_names

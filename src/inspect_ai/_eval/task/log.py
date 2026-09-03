@@ -72,6 +72,10 @@ logger = logging.getLogger(__name__)
 
 _STALE_FLUSH_INTERVAL: float = 60
 
+# how many seeded prior records the reuse sweep reads back from the recorder
+# at once (see TaskLogger.read_prior_sample)
+_PRIOR_READ_CONCURRENCY = 4
+
 if TYPE_CHECKING:
     from inspect_ai._control.eval_state import BufferConfig
     from inspect_ai.log._config_update import ConfigUpdate
@@ -301,8 +305,10 @@ class TaskLogger:
         self._finished = False
 
         # set once a retry attempt's log has been seeded with the prior
-        # attempt's sample records (see seed_from_prior)
+        # attempt's sample records (see seed_from_prior); the limit bounds the
+        # sweep's read-back of those records (see read_prior_sample)
         self._prior_seeded = False
+        self._prior_read_limit = anyio.Semaphore(_PRIOR_READ_CONCURRENCY)
 
         # sample buffer db
         self._buffer_db: SampleBufferDatabase | None = None
@@ -445,57 +451,51 @@ class TaskLogger:
         """Whether this attempt's log was seeded from a prior attempt's samples."""
         return self._prior_seeded
 
+    @property
+    def finished(self) -> bool:
+        """Whether :meth:`log_finish` completed for this attempt (its log is written)."""
+        return self._finished
+
     async def seed_from_prior(
         self,
-        prior_log: str | None,
-        samples: list[EvalSample] | None,
+        prior: "str | list[EvalSample]",
         keep: set[tuple[str | int, int]] | None,
-        log_images: bool,
     ) -> None:
         """Seed this retry attempt's log with the prior attempt's sample records.
 
         Called by ``task_run`` after ``init`` and before ``log_start`` when the
         attempt has an eligible sample source (see ``EvalSampleSource.seed``).
-        The recorder copies the prior log file when it can (an ``.eval``
-        prior into an ``.eval`` log: one whole-file copy, no per-sample
-        reads); otherwise — an in-memory prior log, or a prior in another
-        format — the planned samples are re-logged one by one through the
-        recorder's write-through path, the same sequential fallback either
-        way. Restricted to the planned ``keep`` keys (``None`` for a
-        dynamically fed task keeps everything).
+        ``prior`` is the prior log's location or an in-memory prior log's
+        samples; the recorder copies a same-format prior log file whole and
+        re-logs samples otherwise (see ``Recorder.log_seed``). Restricted to
+        the planned ``keep`` keys (``None`` for a dynamically fed task keeps
+        everything).
 
         Afterwards the log holds every prior record the attempt could reuse,
         so whatever ends the attempt, ``log_finish`` writes a complete log —
         the next attempt never re-runs a sample this one already carried.
-        Seeded keys count toward :attr:`samples_logged` immediately (the log
-        does hold them, run or not); :attr:`samples_completed` counts a
-        reused sample when the reuse sweep reaches it (:meth:`note_reused_sample`).
-        Raises when the prior log cannot be read (after the recorder's own
-        retries); the caller fails the attempt without writing a log.
+        Seeded records are *not* counted as this attempt's resolutions here:
+        :attr:`samples_logged` and :attr:`samples_completed` count a reused
+        record when the reuse sweep accepts it (:meth:`note_reused_sample`)
+        and a re-run when it completes, so a graceful drain that abandons a
+        seeded errored sample's re-run still reads that sample as unresolved
+        (its only record is the prior attempt's error) and a later eval-set
+        pass re-runs it.
+
+        A prior log that no longer exists leaves the attempt unseeded with a
+        warning (every planned sample runs fresh, as the reuse sweep's own
+        lookup degrades for a missing log). Any other read failure — after
+        the recorder's own retries — raises; the caller fails the attempt
+        without writing a log.
         """
-        seeded = False
-        if prior_log is not None:
-            seeded = await self.recorder.log_seed(self.eval, prior_log, keep)
-        if not seeded:
-            if samples is None:
-                from inspect_ai.log._file import read_eval_log_async
-
-                assert prior_log is not None
-                samples = (await read_eval_log_async(prior_log)).samples or []
-            from inspect_ai.log._condense import condense_sample
-
-            for sample in samples:
-                if keep is None or (sample.id, sample.epoch) in keep:
-                    await self.recorder.log_sample(
-                        self.eval,
-                        condense_sample(sample, log_images),
-                        write_through=True,
-                    )
-        for summary in await self.recorder.sample_summaries(self.eval) or []:
-            key = (summary.id, summary.epoch)
-            self._logged_sample_keys.add(key)
-            if summary.error is not None and is_cancellation_message(summary.error):
-                self._cancelled_sample_keys.add(key)
+        try:
+            await self.recorder.log_seed(self.eval, prior, keep)
+        except FileNotFoundError:
+            logger.warning(
+                f"Prior log {prior} not found: retry attempt will re-run every "
+                "sample rather than reusing the prior attempt's."
+            )
+            return
         self._prior_seeded = True
 
     async def read_prior_sample(self, id: str | int, epoch: int) -> EvalSample | None:
@@ -503,15 +503,14 @@ class TaskLogger:
 
         The reuse sweep's lookup once the log is seeded: served from the
         recorder's local copy (no destination read, so an absent key costs
-        nothing remote), resolved the way a log read is so events reference
-        their data as the prior attempt recorded them.
+        nothing remote). Every planned sample's ``run_sample`` calls this at
+        attempt start, so the reads are bounded by ``_prior_read_limit``:
+        the recorder serializes them on its own lock, and without the bound
+        every other lock user (a control-channel listing, a live completion)
+        would queue behind the whole sweep.
         """
-        from inspect_ai.log._file import _resolve_sample_for_read
-
-        sample = await self.recorder.buffered_sample(self.eval, id, epoch)
-        if sample is None:
-            return None
-        return _resolve_sample_for_read(sample, False)
+        async with self._prior_read_limit:
+            return await self.recorder.buffered_sample(self.eval, id, epoch)
 
     def note_reused_sample(self, sample: EvalSample) -> None:
         """Record that the reuse sweep accepted a seeded prior sample as this attempt's result.
@@ -561,12 +560,23 @@ class TaskLogger:
         # just-completed (or reused-on-retry) sample the listing already shows.
         buffered = await self.recorder.buffered_sample(self.eval, id, epoch)
         if buffered is not None:
+            # the recorder's copy is whole (resident, or a local zip member
+            # read in full); honour the exclusion by dropping the fields
+            # rather than parsing them selectively as the disk read does
+            if exclude_fields:
+                buffered = buffered.model_copy(
+                    update={
+                        field: EvalSample.model_fields[field].get_default(
+                            call_default_factory=True
+                        )
+                        for field in exclude_fields
+                        if field in EvalSample.model_fields
+                    }
+                )
             return buffered
 
         from inspect_ai.log._file import read_eval_log_sample_async
 
-        # `exclude_fields` applies only here: the in-memory sample above is
-        # already resident, so returning it whole costs nothing.
         try:
             return await read_eval_log_sample_async(
                 self.location, id, epoch, exclude_fields=exclude_fields

@@ -1548,8 +1548,8 @@ def test_negative_infinity_survives_streaming_reads() -> None:
 
 async def test_eval_recorder_log_sample_write_through(tmp_path) -> None:
     # write_through parks the full sample (events included) in the temp-file
-    # zip immediately, retaining only an event-less copy for pre-flush
-    # control-channel reads — nothing stays in the flush buffer
+    # zip immediately and serves reads from there — nothing stays in the
+    # flush buffer or the streaming-path copies
     from inspect_ai.log._log import (
         EvalConfig,
         EvalDataset,
@@ -1580,7 +1580,7 @@ async def test_eval_recorder_log_sample_write_through(tmp_path) -> None:
 
     zip_log = recorder.data[recorder._log_file_key(spec)]
     assert zip_log._samples == []
-    assert zip_log._streaming_samples[(1, 1)].events == []
+    assert zip_log._streaming_samples == {}
 
     # summary journalled immediately, exactly once
     summaries = await recorder.sample_summaries(spec)
@@ -1593,9 +1593,8 @@ async def test_eval_recorder_log_sample_write_through(tmp_path) -> None:
     assert buffered is not None
     assert [e.data for e in buffered.events if isinstance(e, InfoEvent)] == ["hello"]
 
-    # a flush drops the retained event-less copy and lands the sample on disk
+    # a flush lands the sample on disk; the local read keeps serving it
     await recorder.flush(spec)
-    assert zip_log._streaming_samples == {}
     buffered = await recorder.buffered_sample(spec, 1, 1)
     assert buffered is not None
     assert [e.data for e in buffered.events if isinstance(e, InfoEvent)] == ["hello"]
@@ -1735,7 +1734,7 @@ async def test_eval_recorder_seed_copies_prunes_and_supersedes(tmp_path) -> None
     spec = _seed_spec("retry-attempt")
     recorder = EvalRecorder(str(tmp_path / "retry"))
     location = await recorder.log_init(spec)
-    assert await recorder.log_seed(spec, prior, keep={(1, 1), (2, 1), (9, 1)})
+    await recorder.log_seed(spec, prior, keep={(1, 1), (2, 1), (9, 1)})
 
     zip_log = recorder.data[recorder._log_file_key(spec)]
     assert zip_log._zip is not None
@@ -1806,7 +1805,7 @@ async def test_eval_recorder_seed_from_started_prior_reads_journal(tmp_path) -> 
     recorder = EvalRecorder(str(tmp_path / "retry"))
     await recorder.log_init(spec)
 
-    assert await recorder.log_seed(spec, prior, keep=None)
+    await recorder.log_seed(spec, prior, keep=None)
 
     summaries = await recorder.sample_summaries(spec)
     assert summaries is not None and {s.id for s in summaries} == {1, 2}
@@ -1830,7 +1829,7 @@ async def test_eval_recorder_seed_prunes_by_member_name(tmp_path) -> None:
     recorder = EvalRecorder(str(tmp_path / "retry"))
     await recorder.log_init(spec)
 
-    assert await recorder.log_seed(spec, prior, keep={("a_epoch_1", 1), ("7", 1)})
+    await recorder.log_seed(spec, prior, keep={("a_epoch_1", 1), ("7", 1)})
 
     summaries = await recorder.sample_summaries(spec)
     assert summaries is not None
@@ -1841,13 +1840,118 @@ async def test_eval_recorder_seed_prunes_by_member_name(tmp_path) -> None:
     assert await recorder.buffered_sample(spec, "a_epoch_1", 1) is not None
 
 
-async def test_eval_recorder_seed_rejects_other_format(tmp_path) -> None:
+async def test_eval_recorder_seed_relogs_json_prior(tmp_path) -> None:
+    # a `.json` prior cannot be byte-copied into an `.eval` log: the base
+    # recorder re-logs its kept samples instead, with the same local read-back
+    from inspect_ai.log._log import EvalPlan, EvalStats
     from inspect_ai.log._recorders.eval import EvalRecorder
+    from inspect_ai.log._recorders.json import JSONRecorder
+
+    prior_spec = _seed_spec("prior-attempt")
+    json_recorder = JSONRecorder(str(tmp_path / "prior"))
+    prior = await json_recorder.log_init(prior_spec)
+    await json_recorder.log_start(prior_spec, EvalPlan())
+    await json_recorder.log_sample(prior_spec, _seed_sample(1, "one"))
+    await json_recorder.log_sample(prior_spec, _seed_sample(2, "two"))
+    await json_recorder.log_finish(prior_spec, "error", EvalStats(), None, None)
 
     spec = _seed_spec("retry-attempt")
-    recorder = EvalRecorder(str(tmp_path))
+    recorder = EvalRecorder(str(tmp_path / "retry"))
     await recorder.log_init(spec)
-    assert not await recorder.log_seed(spec, str(tmp_path / "prior.json"), keep=None)
+    await recorder.log_seed(spec, prior, keep={(1, 1)})
+
+    summaries = await recorder.sample_summaries(spec)
+    assert summaries is not None and [s.id for s in summaries] == [1]
+    seeded = await recorder.buffered_sample(spec, 1, 1)
+    assert seeded is not None and seeded.input == "one"
+    assert await recorder.buffered_sample(spec, 2, 1) is None
+
+
+async def test_eval_recorder_seed_rejects_corrupt_prior(tmp_path) -> None:
+    # append mode would treat a non-zip as an empty archive and seed nothing;
+    # a corrupt prior must fail the seed instead
+    from zipfile import BadZipFile
+
+    from inspect_ai.log._recorders.eval import EvalRecorder
+
+    corrupt = tmp_path / "corrupt.eval"
+    corrupt.write_bytes(b"not a zip file at all")
+    spec = _seed_spec("retry-attempt")
+    recorder = EvalRecorder(str(tmp_path / "retry"))
+    await recorder.log_init(spec)
+
+    with pytest.raises(BadZipFile):
+        await recorder.log_seed(spec, str(corrupt), keep=None)
+
+    # the log is untouched and usable
+    zip_log = recorder.data[recorder._log_file_key(spec)]
+    assert zip_log._zip is not None and zip_log._zip.namelist() == []
+
+
+async def test_eval_recorder_compacts_superseded_members(tmp_path) -> None:
+    # a re-run's superseding member alone (no prior-log seed) leaves dead bytes
+    # that a successful finish reclaims once they dominate the file
+    from inspect_ai.log._file import read_eval_log_async
+    from inspect_ai.log._log import EvalPlan, EvalStats
+    from inspect_ai.log._recorders.eval import EvalRecorder
+
+    spec = _seed_spec("compact")
+    recorder = EvalRecorder(str(tmp_path))
+    location = await recorder.log_init(spec)
+    await recorder.log_start(spec, EvalPlan())
+    await recorder.log_sample(spec, _seed_sample(1, os.urandom(200_000).hex()))
+    await recorder.flush(spec)
+    superseded_size = Path(location).stat().st_size
+    await recorder.log_sample(spec, _seed_sample(1, "small"))
+    await recorder.log_finish(spec, "success", EvalStats(), None, None)
+
+    with ZipFile(local_path(location)) as zf:
+        names = zf.namelist()
+        assert names.count("samples/1_epoch_1.json") == 1
+    assert Path(location).stat().st_size < superseded_size
+    final = await read_eval_log_async(location)
+    assert final.samples is not None and [s.input for s in final.samples] == ["small"]
+
+
+async def test_json_recorder_relog_supersedes_same_key(tmp_path) -> None:
+    # a re-log of the same (id, epoch) — a seeded errored record's re-run, or
+    # a requeue — replaces the earlier record rather than listing it twice,
+    # in the written log and in the live summaries alike
+    from inspect_ai.log import EvalError
+    from inspect_ai.log._file import read_eval_log_async
+    from inspect_ai.log._log import EvalPlan, EvalStats
+    from inspect_ai.log._recorders.json import JSONRecorder
+
+    spec = _seed_spec("json-supersede")
+    recorder = JSONRecorder(str(tmp_path))
+    location = await recorder.log_init(spec)
+    await recorder.log_start(spec, EvalPlan())
+    errored = _seed_sample(1, "first").model_copy(
+        update={
+            "error": EvalError(
+                message="RuntimeError('boom')", traceback="", traceback_ansi=""
+            )
+        }
+    )
+    await recorder.log_sample(spec, errored)
+    await recorder.log_sample(spec, _seed_sample(2, "other"))
+    await recorder.log_sample(spec, _seed_sample(1, "second"))
+
+    summaries = await recorder.sample_summaries(spec)
+    assert summaries is not None
+    assert [(s.id, s.error) for s in summaries] == [(2, None), (1, None)]
+    buffered = await recorder.buffered_sample(spec, 1, 1)
+    assert buffered is not None and buffered.input == "second"
+
+    log = await recorder.log_finish(spec, "success", EvalStats(), None, None)
+    assert log.samples is not None
+    assert sorted((s.id, s.input) for s in log.samples) == [(1, "second"), (2, "other")]
+    written = await read_eval_log_async(location)
+    assert written.samples is not None
+    assert sorted((s.id, s.input) for s in written.samples) == [
+        (1, "second"),
+        (2, "other"),
+    ]
 
 
 async def test_eval_recorder_seed_missing_prior_raises_and_keeps_log_usable(
@@ -1893,7 +1997,7 @@ async def test_eval_recorder_seed_retries_transient_copy_failure(
     spec = _seed_spec("retry-attempt")
     recorder = EvalRecorder(str(tmp_path / "retry"))
     await recorder.log_init(spec)
-    assert await recorder.log_seed(spec, prior, keep=None)
+    await recorder.log_seed(spec, prior, keep=None)
     assert failures["n"] == 2
     assert await recorder.buffered_sample(spec, 1, 1) is not None
 
@@ -1926,7 +2030,7 @@ async def test_eval_recorder_seed_preserves_config_updates_and_discard(
     )
     await recorder.log_config_update(spec, update)
 
-    assert await recorder.log_seed(spec, prior, keep=None)
+    await recorder.log_seed(spec, prior, keep=None)
     await recorder.log_start(spec, EvalPlan())
     await recorder.flush(spec)
     header = await read_eval_log_async(location, header_only=True)

@@ -78,6 +78,9 @@ class JSONRecorder(FileRecorder):
         # `sample_summaries` is polled by the control channel — recomputing
         # over the whole in-memory log on every request stalls the event loop.
         summaries: list[EvalSampleSummary] = Field(default_factory=list)
+        # (id, epoch) keys logged so far, so the common append stays O(1) and
+        # only a re-log of an existing key pays for superseding it
+        keys: set[tuple[str | int, int]] = Field(default_factory=set)
 
     def __init__(
         self,
@@ -130,9 +133,12 @@ class JSONRecorder(FileRecorder):
         # errored sample that seeded this log — matching the .eval readers'
         # last-entry-wins rule rather than listing the sample twice
         key = (sample.id, sample.epoch)
-        log.data.samples = [s for s in log.data.samples if (s.id, s.epoch) != key]
+        if key in log.keys:
+            log.data.samples = [s for s in log.data.samples if (s.id, s.epoch) != key]
+            log.summaries = [s for s in log.summaries if (s.id, s.epoch) != key]
+        else:
+            log.keys.add(key)
         log.data.samples.append(sample)
-        log.summaries = [s for s in log.summaries if (s.id, s.epoch) != key]
         log.summaries.append(sample.summary())
 
     @override

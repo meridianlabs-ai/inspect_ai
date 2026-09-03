@@ -1,5 +1,7 @@
 from typing import Any, cast
 
+import anyio
+
 from inspect_ai._eval.task.log import TaskLogger
 from inspect_ai.log._recorders.buffer.database import SampleBufferDatabase
 
@@ -13,3 +15,4 @@ class TaskLoggerShim(TaskLogger):
         self._init_stale_flush_state()
         self._finished = False
         self._prior_seeded = False
+        self._prior_read_limit = anyio.Semaphore(4)

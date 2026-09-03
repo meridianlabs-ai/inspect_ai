@@ -2193,9 +2193,7 @@ def test_retry_attempt_killed_after_seed_leaves_completed_samples_reusable(
     assert {(s.id, s.epoch) for s in final.samples} == {("s1", 1), ("s2", 1)}
 
 
-def _seeded_retry_task(
-    calls: list[str], *, fail_s4_times: int
-) -> tuple[Task, Callable[[], int]]:
+def _seeded_retry_task(calls: list[str], *, fail_s4_times: int) -> Task:
     """Four-sample task whose s4 errors on its first `fail_s4_times` runs."""
     solver_id = id(calls)
 
@@ -2213,7 +2211,7 @@ def _seeded_retry_task(
         dataset=[Sample(id=f"s{i}", input="x", target="y") for i in (1, 2, 3, 4)],
         solver=[seeded_retry_solver()],
         name="seeded_retry_task",
-    ), lambda: calls.count("s4")
+    )
 
 
 @pytest.mark.parametrize("retry_immediate", [True, False])
@@ -2230,7 +2228,7 @@ def test_errored_retry_attempt_log_holds_every_prior_sample(
     exactly once overall.
     """
     calls: list[str] = []
-    seeded_task, _ = _seeded_retry_task(calls, fail_s4_times=2)
+    seeded_task = _seeded_retry_task(calls, fail_s4_times=2)
 
     log_dir = str(tmp_path / "logs")
     # three attempts are needed; the legacy pass loop counts the initial pass
@@ -2272,7 +2270,7 @@ def test_errored_retry_attempt_log_holds_every_prior_sample(
 def test_eval_task_retry_attempt_log_holds_every_prior_sample(tmp_path: Path) -> None:
     """The in-process `eval(task_retry_attempts=...)` path seeds the same way."""
     calls: list[str] = []
-    seeded_task, _ = _seeded_retry_task(calls, fail_s4_times=1)
+    seeded_task = _seeded_retry_task(calls, fail_s4_times=1)
 
     logs = eval(
         seeded_task,
@@ -2312,7 +2310,7 @@ def test_retry_seed_failure_writes_no_log_and_next_attempt_reuses(
     monkeypatch.setattr(eval_recorder_module, "_copy_prior_log", flaky_copy)
 
     calls: list[str] = []
-    seeded_task, _ = _seeded_retry_task(calls, fail_s4_times=1)
+    seeded_task = _seeded_retry_task(calls, fail_s4_times=1)
 
     log_dir = str(tmp_path / "logs")
     success, _ = eval_set(
