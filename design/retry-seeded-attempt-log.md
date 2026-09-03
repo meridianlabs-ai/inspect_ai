@@ -443,28 +443,54 @@ open second. Under `_lock`:
    anonymous `tempfile.TemporaryFile()` (unlinked on Linux), so
    `AsyncFilesystem.get_file(remote, local_path)` has nothing to target;
    the seed instead pumps `AsyncFilesystem.read_file_bytes(prior_log, 0,
-   None)` — a `ByteReceiveStream` (the S3 body stream on asyncio, an
-   `_AnyIOFileByteReceiveStream` for local) — into the open file object in
-   constant memory, with the writes in a worker thread. No event-loop
-   blocking and no `to_thread` over fsspec's remote API (the fsspec rule in
-   AGENTS.md); the same shape `read_log` uses to download a remote `.eval`
-   before reading it. A download failure raises; nothing has been written to
-   the destination and the temp file is truncated back to empty so the
-   caller can decide (see Failure analysis).
-2. **Read the prior header** (`header.json` if present, via
-   `AsyncZipReader` over the local temp file) for its `invalidated` flag,
-   and **load the prior summaries** through `_read_all_summaries_async` over
-   the same reader (prefers `summaries.json`, falls back to the journal),
-   restricted to `keep`. When `invalidated` is `True`, read each kept
-   sample's body from the local zip and record the keys whose
-   `invalidation is not None` in `_prior_invalidated`. A prior with no
-   header is a `started` log and has no invalidations (see Options A).
-3. **Open in append mode** (`_open()`), which parses the copied central
-   directory into `filelist`/`NameToInfo`.
+   None)` — a `ByteReceiveStream` — into the open file object, with the
+   writes in a worker thread. For S3 on asyncio (the body stream) and for
+   local files (`_AnyIOFileByteReceiveStream`) that is a constant-memory
+   stream that never blocks the loop. It is not unconditional:
+   `read_file_bytes` returns the whole object as an in-memory buffer for S3
+   under trio (`to_thread` over `s3_read_file_bytes`) and for every other
+   remote backend (GCS/Azure), where the read itself is a synchronous fsspec
+   read on the event loop. The seed inherits those limits rather than
+   working around them — they are the ones `read_log`'s download already
+   has today (`fs.get_file`, sync, for non-S3 remotes) — so the multi-GB
+   case in Trade-offs is bounded only on S3/asyncio and local. No
+   `to_thread` over fsspec's remote API (the fsspec rule in AGENTS.md). A
+   download failure raises; nothing has been written to the destination and
+   the temp file is truncated back to empty so the caller can decide (see
+   Failure analysis).
+2. **Open in append mode** (`_open()`), which parses the copied central
+   directory into `filelist`/`NameToInfo`. Over a *valid* zip, append mode
+   leaves `_didModify = False` and permits reads, so the hazard above does
+   not apply once the copy has landed.
+3. **Read the prior header and summaries through `self._zip`** in a worker
+   thread (`anyio.to_thread.run_sync`; the temp file is local, so the fsspec
+   rule does not apply). `AsyncZipReader` reads by path through
+   `AsyncFilesystem` and so, like `get_file` in step 1, cannot target the
+   anonymous temp file; reading the header and summaries from the prior
+   log's remote location instead would spend three range reads per attempt
+   on bytes that are already local. The header read is the existing sync
+   `_read_header(zip, location)` (`header.json` if present, else
+   `_journal/start.json` plus config updates) and supplies `invalidated`; a
+   prior with no header is a `started` log and has no invalidations (see
+   Options A). The summaries readers are async-only
+   (`_read_all_summaries_async`, `_read_summary_counter`), so a small sync
+   counterpart over `ZipFile`, `_read_all_summaries(zip)`, is added with the
+   same contract: `summaries.json` if present, else the journal members in
+   index order, then `_dedupe_summaries`. The result is filtered to `keep`
+   by typed `(id, epoch)` (every summary when `keep` is `None`); these are
+   the **kept summaries** the following steps work from. When `invalidated`
+   is `True`, each kept body is read with `zip.read` in the same thread and
+   the keys whose `invalidation is not None` are recorded in
+   `_prior_invalidated`.
 4. **Prune** from `filelist`/`NameToInfo`: `header.json`, `summaries.json`,
    `reductions.json`, `_journal/config_updates/*`, every
-   `_journal/summaries/*`, and every `samples/{id}_epoch_{epoch}.json` whose
-   key is not in `keep` (when `keep` is given). Dead bytes only; no rewrite.
+   `_journal/summaries/*`, and every `samples/*` member whose name is not in
+   `{_sample_filename(s.id, s.epoch) for s in kept summaries}`. Names are
+   generated and compared, never parsed: `_sample_filename` interpolates
+   the id as a plain string, so `samples/1_epoch_1.json` does not say
+   whether the id was `1` or `"1"`, and a string id containing `_epoch_`
+   cannot be split back. A body member with no summary row is pruned too —
+   `lookup` could not classify it. Dead bytes only; no rewrite.
    `_journal/start.json` is left in place and superseded by the new
    attempt's `start()` (readers take the last entry).
 5. **Rewrite the summaries journal**: set `_summaries` to the kept
@@ -473,7 +499,8 @@ open second. Under `_lock`:
    index present, so pruning the prior journal and starting at 1 is
    consistent for every reader. Nothing goes into `_samples` or
    `_streaming_samples`.
-6. Record `_prior_keys = {(id, epoch)}` of kept sample entries and
+6. Record `_prior_keys = {(s.id, s.epoch) for s in kept summaries}` — typed
+   keys from the summaries, not parsed from member names — and
    `_prior_size` (bytes) for the compaction heuristic.
 
 `buffered_sample(id, epoch)` gains a third tier after `_samples` and
@@ -626,7 +653,10 @@ warning names the prior log and the error.
    multi-GB prior log on a slow link that is tens of seconds to a few
    minutes of startup delay per attempt. If that matters in practice, A2
    restores the overlap at the cost of the seed-failure-after-live-work
-   rule (discard and write nothing).
+   rule (discard and write nothing). The download streams in constant
+   memory only on S3 under asyncio and for local files; other remote
+   backends, and S3 under trio, buffer the whole prior log in memory, as
+   `read_log` does for them today (see step 1 of the mechanism).
 2. **Dead bytes between attempts.** A non-success attempt's log carries the
    prior's superseded metadata and, for re-run samples, their prior records.
    Bounded by the errored/invalidated set per attempt; reclaimed by
@@ -694,7 +724,12 @@ Unit (`tests/log/test_task_log.py` and a recorder test module):
 - `ZipLogFile.init(prior_log=...)`: seeded temp zip contains every prior
   sample member and its first bytes are the prior log's (no
   end-of-central-directory record written over them); pruned names are
-  absent from the central directory but the file stays valid; `_summaries`
+  absent from the central directory but the file stays valid; pruning is
+  by generated member name, so a prior holding the string id `"1"` and a
+  string id containing `_epoch_` keeps exactly the planned keys and
+  `_prior_keys` preserves id type; `_read_all_summaries` over the seeded
+  zip matches `_read_all_summaries_async` on the same file for both a
+  `summaries.json` prior and a journal-only `started` prior; `_summaries`
   matches the kept keys and the journal holds exactly one member listing
   them, so an in-progress `read_eval_log_sample_summaries` over the seeded
   log lists no pruned key; `buffered_sample` serves a seeded key from the
