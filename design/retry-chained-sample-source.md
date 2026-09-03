@@ -161,20 +161,32 @@ jobs:
 - A grouping helper returns the mtime-ordered groups (newest first) per task
   id. `list_latest_eval_logs` takes `[0]` of each group for the
   complete/incomplete classification as today, and passes the tail along
-  with each incomplete `Log`.
+  with each incomplete `Log`. `latest_completed_task_eval_logs(logs,
+  cleanup_older)` keeps its signature and `list[Log]` return as a thin
+  wrapper over the helper (grouping, then cleanup, then `[0]` per group):
+  `cleanup_older_eval_logs` and two existing tests call it directly (see
+  Testing).
 - `as_previous_tasks` receives, per failed task, the newest `Log` plus its
-  ordered older siblings, and stores them on `PreviousTask` as a new
-  defaulted field `fallback_logs: list[tuple[EvalLog, EvalLogInfo]]`
-  (`_eval/task/task.py`; `PreviousTask` is private, and both other
-  constructors — `eval_retry` in `_eval/eval.py` and the explicit-resume path
-  in `evalset.py` — keep the default). `_recover_crashed_log` applies only to
-  the newest log as today; older `started` logs are chained as they are on
-  disk (whatever they hold is usable; nothing more is attempted).
+  ordered older siblings, and stores the siblings on `PreviousTask` as a new
+  defaulted field `fallback_logs: list[PriorAttemptLog]`
+  (`_eval/task/task.py`), where `PriorAttemptLog` is a two-field
+  `NamedTuple(log: EvalLog, info: EvalLogInfo)` declared beside
+  `PreviousTask` — named fields rather than a bare tuple so the
+  `EvalLog`/`EvalLogInfo` slots can't be swapped positionally, mirroring
+  `PreviousTask`'s own `log`/`log_info` pair. `evalset.Log` is not reused
+  because `evalset.py` imports from `task/`, so `task.py` importing `Log`
+  back would be circular; `as_previous_tasks` converts each sibling `Log`
+  to `PriorAttemptLog(log=header, info=info)`. `PreviousTask` is private,
+  and both other constructors — `eval_retry` in `_eval/eval.py` and the
+  explicit-resume path in `evalset.py` — keep the default.
+  `_recover_crashed_log` applies only to the newest log as today; older
+  `started` logs are chained as they are on disk (whatever they hold is
+  usable; nothing more is attempted).
 - `resolve_previous_task` (`_eval/loader.py`) folds the chain from oldest to
-  newest: `source = None; for log in reversed(fallback_logs): source =
-  eval_log_sample_source(log, ..., fallback=source)`, then the newest with
-  `fallback=source`. Each link runs its own eligibility checks against
-  `loaded_task.dataset`.
+  newest: `source = None; for link in reversed(fallback_logs): source =
+  eval_log_sample_source(link.log, link.info, ..., fallback=source)`, then
+  the newest with `fallback=source`. Each link runs its own eligibility
+  checks against `loaded_task.dataset`.
 
 Logs in one group already share task identity (`task_identifier` includes
 task args, model, and the eval-set config that participates in identity), so
@@ -222,17 +234,57 @@ predecessor alive, and only until an attempt supersedes both. `invalidate_log_sa
 is called on deletion as today.
 
 `docs/eval-sets.qmd`'s `--no-retry-cleanup` row should say failed logs are
-removed once a later attempt supersedes them.
+removed once a later attempt supersedes them. This is a visible behaviour
+change for anything that assumes one log per task in an eval-set directory
+after a pass — `bundle_log_dir` output, viewer listings, scripts iterating
+`list_eval_logs` — triggered by any partial attempt. It is accepted (those
+logs hold results nothing else has, and keeping is the conservative
+direction), and the implementation PR's CHANGELOG entry should say in one
+sentence that a failed attempt's older logs now remain until a later
+attempt holds every sample they do.
 
 ### Observability at the partial finish
 
-`_ReuseSweepCountdown` knows how many planned runs have not settled. When
-`task_run` finishes with a non-success status while `_remaining > 0`, log a
-warning naming the count: "N planned samples had not resolved their
-prior-attempt lookup when this attempt ended; the next retry will consult the
-prior attempt's log for them." This costs nothing and turns a silent
-condition into a diagnosable one — the incident was only reconstructed by
-reading three logs by hand.
+When a retry attempt finishes with a non-success status while some planned
+runs never resolved their prior-attempt lookup, log a warning naming the
+count: "N planned samples had not resolved their prior-attempt lookup when
+this attempt ended; the next retry will consult the prior attempt's log for
+them." This costs nothing and turns a silent condition into a diagnosable
+one — the incident was only reconstructed by reading three logs by hand.
+
+The count is **not** `_ReuseSweepCountdown._remaining`. That counter tracks
+*settled* runs, and settling deliberately includes cancellation: the
+`settle_one()` call sits in `run_sample`'s `finally` (`_eval/task/run.py`)
+precisely so a cancelled `run_sample` still releases the destination-write
+hold. On every teardown shape in the Problem section the task group is
+cancelled, each pending `await sample_source.lookup(...)` raises the
+cancellation exception, and its `finally` decrements the count — so by the
+time `task_run`'s terminal branches reach `finish_task_log`, `_remaining` is
+already `0`. A warning keyed on it would never fire in exactly the
+scenarios it exists to diagnose.
+
+The warning needs a resolved-vs-settled distinction: `_ReuseSweepCountdown`
+gains a `resolved` counter incremented only when the lookup block completes
+normally, via `settle_one(resolved: bool)` — `run_sample` sets a local flag
+at the end of the `try` body (after the lookup and any re-log) and passes it
+from the `finally`, so a lookup that raised or was cancelled settles but
+does not resolve. A `run_sample` with no source, or whose key the source
+lacks, completes the block trivially and counts as resolved; requeued
+re-runs are excluded exactly as they are from settling. The warning is
+keyed on `planned − resolved > 0` (planned includes any runs added by
+`add()`), and fires only when `options.sample_source` is not `None` — a
+fresh eval has no prior attempt to consult, so the message would be
+misleading there.
+
+Where it fires: from the `finish_task_log` closure, which every terminal
+branch already goes through, when `status != "success"`. `reuse_settle` is
+currently bound inside the `try`, a few statements in (after
+`create_sample_semaphore`, alongside the read throttle), so an exception
+raised before that line — `create_sample_semaphore` itself, say — reaches
+the `BaseException` branch and its `finish_task_log` call with the name
+unbound. Declare it as `_ReuseSweepCountdown | None = None` before the
+`try` so the closure can read it, and skip the warning when it is still
+`None`.
 
 ## Failure analysis
 
@@ -273,7 +325,7 @@ reading three logs by hand.
 2. **Un-superseded older logs stay in the log dir** until an attempt
    supersedes them (or forever if the set never succeeds). This is the point:
    those logs hold results nothing else has. The info-level message explains
-   the extra file.
+   the extra file, and the cleanup section names the consumers that see it.
 3. **Extra summaries reads at pass start**, only for tasks with more than one
    log — one per log in the group. Bounded and rare.
 4. **`PreviousTask` grows a field.** Private dataclass, defaulted; the
@@ -342,6 +394,16 @@ reading three logs by hand.
   composes; presence stays `_never_prior_exists` for `.json` links.
 - **Dynamic `SampleSource` tasks**: injected samples look up through the
   same chained source; nothing feed-specific changes.
+- **Two attempts with the same mtime**: chain order is mtime order,
+  inherited from today's newest-log selection, and stores with
+  seconds-granularity mtimes (S3) can give two attempts that finish within
+  the same second an ambiguous order. The worst case is a key present in
+  both logs resolving from the older one — one lost error-history
+  increment, or a clean sample shadowing an errored re-run of it — never a
+  re-run of a completed sample or a lost result. `retry_wait` makes it
+  unlikely and the existing single-log selection has the same ambiguity, so
+  no tie-break is added; if one is ever wanted, the header's
+  `eval.created` timestamp is the natural secondary key.
 
 ## Testing
 
@@ -361,8 +423,20 @@ Unit (`tests/test_task_retry_error_history.py`, which already covers
   lacks is kept, a superseded one is deleted, `started` logs are kept; with a
   success newest log every older non-`started` log is deleted; a failing
   summaries read keeps the log.
-- The mid-sweep non-success warning fires with the unsettled count and is
-  silent when the sweep settled.
+- Existing callers of `latest_completed_task_eval_logs` must keep passing:
+  `tests/test_eval_set.py::test_latest_completed_task_eval_logs` (two
+  `.json` fixtures for one task, `success` and `error`, both holding no
+  samples — an empty key set is trivially superseded, so the older log is
+  deleted under either mtime order) and
+  `tests/_control/test_eval_state.py`'s summaries-memo invalidation test
+  (`success` newest, so the shortcut path with no summaries read; its
+  header is a `SimpleNamespace` stub exposing only `status`,
+  `eval.task_id` and `eval.eval_id`, which the success path must keep
+  sufficient).
+- The mid-sweep non-success warning fires with the *unresolved* count when
+  `run_sample`s are cancelled mid-lookup (settled but not resolved), is
+  silent when every lookup resolved before the failure, and is silent on a
+  fresh eval with no sample source.
 
 Eval-level (`tests/test_eval_set.py`):
 
