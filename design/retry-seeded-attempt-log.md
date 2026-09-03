@@ -605,6 +605,21 @@ carries the complete prior set.
   key's prior record is already in the seeded zip, which is exactly what
   carry-forward re-logged.
 
+### The control channel's samples listing
+
+`current_sample_summaries` merges the recorder's summaries with
+`active_samples`, letting a terminal record supersede a running row (the
+sample finished between the two reads). A seeded log makes that rule wrong
+for a re-running sample: the recorder now holds the prior attempt's errored
+(or cancelled) record for the same `(id, epoch)` while its re-run is live,
+and without a guard the stale record hides the running row — `inspect ctl
+sample list` shows the sample as `error` with no `retries`, and the
+running row's `retries` count with it. The merge therefore lets a terminal
+record supersede a running row only when it completed at or after the
+running sample started; a record that completed earlier is the prior
+attempt's, and the live row stays. `sample_error_detail` already reads the
+running sample first, so it needs no change.
+
 ### Compaction at successful finish
 
 In `EvalRecorder.log_finish` when `status == "success"` and dead bytes

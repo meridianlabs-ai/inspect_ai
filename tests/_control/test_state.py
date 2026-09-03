@@ -284,6 +284,77 @@ async def test_errors_filter_filters_and_skips_pending_grid(monkeypatch) -> None
         clear_all_eval_states()
 
 
+async def test_seeded_prior_record_does_not_hide_running_rerun(monkeypatch) -> None:
+    """A prior attempt's terminal record never supersedes the sample's live re-run.
+
+    A retry attempt's log is seeded with the prior attempt's sample records
+    (``TaskLogger.seed_from_prior``), so while a sample that errored last
+    attempt re-runs, the recorder holds its prior ``error`` record alongside
+    the running ``ActiveSample``. That record completed before the re-run
+    started, so the running row wins. A record completed after the running
+    row started (the sample finished between the two reads) still supersedes.
+    """
+    from datetime import datetime, timezone
+    from unittest.mock import MagicMock
+
+    from inspect_ai._control.eval_state import clear_all_eval_states, register_eval
+    from inspect_ai._control.state import current_sample_summaries
+
+    running_since = 1000.0
+
+    def iso(ts: float) -> str:
+        return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+    s = MagicMock()
+    s.eval_id = "e-seeded"
+    s.completed = None
+    s.started = running_since
+    s.sample.id = 1
+    s.epoch = 1
+    s.retries = 1
+    s.retry_wait = None
+    s.transcript.history.last_event = None
+    s.transcript.history.event_count = 0
+    s.transcript.pending_events = []
+    s.pending_interaction = None
+    monkeypatch.setattr("inspect_ai.log._samples.active_samples", lambda: [s])
+
+    prior = EvalSampleSummary(
+        id=1,
+        epoch=1,
+        input="i",
+        target="t",
+        error=_GENUINE,
+        started_at=iso(running_since - 100.0),
+        completed_at=iso(running_since - 50.0),
+    )
+    fresh = EvalSampleSummary(
+        id=1,
+        epoch=1,
+        input="i",
+        target="t",
+        completed=True,
+        retries=1,
+        started_at=iso(running_since),
+        completed_at=iso(running_since + 10.0),
+    )
+    for completed, expected in ((prior, "running"), (fresh, "completed")):
+        try:
+            register_eval(
+                "e-seeded",
+                1,
+                live=cast("LiveEvalData", _FakeLive([completed])),
+                sample_ids=[1],
+                epochs=1,
+            )
+            [row] = await current_sample_summaries("e-seeded")
+            assert row["status"] == expected
+            assert row["retries"] == 1
+            assert row["error"] is None
+        finally:
+            clear_all_eval_states()
+
+
 async def test_listing_withholds_error_message_unless_content(monkeypatch) -> None:
     """The listing's error message (agent-influenced free text) is gated.
 

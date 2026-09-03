@@ -324,8 +324,12 @@ async def current_sample_summaries(
 
     Merged and deduped by ``(sample_id, epoch)``; a terminal record
     (completed / error) supersedes a running one, which supersedes a
-    pending one. Sorted running → terminal → pending. Returns an empty
-    list when the eval isn't in this process.
+    pending one — except a terminal record that predates the running
+    sample's start, which is a prior attempt's record awaiting its re-run
+    (a retry attempt's log is seeded with the prior attempt's samples, see
+    ``TaskLogger.seed_from_prior``), not a finish of the running one.
+    Sorted running → terminal → pending. Returns an empty list when the
+    eval isn't in this process.
 
     Each entry has: ``sample_id``, ``epoch``, ``status`` (a
     :data:`SAMPLE_STATUSES` member), ``started_at``, ``completed_at``,
@@ -358,10 +362,16 @@ async def current_sample_summaries(
         existing = by_key.get(key)
         # Keep the first record for a key, except let a terminal record
         # supersede a still-running one (a sample that has since finished).
-        if existing is None or (
-            existing["status"] == "running" and summary["status"] != "running"
-        ):
+        # A terminal record completed before the running sample started is
+        # not that: it is the prior attempt's record (seeded into a retry
+        # attempt's log) for a sample now re-running, so the live row stays.
+        if existing is None:
             by_key[key] = summary
+        elif existing["status"] == "running" and summary["status"] != "running":
+            started_at = existing["started_at"]
+            completed_at = summary["completed_at"]
+            if started_at is None or completed_at is None or completed_at >= started_at:
+                by_key[key] = summary
 
     # Running first (the freshest source for in-flight samples), then the
     # completed records (which supersede any now-finished running entry).
