@@ -546,7 +546,13 @@ where it is decided today, and the logger just reads the field.
 `TaskLogger.init()`/`reinit()` call `recorder.log_init(eval,
 prior_log=source.seed.location, keep=...)` when the field is set. `keep`
 comes from the plan (`sample_ids × range(1, epochs+1)`; `None` for a
-dynamic-feed task). The logger records the seeded key set and the
+dynamic-feed task). Both `init()` (in `eval_run`) and `reinit()` (in
+`run_task_retry_attempts`) run before `task_run` slices the dataset, but
+the plan is already available: `TaskLogger.__init__` slices with the same
+`limit`/`sample_id`/`dynamic` arguments and stores the typed ids on
+`self.eval.dataset.sample_ids`, and `self.eval.config.epochs` gives the
+epoch count, so `keep` is built from those two fields and `log_init` stays
+where it is. The logger records the seeded key set and the
 invalidated subset for bookkeeping: `samples_logged` becomes "distinct keys
 present in the log minus cancelled" derived from `sample_summaries()`, so
 the count is right even for seeded keys whose `run_sample` never ran before
