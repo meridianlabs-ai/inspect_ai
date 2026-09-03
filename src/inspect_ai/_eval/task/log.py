@@ -361,7 +361,15 @@ class TaskLogger:
         # logger, which is about to be re-pointed at the new attempt
         detach_eval_live(self.eval.eval_id)
 
-        await self._stop_stale_flush_timer()
+        if self._finished:
+            await self._stop_stale_flush_timer()
+        else:
+            # the attempt failed before finishing its log (its prior-log seed
+            # or a log write failed): log_finish never released its recorder
+            # entry (open temp zip) or buffer db, and a destination its
+            # log_start flushed would stand as a stray `started` log — drop
+            # them as for an abandoned attempt, before the eval_id moves on
+            await self.discard()
         self.eval = self.eval.model_copy(update=dict(eval_id=uuid(), created=iso_now()))
         self._samples_completed = 0
         self._logged_sample_keys = set()
@@ -373,11 +381,9 @@ class TaskLogger:
         # the retry attempt gets a fresh log, which must re-record the run's
         # full accumulated process-scoped updates in init() below
         self._process_updates_recorded = 0
-        # normally log_finish() has already cleaned up the buffer db, but if
-        # the attempt failed before finishing its log (e.g. the log_start()
-        # write failed) it is still live — clean it up so the new attempt
-        # can't collide with it (the location repeats if `created` lands on
-        # the same second)
+        # log_finish() (or discard() above) has cleaned up the buffer db; a
+        # stale one would collide with the new attempt's (the location repeats
+        # if `created` lands on the same second)
         if self._buffer_db is not None:
             self._buffer_db.cleanup()
             self._buffer_db = None

@@ -3698,7 +3698,9 @@ async def _finish_task_log(
     so nothing needs carrying forward here.
     """
     # log_samples_complete (_eval/evalset.py) prefers this count over the
-    # planned total_samples; seeded prior records count toward it too.
+    # planned total_samples. A seeded prior record counts only once the reuse
+    # sweep accepts it; a seeded errored record awaiting its re-run does not
+    # (see TaskLogger.seed_from_prior).
     if results is not None and record_logged_samples:
         results.logged_samples = (
             logger.samples_logged

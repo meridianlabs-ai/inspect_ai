@@ -152,6 +152,7 @@ class _FlushRecorder:
     def __init__(self, location: str = "test.eval") -> None:
         self.location = location
         self.init_count = 0
+        self.discard_count = 0
         self.flush_count = 0
         self.flush_started = anyio.Event()
         self.allow_flush = anyio.Event()
@@ -163,6 +164,9 @@ class _FlushRecorder:
     ) -> str:
         self.init_count += 1
         return location or self.location
+
+    async def log_discard(self, eval_spec: EvalSpec) -> None:
+        self.discard_count += 1
 
     async def flush(self, eval_spec: EvalSpec) -> None:
         self.flush_count += 1
@@ -857,9 +861,63 @@ async def test_task_logger_reinit_waits_for_in_flight_stale_flush_and_restarts(
     assert old_buffer_db.removed == [("sample", 1)]
     assert new_buffer_db.removed == [("after-retry", 1)]
     assert recorder.init_count == 1
+    # the attempt never finished its log, so reinit released its recorder entry
+    assert recorder.discard_count == 1
     assert logger.eval.eval_id != original_eval_id
     assert logger.samples_completed == 1
     assert logger.flush_pending == []
+
+
+async def test_task_logger_reinit_discards_unfinished_attempt_log(
+    tmp_path: Path,
+) -> None:
+    # an attempt that never reached log_finish (its seed or a log write failed)
+    # still holds its recorder entry (open temp zip) and, once log_start
+    # flushed, a `started` destination; reinit releases both, as discard does
+    # for an abandoned attempt, so neither outlives the attempt
+    recorder = EvalRecorder(str(tmp_path))
+    logger = _seed_logger(recorder)
+    logger.eval = logger.eval.model_copy(
+        update={"config": EvalConfig(log_realtime=False)}
+    )
+    logger._location = await recorder.log_init(logger.eval)
+    await logger.log_start(EvalPlan())
+    failed_location = logger.location
+    assert Path(failed_location).exists()
+    (failed_key,) = recorder.data
+    assert not logger.finished
+
+    await logger.reinit()
+
+    assert not Path(failed_location).exists()
+    assert failed_key not in recorder.data
+    assert len(recorder.data) == 1
+    assert logger.location != failed_location
+    await logger.log_start(EvalPlan())
+    assert Path(logger.location).exists()
+
+
+async def test_task_logger_reinit_leaves_finished_attempt_log(
+    tmp_path: Path,
+) -> None:
+    # a finished attempt's log (the errored log the retry seeds from) is not
+    # a stray: reinit must leave it in place
+    recorder = EvalRecorder(str(tmp_path))
+    logger = _seed_logger(recorder)
+    logger.eval = logger.eval.model_copy(
+        update={"config": EvalConfig(log_realtime=False)}
+    )
+    logger._location = await recorder.log_init(logger.eval)
+    await logger.log_start(EvalPlan())
+    await logger.log_finish("error", EvalStats(), None, None, _error("boom"))
+    finished_location = logger.location
+    assert logger.finished
+
+    await logger.reinit()
+
+    assert Path(finished_location).exists()
+    assert not logger.finished
+    assert len(recorder.data) == 1
 
 
 @pytest.mark.anyio

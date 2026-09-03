@@ -6,8 +6,10 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import BinaryIO, Literal, cast
+from unittest.mock import patch
 from zipfile import ZipFile
 
+import anyio
 import pytest
 from pydantic import BaseModel
 from pydantic_core import PydanticSerializationError
@@ -2007,6 +2009,45 @@ async def test_eval_recorder_seed_retries_transient_copy_failure(
     await recorder.log_init(spec2)
     with pytest.raises(OSError, match="simulated storage failure"):
         await recorder.log_seed(spec2, prior, keep=None)
+
+
+async def test_copy_prior_log_does_not_retry_a_cancellation(monkeypatch) -> None:
+    # tenacity's attempt manager catches BaseException, so the retry predicate
+    # must not match a cancellation landing mid-copy (Ctrl-C during a long
+    # download): it propagates at once rather than being swallowed for a step
+    # as a "transient failure" (a spurious retrying warning and a temp-file
+    # reset before the next sleep re-raised it)
+    import inspect_ai.log._recorders.eval as eval_module
+
+    class _RemoteFS:
+        def is_local(self) -> bool:
+            return False
+
+    attempts = 0
+    started = anyio.Event()
+
+    async def hanging_copy(location: str, dest: BinaryIO) -> None:
+        nonlocal attempts
+        attempts += 1
+        dest.write(b"partial")
+        started.set()
+        await anyio.sleep_forever()
+
+    monkeypatch.setattr(eval_module, "filesystem", lambda path: _RemoteFS())
+    monkeypatch.setattr(eval_module, "_copy_remote_file", hanging_copy)
+
+    with tempfile.TemporaryFile() as dest:
+        with patch.object(eval_module.logger, "warning") as warning:
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(eval_module._copy_prior_log, "remote://prior.eval", dest)
+                await started.wait()
+                tg.cancel_scope.cancel()
+
+        assert attempts == 1
+        warning.assert_not_called()
+        # no retry reset the copy in flight
+        dest.seek(0)
+        assert dest.read() == b"partial"
 
 
 async def test_eval_recorder_seed_preserves_config_updates_and_discard(

@@ -32,7 +32,7 @@ from pydantic import BaseModel, Field, JsonValue
 from tenacity import (
     AsyncRetrying,
     RetryCallState,
-    retry_if_not_exception_type,
+    retry_if_exception,
     stop_after_attempt,
     wait_exponential_jitter,
 )
@@ -839,6 +839,15 @@ async def _copy_prior_log(prior_log: str, dest: BinaryIO) -> None:
     """
     fs = filesystem(prior_log)
 
+    def is_transient_failure(exception: BaseException) -> bool:
+        # a positive predicate: tenacity's attempt manager catches
+        # BaseException, so a negative one would also match a cancellation
+        # mid-copy, swallowing it for one step (a spurious "retrying"
+        # warning and temp-file reset) before the next sleep re-raised it
+        return isinstance(exception, Exception) and not isinstance(
+            exception, FileNotFoundError
+        )
+
     def reset_before_retry(state: RetryCallState) -> None:
         dest.seek(0)
         dest.truncate()
@@ -850,7 +859,7 @@ async def _copy_prior_log(prior_log: str, dest: BinaryIO) -> None:
         )
 
     async for attempt in AsyncRetrying(
-        retry=retry_if_not_exception_type(FileNotFoundError),
+        retry=retry_if_exception(is_transient_failure),
         wait=wait_exponential_jitter(
             initial=SEED_COPY_BACKOFF_SECONDS, jitter=SEED_COPY_BACKOFF_SECONDS
         ),

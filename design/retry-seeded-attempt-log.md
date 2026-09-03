@@ -670,6 +670,14 @@ an errored `EvalLog` without a file, the same path a failed `log_start`
 flush takes). eval_set with `retry_immediate=False` needs nothing: no file
 means the next pass selects the older log.
 
+`TaskLogger.reinit` then releases what the unfinished attempt left behind,
+as `TaskLogger.discard` does for an abandoned attempt: `log_finish` never
+ran, so the recorder still holds the attempt's entry (its open temp zip,
+plus any members a partially re-logged in-memory or `.json` prior wrote
+through), and a `log_start` flush that did land left a `started`
+destination that would otherwise stand as a stray log. Both go before the
+`eval_id` moves on; a finished attempt's log is untouched.
+
 ### Seed download retry (H)
 
 Wrap the download in a bounded retry with backoff (three attempts, say)
