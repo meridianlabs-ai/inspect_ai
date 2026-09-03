@@ -1,0 +1,624 @@
+# Making every retry attempt's log complete: seeding the attempt from the prior log
+
+Design for [meridianlabs-ai/inspect_ai#420](https://github.com/meridianlabs-ai/inspect_ai/issues/420)
+(upstream [UKGovernmentBEIS/inspect_ai#5213](https://github.com/UKGovernmentBEIS/inspect_ai/issues/5213)).
+Follows on from [retry-deferred-destination-log.md](retry-deferred-destination-log.md)
+(the hard-kill variant, #4933) and the reuse-sweep machinery in
+[retry-reused-sample-flush.md](retry-reused-sample-flush.md).
+
+This revision supersedes an earlier draft that proposed chaining the retry
+sample source across a task's older logs. Review feedback (ransomr): log files
+are self-contained today, and a retry that depends on more than one file
+introduces a new cross-file concept with its own hazards. The constraint
+adopted here is therefore:
+
+> **Every log file stays self-contained, and the newest log for a task stays
+> the whole truth about that task.** The fix must make a retry attempt's log
+> complete no matter how the attempt ends — not teach readers to look past an
+> incomplete one.
+
+Chaining is retained below as one of the compared options, for the record.
+
+## Problem
+
+A retry attempt seeds itself from exactly one prior log. Every planned
+`(id, epoch)` is looked up in that log by the reuse sweep in `run_sample`
+(`_eval/task/run.py`): a clean completed sample is read from the prior log,
+parsed, condensed, re-serialized and re-logged into the new attempt with
+`write_through=True`; an errored one seeds `PreviousError` history; anything
+else runs live. Live samples do not wait for the sweep, and the sweep's body
+reads are bounded to 25 at a time, so on a large prior log on remote storage
+the sweep can run for minutes while live samples are already executing.
+
+If the attempt *errors* while the sweep is still running — a live sample fails
+and `fail_on_error` tears the task down, a `TerminateTaskError` from
+`inspect ctl`, a Ctrl-C, or the prior-log read itself raising a transport
+error out of `read_from_file` — `task_run`'s terminal branches call
+`finish_task_log`, which writes whatever the sweep had re-logged so far plus
+the live results. That log is a legitimate error/cancelled record of the
+attempt, and it is now the task's newest log. It is also missing every prior
+completed sample the sweep never reached.
+
+The next attempt then uses only that partial log:
+
+- eval_set (`retry_immediate=False`) picks the newest log per task by mtime
+  in `latest_completed_task_eval_logs` (`_eval/evalset.py`) and builds the
+  source from it in `as_previous_tasks` → `resolve_previous_task`
+  (`_eval/loader.py`).
+- The in-process retry (`retry_immediate=True`, or `eval(retry_attempts=)`)
+  builds the source directly from `options.logger.location` — the attempt
+  that just errored — in `_run_task`'s retry branch (`_eval/run.py`).
+
+Both paths re-run from scratch every sample that completed in the older log
+but is absent from the newer one. In the production incident that was 34 of
+47 samples (25 of them cost-capped). With the default `retry_cleanup=True`
+the older log is deleted at the start of the next pass
+(`list_latest_eval_logs(..., cleanup_older=retry_cleanup)` removes every
+non-`started` log that isn't the newest), so the completed results are gone
+before the retry even starts — duplicated spend becomes permanent loss.
+
+### Why #4933 doesn't cover this
+
+That fix enforces "no destination write until the reuse sweep settles", so a
+hard kill mid-sweep leaves no file and the next retry naturally falls back to
+the older log. `TaskLogger.log_finish` is deliberately exempt: it is the
+attempt's own terminal record and must always land. The graceful-error path
+therefore still produces a newest log with a partial reused set. The #240
+design filed this as an accepted "bounded re-spend, no data loss" trade-off;
+the incident shows the bound is the whole prior log and, with cleanup on, it
+*is* data loss.
+
+The `carry_forward_unlogged_samples` teardown step doesn't help either: it
+re-logs only samples with prior *error* history (`PreviousError`), probing
+`error_history_ids()` — never clean completed samples — and it was
+deliberately narrowed to that set because probing every planned sample at
+teardown stalled Ctrl-C shutdown of large remote retries for minutes.
+
+### The root cause, restated
+
+The prior log's completed samples are copied into the new attempt **lazily,
+one sample at a time, interleaved with live work**, so there is always a
+window in which the new attempt's log is a strict subset of the prior one.
+Every option below either closes that window (copy everything up front, or
+finish the copy before finalizing), or stops the subset log from becoming the
+newest log (write nothing, or look past it).
+
+## Facts the options build on
+
+- **The recorder is a local temp zip, copied whole on every flush.**
+  `ZipLogFile` (`log/_recorders/eval.py`) appends every entry to an anonymous
+  local temp file opened with `ZipFile(mode="a")`; `flush()` copies the
+  entire temp zip to the destination (atomic rename locally, streaming
+  multipart upload on S3). There is no incremental/append write to the
+  destination — a flush always rewrites the whole file. So anything the
+  attempt's log is to contain must be in the temp zip; a server-side copy of
+  the prior log to the destination alone cannot survive the first flush.
+- **Duplicate member names already mean "supersede".** `_zip_writestr`
+  deliberately appends a second member under the same name for a requeued
+  sample's re-run (and for re-logging with `log_init(clean=False)`), and
+  every reader resolves a name to its *last* entry: `_read_log`,
+  `_read_log_from_bytes`, `_rewrite_eval_zip_with_new_header`,
+  `_dedupe_summaries`, and `AsyncZipReader`'s `CentralDirectory.entry()`
+  (`_by_name` is a dict comprehension over entries in order). Production
+  logs already contain such duplicates, so this is an existing format
+  contract, not a new one.
+- **A zip's central directory can drop entries cheaply.**
+  `_replace_eval_header_in_place` removes `header.json` from
+  `ZipFile.filelist`/`NameToInfo` before appending a fresh one; the old
+  bytes become unreferenced ("dead bytes") but the file stays valid. This
+  is the accepted local-edit idiom for `.eval` files.
+- **Raw member bytes are readable without decompression.**
+  `AsyncZipReader.open_member_raw` streams a member's compressed bytes.
+  Python's `zipfile` has no public API to *write* pre-compressed bytes, so a
+  raw entry copy needs either a small hand-rolled local-header writer or a
+  decompress+recompress round trip (`_rewrite_eval_zip_with_new_header`
+  already does the latter for remote header-only writes).
+- **Whole-file reads are the fast path for remote logs.**
+  `EvalRecorder.read_log` downloads a remote `.eval` to a temp file before
+  reading it, precisely "to eliminate the possibility of hundreds of small
+  fetches from the zip file streams". The reuse sweep today is exactly that
+  hundreds-of-small-fetches pattern, plus a JSON parse, condense, re-serialize
+  and recompress per sample.
+- **The #4933 hold already exists.** `TaskLogger.hold_destination_writes()`
+  defers every destination write until `reuse_sweep_settled()`; `log_finish`
+  is the only exempt write.
+
+## Goal
+
+> **A retry never re-runs a sample that a prior attempt of the same task
+> completed cleanly, regardless of how the intervening attempt ended — and
+> every log file remains self-contained.**
+
+Non-goals: changing how eval_set selects the retry source (newest log per
+task), changing `retry_cleanup` semantics, or changing the per-attempt log
+identity (one log file with its own `eval_id` per attempt).
+
+## Options
+
+### A. Seed the attempt's temp zip from the prior log's bytes (recommended)
+
+Before the attempt does any work, copy the prior `.eval` **as a file** into
+the new attempt's `ZipLogFile._temp_file` — one streamed download for S3/GCS,
+one local file copy otherwise — and open it in append mode. The attempt then
+starts with every prior sample entry already in its log, byte for byte, with
+zero per-sample reads, no JSON parsing, no condense, no recompression. Its
+own work appends on top:
+
+- Samples that need re-running (errored, invalidated, absent, or planned
+  keys with no prior entry) run live and append a superseding entry under
+  the same member name — the existing duplicate-name contract.
+- `_journal/start.json` for the new attempt is appended (supersedes the
+  prior's); `header.json`, `summaries.json`, `reductions.json` are written
+  at `log_finish` as today.
+- The reuse "sweep" collapses to bookkeeping: for each planned key, consult
+  the seeded summaries (already in memory — `log_init` reads the prior
+  summaries today for `clean=False`) to decide clean / errored / absent, feed
+  the reporter with scores and usage from the summary, and mark the key as
+  logged. No body read for a clean sample unless something needs the body
+  (scanner resume, a dynamic `SampleSource` feed's `sample_complete`,
+  `PreviousError` seeding) — and those read from the **local** seeded zip,
+  not the remote prior log.
+
+At seed time a few entries are pruned from the central directory (dead bytes,
+not rewritten): the prior `header.json`, `summaries.json`, `reductions.json`
+and `_journal/config_updates/*` (otherwise an in-progress read of the new log
+would return the prior attempt's finished header and eval_id — readers prefer
+`header.json` when present), and sample entries for keys outside this
+attempt's plan (a `sample_id`/`limit` subset or reduced epoch count; a
+dynamic-feed task has no upfront plan and keeps everything). Journal summary
+files (`_journal/summaries/N.json`) stay and the counter continues from the
+prior's maximum, exactly as `log_init(clean=False)` does today.
+
+Two sub-variants:
+
+- **A1 — sequential (recommended first).** `task_run` awaits the seed
+  before `log_start`. The hold from #4933 and the settle flush from #117
+  become unnecessary: `log_start`'s immediate flush uploads the seeded zip,
+  so the destination exists from the first seconds of the attempt *and*
+  already holds the complete prior set. Live samples start after the seed
+  lands. Startup latency = one whole-file download; see Trade-offs for why
+  that is not slower than today's sweep, just front-loaded.
+- **A2 — concurrent.** Live samples start immediately while the seed
+  streams in; the existing hold defers destination writes until the seed
+  lands, and temp-zip writes (streaming completions, write-throughs) await a
+  `seeded` event. Preserves today's "live samples don't wait", but reopens
+  a hard case: if the seed *fails* after live samples have completed, the
+  attempt must either drop those live results and write nothing, or write a
+  partial log — the very state this design exists to prevent. A1 has no
+  such case because nothing runs before the seed lands. A2 is a follow-up
+  only if A1's startup latency proves to be a problem in practice.
+
+What A removes: the `write_through` re-log path in `run_sample`, the
+`_ReuseSweepCountdown` settle flush, the destination-write hold (A1), the
+`carry_forward_unlogged_samples` teardown step (errored prior records are
+already in the seeded zip), and the remote per-sample read machinery
+(`AsyncZipReader` sharing, the 25-way read throttle, the presence probe and
+its failure cap). The `EvalSampleSource` abstraction stays for the
+eligibility decision and for in-memory sources, but its file-backed path reads
+the local seeded zip.
+
+What A adds: `ZipLogFile.seed(prior_location, keep: set[(id, epoch)] | None)`
+(download/copy into the temp file, open in append mode, prune, load
+summaries), a `JSONRecorder` counterpart (load the prior log's planned samples
+into its in-memory buffer — the `.json` format holds the whole log in memory
+anyway), a `TaskLogger.seed_from_prior(...)` call in `task_run` between
+`log_init` and `log_start`, and a **compaction** step at a successful
+`log_finish` that rewrites the temp zip without dead bytes (see below).
+
+**Dead bytes and compaction.** Each attempt's seeded zip carries the prior
+attempt's superseded metadata entries plus, once re-run samples complete,
+their prior records. Over `k` attempts the final log accumulates `k` stale
+copies of the re-run samples' transcripts — bounded (re-run samples are the
+errored ones) but real. Compaction at a *successful* finish — the log's last
+write — drops every unreferenced member before the final flush. It is local
+CPU only (the temp zip is a local file): either a raw member copy if it can be
+done against documented `zipfile` surface, or the decompress+recompress
+rewrite that `_rewrite_eval_zip_with_new_header` already uses, run in a
+worker thread. Non-success finishes skip compaction (their logs are
+short-lived retry seeds and `retry_cleanup` removes them), so the cost is
+paid once per task. A size heuristic (compact only when dead bytes exceed some
+fraction of the file) keeps it a no-op for a fresh eval.
+
+### B. Eager entry-level copy (pre-pass) with raw member copy
+
+Same "copy first, then work" shape as A, but copy only the planned sample
+entries from the prior log, raw (compressed) bytes via `open_member_raw`
+straight into the temp zip, before `log_start`. Skips unplanned entries and
+the prior's metadata, so there are no dead bytes and no pruning. Costs one
+range request per entry (as today) but no parse/serialize/recompress, and
+needs a raw *write* into the temp zip, which `zipfile` doesn't expose — a
+hand-rolled local-header writer over `zipfile` internals (`fp`, `start_dir`,
+`filelist`), or a decompress+recompress round trip that gives back most of
+the CPU saving. For a prior log whose sample entries are contiguous (they
+always are — an attempt writes them in order), the union of those ranges *is*
+the file, so B's N range reads fetch the same bytes as A's single download
+with more requests and more code. B is A with pruning done at copy time
+instead of at compaction time; not worth the separate machinery.
+
+### C. Filesystem-level copy of the prior log to the new destination
+
+Copy the prior log to the attempt's destination path at attempt start (S3
+`CopyObject` is server-side and fast; local reflink/copy), then run the lazy
+sweep as today. The destination immediately holds the complete prior set.
+Two problems make this not fit the recorder:
+
+- The very first flush overwrites the destination with the temp zip, which
+  holds only what the sweep has reached — the copy is undone. Keeping it
+  would require holding *every* write including `log_finish` until the
+  sweep settles, and on an unsettled finish merging the temp zip into the
+  copy — download, append, upload — which is A with extra steps.
+- The copied file carries the prior attempt's `header.json` (its `eval_id`,
+  status, results) under a new filename. Until rewritten it reads as a
+  finished duplicate of the prior attempt: eval_set groups it into the same
+  task, the control channel's summaries memo and `EvalState` registry are
+  keyed by `eval_id`, and the viewer lists two identical finished logs.
+  Rewriting the header on S3 (`_write_log_s3(header_only=True)`) downloads
+  the whole body anyway.
+
+A server-side copy only saves the download if the bytes are never needed
+locally, and the recorder's flush model needs them. Rejected.
+
+### D. Complete the sweep at teardown (the issue's first suggestion), made efficient
+
+Keep the lazy sweep; at a non-success finish with an unsettled sweep, copy
+the planned prior entries the sweep never reached into the temp zip before
+`log_finish` writes. Done as a *whole-file download plus raw copy of the
+missing names* it is a single request rather than the per-sample probing that
+stalled Ctrl-C before, and only names absent from the temp zip are copied, so
+no attempt-written entry is superseded. Still rejected as the primary
+mechanism: (a) the work runs inside teardown, under the Ctrl-C cancellation
+shield, at the worst possible moment — a slow or hung storage backend turns
+"the attempt errored" into "shutdown hangs for the length of a download";
+(b) when the trigger is the prior-log read failing, the copy fails for the
+same reason and the partial log is written anyway. A pays the same download
+up front, where a failure is cheap (nothing has run yet) and a slow download
+delays a start rather than a shutdown.
+
+### E. Don't finalize a partial attempt (write nothing when the sweep hasn't settled)
+
+Extend the #4933 hold to `log_finish`: if the attempt ends before its sweep
+settled, discard the temp zip and write no destination file, mirroring the
+hard-kill shape. The next retry then sees the older, complete log. Requires
+one more change: `_run_task`'s in-process retry branch must not build its
+source from a location with no file (today that degrades to no reuse), but
+reuse `options.sample_source` — the same source the failed attempt ran with.
+A sub-variant (E2) writes the log after all if it holds live clean
+completions the older log lacks, discarding only when there is nothing to
+lose.
+
+Cheapest option that fully fixes the reported bug, and every log it does
+write is complete. Costs: the errored attempt leaves no log (its error is in
+the console and trace only — a post-mortem regression for exactly the
+attempts operators most want to inspect); live results and `error_retries`
+increments accrued during the sweep window are lost (E2 narrows this to
+the increments); and it leaves the slow per-sample sweep in place. Worth
+keeping in view as the **minimal interim fix** if A is judged too large for
+one PR; A makes it unnecessary.
+
+### F. One log per task across attempts (append into the prior log in place)
+
+Have the retry attempt reopen the prior attempt's *own* log — same path, same
+`eval_id`, same `created` — via `log_init(clean=False)`, and write into it.
+This is how `score --overwrite` re-logs into an existing file. There is only
+ever one log per task, so newest-by-mtime selection and `retry_cleanup` have
+nothing to choose between. On a remote filesystem it still needs the whole
+prior log in the temp zip (the flush model above), so its cost is A's; what
+it adds is a contract change: attempts stop being distinct logs (the viewer,
+`inspect log list`, bundles, `EvalState` retry-pending marks and
+`eval_set_id`/`run_id` bookkeeping all assume one `eval_id` per attempt), the
+attempt's own error record replaces the prior's instead of standing beside
+it, and `--no-retry-cleanup` (keep failed attempts for inspection) loses its
+meaning. Too broad for this bug. Noted because A makes F a small step later
+if one log per task is ever wanted.
+
+### G. Chain the retry sample source across the task's logs (previous draft)
+
+Give `eval_log_sample_source` a `fallback`; eval_set hands every same-task log
+(mtime-ordered) to the retry; a key absent from the newest log falls through
+to older ones; `retry_cleanup` deletes an older log only once the newest holds
+every key it does. Heals every shape including ones not yet anticipated, and
+uses the partial attempt's live results. Deferred per review: it makes a
+retry depend on a *set* of files with a precedence rule (newest record wins,
+absence falls through) that every future consumer of the retry source has to
+know about; it changes `retry_cleanup` from "one log per task after a pass" to
+"until superseded", visible to bundles, viewer listings and scripts; it adds
+summaries reads to pass start; and it grows `PreviousTask`. All of that is
+machinery to *tolerate* an incomplete newest log, where A stops the
+incomplete log from existing.
+
+### H. Complementary: harden the two triggers
+
+Independent of the mechanism chosen:
+
+- **Delay task teardown until the sweep settles.** When a live sample's
+  error trips `fail_on_error` while the seed reuse sweep is still running,
+  let the sweep finish (it is bounded and already in flight) before the task
+  group is cancelled. Removes the incident's trigger for the common case but
+  not Ctrl-C, `ctl` terminate or read failures. Under A the sweep is
+  in-memory bookkeeping that settles in milliseconds, so this falls out for
+  free.
+- **Prior-log read failures should not produce a partial log.** Today a
+  transport error escaping `read_from_file` fails the whole attempt with
+  whatever was copied so far. Under A there is one read (the seed) and it
+  happens before anything is written, so a failure leaves no file; add a
+  bounded retry with backoff around the download so a storage blip doesn't
+  burn a retry attempt.
+
+## Comparison
+
+| | Logs self-contained | Fixes all teardown shapes | Startup cost | Teardown cost | Prior-log reads | Contract changes | Machinery |
+|---|---|---|---|---|---|---|---|
+| **A1 seed (sequential)** | yes | yes, by construction | one whole-file download before live start | none (compaction on success only) | 1 | none (dead-bytes idiom already used) | **removes** hold, settle flush, carry-forward, read throttle, probe |
+| A2 seed (concurrent) | yes | yes, except seed-failure-after-live-work (must discard) | none (overlapped) | awaits seed | 1 | none | keeps hold; adds seeded-event gating |
+| B raw entry copy | yes | yes | N range reads before live start | none | N | none | adds raw zip writer |
+| C server-side copy | yes | no (first flush undoes it) | fast copy | merge on unsettled finish | N + full download | `eval_id` duplication until header rewrite | adds merge path |
+| D complete at teardown | yes | no (read failure → partial) | none | whole-file download under Ctrl-C shield | N + 1 | none | keeps everything, adds teardown copy |
+| E write nothing if unsettled | yes | yes (by omission) | none | none | N | attempt leaves no log; lost live results | small; `_run_task` source reuse |
+| F one log per task | yes | yes | A's | none | 1 | attempt identity, cleanup, viewer, registry | A's + identity plumbing |
+| G chain sources | **no** | yes | summaries reads per multi-log task | none | N per link | cleanup rule, `PreviousTask`, retry precedence | adds fallback chain |
+
+## Recommendation
+
+**A1, plus the `_run_task` source-reuse change from E for the seed-failure
+path, plus H's download retry.** It is the only option that both satisfies
+the self-contained-logs constraint and makes the invariant structural rather
+than a race: after the seed, the attempt's log is a superset of the prior
+log at every instant, so *any* finish — error, cancel, terminate, Ctrl-C,
+success — writes a complete log, and any hard kill leaves either no file or a
+complete one. It replaces hundreds of small remote reads with one streamed
+download, drops the per-sample parse/condense/serialize/compress work
+entirely, and lets three pieces of retry-specific machinery (hold, settle
+flush, carry-forward) be deleted rather than extended.
+
+## Mechanism (A1)
+
+### `ZipLogFile.seed`
+
+```
+async def seed(self, prior: str, keep: set[tuple[int | str, int]] | None) -> None
+```
+
+Called once, after `init()` and before `start()`, only when the temp zip is
+empty. Under `_lock`:
+
+1. **Copy bytes.** Remote: `AsyncFilesystem.get_file`/streamed read into
+   `_temp_file` (constant memory, no event-loop blocking — see the fsspec
+   rule in AGENTS.md; `read_log` already does this download for remote
+   logs). Local: `shutil.copyfileobj` in a worker thread. A download
+   failure raises; nothing has been written to the destination and the temp
+   file is truncated back to empty so the caller can decide (see Failure
+   analysis).
+2. **Open in append mode** (`_open()`), which parses the copied central
+   directory into `filelist`/`NameToInfo`.
+3. **Prune** from `filelist`/`NameToInfo`: `header.json`, `summaries.json`,
+   `reductions.json`, `_journal/config_updates/*`, and every
+   `samples/{id}_epoch_{epoch}.json` whose key is not in `keep` (when `keep`
+   is given). Dead bytes only; no rewrite. `_journal/start.json` is left in
+   place and superseded by the new attempt's `start()` (readers take the
+   last entry).
+4. **Load summaries** from the seeded journal (the same
+   `_read_all_summaries_async` path `log_init(clean=False)` uses, over the
+   local temp file), restricted to kept keys, into `_summaries`; set
+   `_summary_counter` to the journal maximum. Nothing goes into `_samples`
+   or `_streaming_samples`.
+5. Record `_seeded_keys = {(id, epoch)}` of kept sample entries and
+   `_seeded_size` (bytes) for the compaction heuristic.
+
+`buffered_sample(id, epoch)` gains a third tier after `_samples` and
+`_streaming_samples`: a seeded key is read from the local zip
+(`self._zip.read(name)` under the lock — reading is permitted in append
+mode). `TaskLogger.read_sample`'s disk fallback therefore never needs the
+destination for a seeded sample.
+
+`JSONRecorder.seed` reads the prior `.json` log and buffers its kept samples
+(the format is whole-log-in-memory; this matches today's in-memory source
+residency and is strictly less than today's duplicate copy).
+
+### `TaskLogger.seed_from_prior`
+
+Called by `task_run` between `log_init` (already done in `init()`/`reinit()`)
+and `log_start`, when `options.sample_source` is a file-backed source that
+passed the existing eligibility checks (shuffle-without-ids, dataset size).
+Computes `keep` from the plan (`sample_ids × range(1, epochs+1)`; `None` for
+a dynamic-feed task), calls `recorder.seed(...)`, and records the seeded key
+set for bookkeeping: `samples_logged` becomes "distinct keys present in the
+log minus cancelled" derived from `sample_summaries()`, so the count is right
+even for seeded keys whose `run_sample` never ran before a teardown.
+`hold_destination_writes()` is no longer called for retries; `log_start`
+flushes immediately as a fresh eval does, and that first flush carries the
+complete prior set.
+
+### The reuse sweep becomes bookkeeping
+
+`run_sample`'s `sample_source` branch:
+
+- `lookup(id, epoch)` on the file-backed source consults the *logger's*
+  seeded summaries (in memory) rather than the remote prior log. Clean
+  (`error is None`, not invalidated) → a lightweight `ReusedSample(summary)`
+  carrying `scores` and `model_usage` (both on `EvalSampleSummary`); the
+  reporter is fed from it and the key is marked logged. No re-log, no
+  write-through. When the body is needed — `resume_scan_previous_sample`
+  with a scanner configured, a dynamic feed's `sample_complete`, or the
+  reporter's message count — it is read via `logger.read_sample` from the
+  local seeded zip.
+- Errored → `PreviousError` seeded from the body read locally (needs
+  `error_retries`); invalidated/absent → checkpoint resume or fresh run, as
+  today. The re-run's completion appends a superseding member.
+- `prior_exists`, the read throttle and the presence probe are removed: no
+  remote body read happens in the sweep, so there is nothing to throttle.
+- `_ReuseSweepCountdown` is kept only for the dynamic-feed `add()`/settle
+  cycles if anything still depends on the settle event; the settle *flush*
+  is deleted (nothing is written through). If nothing depends on it, delete
+  the countdown too.
+- `carry_forward_unlogged_samples` and its `_finish_task_log` call are
+  deleted: an unreached errored key's prior record is already in the seeded
+  zip, which is exactly what carry-forward re-logged.
+
+In-memory sources (`eval_retry` on an already-loaded `EvalLog`,
+`log_info=None`) seed by writing the log's kept samples into the temp zip
+before `log_start` — today's write-through, done sequentially up front.
+
+### Compaction at successful finish
+
+In `EvalRecorder.log_finish` when `status == "success"` and dead bytes exceed
+a threshold (say 10% of the file, or any pruned/superseded sample member):
+rewrite the temp zip keeping only the referenced members, in a worker thread
+(local file, CPU-bound). Prefer a raw member copy if it can be written
+against documented `zipfile` behaviour; otherwise the decompress+recompress
+loop from `_rewrite_eval_zip_with_new_header`. Then write
+`summaries.json`/`reductions.json`/`header.json` and flush as today. A fresh
+eval has no dead bytes and skips this.
+
+### `_run_task`: keep the prior source when the attempt wrote no log
+
+`TaskRunResult` gains `log_written: bool` (or the retry branch checks
+`filesystem(location).exists`). When a retry is scheduled for an attempt
+that wrote nothing — a seed failure, or a failed `log_start` flush — the
+retry reuses `options.sample_source` instead of building one from an
+absent file. Today that case degrades to no reuse; this is the E change and
+A needs it for the seed-failure path. eval_set with `retry_immediate=False`
+needs nothing: no file means the next pass selects the older log.
+
+### Seed download retry (H)
+
+Wrap the download in a bounded retry with backoff (three attempts, say)
+before raising. A persistent failure fails the attempt without a log; the
+warning names the prior log and the error.
+
+## Failure analysis
+
+- **Graceful error / cancel / terminate / Ctrl-C at any point after the
+  seed** (the issue): the temp zip holds every prior entry plus this
+  attempt's completions; `log_finish` writes a complete error/cancelled log.
+  The next attempt seeds from it and re-runs only what still needs running.
+  Both `retry_immediate` values, and `eval(retry_attempts=)`, take the same
+  path.
+- **Prior-log read fails** (the issue's second trigger): the seed fails
+  before `log_start`; no destination file; the retry reuses the prior source
+  (in-process) or re-selects the older log (eval_set pass). No sample runs
+  in the failed attempt, so no `error_retries` history is lost.
+- **Hard kill during the seed**: no destination file (nothing flushed yet).
+  Same outcome as #4933 today.
+- **Hard kill after `log_start`'s flush**: the destination holds the
+  complete prior set plus whatever later flushes carried. Buffer-db recovery
+  discovers the `started` log again (reversing #4933's trade-off 2) and the
+  recovered log is a superset of the prior — recovery no longer "cements the
+  loss".
+- **Compaction fails**: warn and flush the uncompacted zip (correct, just
+  larger). Never let compaction fail a successful finish.
+- **Destination flush fails**: unchanged from today (warning, stale-timer
+  retry, `log_finish` backstop). The failure surfaces at `log_start`
+  again, as for a fresh eval — restoring the fail-fast #4933 traded away.
+
+## Trade-offs (accepted)
+
+1. **Live samples start after the seed download instead of immediately.**
+   Today's sweep reads the same bytes as N throttled range requests, parses
+   and re-serializes each sample, and then uploads the whole temp zip at
+   settle; the seed reads them as one streamed GET and skips the per-sample
+   CPU. Total work to reach "destination holds the complete prior set" is
+   lower; what moves is that live work no longer overlaps the read. For a
+   multi-GB prior log on a slow link that is tens of seconds to a few
+   minutes of startup delay per attempt. If that matters in practice, A2
+   restores the overlap at the cost of the seed-failure-after-live-work
+   rule (discard and write nothing).
+2. **Dead bytes between attempts.** A non-success attempt's log carries the
+   prior's superseded metadata and, for re-run samples, their prior records.
+   Bounded by the errored/invalidated set per attempt; reclaimed by
+   compaction at the successful finish; the intermediate logs are removed by
+   `retry_cleanup` anyway.
+3. **`log_images=False` on a retry of a `log_images=True` prior log keeps the
+   prior samples' images**: they are copied as bytes, not condensed. Today's
+   re-log strips them. Edge case; the alternative (parse and re-log those
+   samples) reintroduces the per-sample path for one flag. Accept and
+   document; a follow-up could prune attachments at compaction.
+4. **The first flush is the size of the prior log.** Today the settle flush
+   is the same size, so this is a timing change, not a cost change; and
+   every later flush already rewrites the whole file.
+5. **Unplanned prior entries in a dynamic-feed retry linger** until
+   compaction: with no upfront plan there is nothing to prune against.
+   Harmless (never re-injected keys are never consulted) and cleaned at the
+   successful finish.
+
+## Edge cases
+
+- **Fresh eval / no sample source**: no seed; byte-for-byte unchanged.
+- **Ineligible prior log** (shuffled without ids, dataset size changed): the
+  existing warnings fire, no seed, no reuse — as today.
+- **`sample_id` / `limit` subset, or fewer epochs than the prior**: unplanned
+  keys pruned at seed; the log holds exactly the plan (plus dead bytes until
+  compaction). More epochs than the prior: new epochs are absent keys and
+  run live.
+- **Invalidated sample in the prior**: its record is seeded (so an
+  in-progress read shows it), it re-runs, and the re-run supersedes it. The
+  log-level `invalidated` flag comes from the new header.
+- **Requeue within the attempt**: unchanged — a requeued re-run appends a
+  superseding member as it does today; compaction treats it like any other
+  superseded entry.
+- **`eval-retry` on a named `.eval` file**: seeds from that file. On an
+  in-memory `EvalLog`: sequential write-through before `log_start`.
+- **Explicit `resume=` log in eval_set**: seeds from it; nothing else
+  changes.
+- **JSON logs**: `JSONRecorder.seed` buffers the prior's kept samples;
+  compaction is a no-op (the writer emits one document).
+- **Checkpoints**: still keyed off the *prior* log's basename via
+  `eval_checkpoints_dir_from_config`; absent keys consult them as today.
+- **Prior log written by an older Inspect version**: the seed is a byte
+  copy, so the samples keep their original schema version; readers already
+  handle mixed-version members (the format has always been append-only).
+  `_journal/start.json`'s `version` is superseded by the new attempt's.
+- **Two attempts finishing within the same second on S3**: unchanged —
+  newest-by-mtime selection has the same ambiguity today, and both
+  candidate logs are now complete, so the worst case is choosing the one
+  with one fewer live result.
+
+## Testing
+
+Unit (`tests/log/test_task_log.py` and a recorder test module):
+
+- `ZipLogFile.seed`: seeded temp zip contains every prior sample member;
+  pruned names are absent from the central directory but the file stays
+  valid; `_summaries` matches the kept keys and the journal counter
+  continues; `buffered_sample` serves a seeded key from the local zip;
+  `start()` after seed makes an in-progress read return the *new* start
+  record, not the prior header; a re-run's completion supersedes the seeded
+  member (last-entry-wins on read); compaction removes dead bytes and the
+  compacted log round-trips identically through `read_eval_log`; a seed
+  download failure leaves the temp zip empty and raises.
+- `TaskLogger.seed_from_prior`: `samples_logged` counts seeded keys; no hold
+  is set; `log_start` creates the destination containing the prior set.
+- `_run_task` retry branch: an attempt that wrote no log retries with the
+  unchanged prior source (`tests/test_retry.py`).
+- Sample-source bookkeeping (`tests/test_task_retry_error_history.py`):
+  clean seeded key → reporter fed from summary, no body read; errored →
+  `PreviousError` from the local body; invalidated → fresh run; scanner
+  configured → body read from the local zip.
+
+Eval-level (`tests/test_eval_set.py`, parametrized over `retry_immediate`):
+
+- The issue's repro: attempt 1 completes s1–s3 and errors on s4; attempt 2's
+  live s4 errors again while the (now local) reuse bookkeeping is stalled;
+  assert attempt 2's log holds `{s1, s2, s3, s4}`, s2 and s3 run exactly once
+  overall, and after success only the final log remains with
+  `retry_cleanup=True`.
+- Seed failure: the prior log read raises on attempt 2; assert no log file
+  is written for attempt 2, attempt 3 reuses s1–s3, and total solver calls
+  equal today's minimum.
+- Hard kill during the seed (subprocess `os._exit` inside the download):
+  no destination file; the next eval_set run reuses everything.
+- `sample_id` subset retry: the new log holds only the subset.
+- Same shape with `eval(retry_attempts=2)` (no eval_set) for the `_run_task`
+  path.
+
+Run the async tests with `--runtrio` as well.
+
+## Follow-ups (out of scope)
+
+- **A2 (concurrent seed)** if A1's startup latency is a demonstrated problem,
+  with the rule that a seed failure after live work discards the attempt.
+- **Attachment pruning at compaction** for `log_images=False` retries of
+  `log_images=True` logs (trade-off 3).
+- **`eval-retry` seeding from a directory's newest same-task log** rather
+  than only the named file.
+- **F (one log per task)** becomes a small increment on A if per-attempt log
+  identity is ever judged more cost than value.
