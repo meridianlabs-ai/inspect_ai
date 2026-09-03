@@ -7,6 +7,7 @@ cancellation error. Those cancellations must not render as ``error`` — a
 sample that will be retried is ``pending``; one that won't is ``cancelled``.
 """
 
+import math
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from inspect_ai._control.state import _summary_from_eval_sample_summary
@@ -292,7 +293,9 @@ async def test_seeded_prior_record_does_not_hide_running_rerun(monkeypatch) -> N
     attempt re-runs, the recorder holds its prior ``error`` record alongside
     the running ``ActiveSample``. That record completed before the re-run
     started, so the running row wins. A record completed after the running
-    row started (the sample finished between the two reads) still supersedes.
+    row started (the sample finished between the two reads) still supersedes,
+    including one whose second-precision ``completed_at`` falls in the same
+    wall-clock second as the fractional live start.
     """
     from datetime import datetime, timezone
     from unittest.mock import MagicMock
@@ -300,7 +303,7 @@ async def test_seeded_prior_record_does_not_hide_running_rerun(monkeypatch) -> N
     from inspect_ai._control.eval_state import clear_all_eval_states, register_eval
     from inspect_ai._control.state import current_sample_summaries
 
-    running_since = 1000.0
+    running_since = 1000.7
 
     def iso(ts: float) -> str:
         return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
@@ -338,7 +341,17 @@ async def test_seeded_prior_record_does_not_hide_running_rerun(monkeypatch) -> N
         started_at=iso(running_since),
         completed_at=iso(running_since + 10.0),
     )
-    for completed, expected in ((prior, "running"), (fresh, "completed")):
+    # Finished within the second it started: `iso_now()` records
+    # `completed_at` to the second, so the stamp (1000) precedes the
+    # fractional live start (1000.7) yet must still supersede it.
+    same_second = fresh.model_copy(
+        update={"completed_at": iso(math.floor(running_since))}
+    )
+    for completed, expected in (
+        (prior, "running"),
+        (fresh, "completed"),
+        (same_second, "completed"),
+    ):
         try:
             register_eval(
                 "e-seeded",

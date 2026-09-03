@@ -368,12 +368,20 @@ async def current_sample_summaries(
         # A terminal record completed before the running sample started is
         # not that: it is the prior attempt's record (seeded into a retry
         # attempt's log) for a sample now re-running, so the live row stays.
+        # `completed_at` is second-precision while the live start is
+        # fractional, so compare against the floored start (as
+        # `_is_prior_record_awaiting_rerun` does): a sample finishing in the
+        # second it started still supersedes its snapshotted running row.
         if existing is None:
             by_key[key] = summary
         elif existing["status"] == "running" and summary["status"] != "running":
             started_at = existing["started_at"]
             completed_at = summary["completed_at"]
-            if started_at is None or completed_at is None or completed_at >= started_at:
+            if (
+                started_at is None
+                or completed_at is None
+                or completed_at >= math.floor(started_at)
+            ):
                 by_key[key] = summary
 
     # Running first (the freshest source for in-flight samples), then the
