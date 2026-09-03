@@ -96,7 +96,6 @@ from inspect_ai.log._file import (
     EvalLogInfo,
     eval_log_json_str,
     read_eval_log_sample_async,
-    read_eval_log_sample_summaries_async,
 )
 from inspect_ai.log._log import (
     EvalPlan,
@@ -110,7 +109,6 @@ from inspect_ai.log._log import (
 from inspect_ai.log._recorders.buffer.transcript_history_provider import (
     BufferTranscriptHistoryProvider,
 )
-from inspect_ai.log._recorders.eval import EvalRecorder, _sample_filename
 from inspect_ai.log._recorders.streaming import (
     eval_retry_error_from_history,
     materialize_streaming_sample,
@@ -249,46 +247,54 @@ class PreviousError:
     log per attempt) with sample-level `retry_on_error` so both surface a
     retry count and the prior errors on the surviving sample.
 
-    Carries the full prior `sample` so a retry attempt that is itself torn
-    down before re-running this sample can re-log it verbatim, keeping the
-    error history intact across the per-attempt log chain (see
-    `carry_forward_unlogged_samples`).
+    Carries the full prior `sample`: the re-run's seeded `error_retries`
+    are taken from it, and its record already sits in the retry attempt's
+    log (seeded from the prior log) until the re-run supersedes it.
     """
 
     sample: EvalSample
 
 
-SampleLookup = Callable[
-    [int | str, int], Awaitable[EvalSample | ResumeCheckpoint | PreviousError | None]
+PriorResolution: TypeAlias = EvalSample | ResumeCheckpoint | PreviousError | None
+SampleLookup = Callable[[int | str, int], Awaitable[PriorResolution]]
+PriorClassifier = Callable[
+    [int | str, int, EvalSample | None], Awaitable[PriorResolution]
 ]
-ErrorHistoryIds = Callable[[], Awaitable[set[tuple[int | str, int]]]]
-PriorExists = Callable[[int | str, int], Awaitable[bool]]
 
 
-async def _never_prior_exists(id: int | str, epoch: int) -> bool:
-    """Default presence probe: no cheap probe available, so don't throttle."""
-    return False
+class SeedSource(NamedTuple):
+    """How a retry attempt seeds its log from the prior attempt's samples.
+
+    Set on an `EvalSampleSource` only once the prior log passed the reuse
+    eligibility checks (see `eval_log_sample_source`), so `task_run` can
+    seed the attempt's log before `log_start` — every prior record is then
+    in the attempt's log from its first flush, whatever ends the attempt
+    (see `design/retry-seeded-attempt-log.md`). Exactly one of `location`
+    (a prior log file, copied as bytes when the recorder's format matches)
+    and `samples` (an in-memory prior log, re-logged sample by sample) is
+    set. `classify` resolves a seeded record read back from the attempt's
+    own log — clean, errored, invalidated, or absent — the same way
+    `EvalSampleSource.lookup` resolves one read from the prior source.
+    """
+
+    location: str | None
+    samples: list[EvalSample] | None
+    classify: PriorClassifier
 
 
 class EvalSampleSource(NamedTuple):
     """A prior attempt's sample source.
 
-    `lookup` resolves one planned `(id, epoch)` to a reusable sample, a
-    resume checkpoint, or carried error history. `error_history_ids`
-    returns the `(id, epoch)` pairs that errored in the prior attempt —
-    the only candidates that can yield a `PreviousError` — so teardown
-    carry-forward can probe just those instead of the full plan.
-    `prior_exists` is a cheap presence probe for the prior attempt's record
-    of a sample, used to decide whether its lookup must take the bounded
-    reuse read throttle (a presence hit reads a full sample body; misses
-    must not queue behind those reads). False means "don't throttle" —
-    the sample is known absent, or this source's lookups are cheap
-    (in-memory list scans).
+    `lookup` resolves one planned `(id, epoch)` against the prior source (a
+    log file or an in-memory log) to a reusable sample, a resume checkpoint,
+    or carried error history. It is the fallback for an attempt whose log
+    was not seeded (sample logging off, or no eligible prior); a seeded
+    attempt reads each prior record from its own log and resolves it with
+    `seed.classify` instead, so no per-sample read of the prior log happens.
     """
 
     lookup: SampleLookup
-    error_history_ids: ErrorHistoryIds
-    prior_exists: PriorExists = _never_prior_exists
+    seed: SeedSource | None = None
 
 
 # Units allocated for sample progress - the total units
@@ -572,53 +578,6 @@ class _SampleRetry:
     """The attempt's sample uuid, carried to the retry."""
 
 
-# How many prior-attempt sample bodies a retry's reuse sweep reads (and
-# re-logs) concurrently. All run_sample coroutines start at once, so without
-# a bound the whole reused set can be mid-read simultaneously; 25 matches the
-# bounded concurrency used for journal summary reads in
-# `_read_all_summaries_async`.
-REUSED_SAMPLE_READ_CONCURRENCY = 25
-
-# How many times the reuse presence probe re-attempts a failed central
-# directory fetch before giving up (which disables the reuse read throttle
-# for the sweep). Failures other than FileNotFoundError may be transient
-# (e.g. a remote filesystem blip), so a single failure must not be cached;
-# but a persistently unreadable log must not be re-fetched per probe either.
-PRIOR_PROBE_MAX_FAILURES = 3
-
-
-class _ReuseSweepCountdown:
-    """Fires the reused-sample settle flush when the reuse sweep completes.
-
-    Counts planned ``(sample, epoch)`` runs; each ``run_sample`` settles one
-    as soon as its prior-attempt lookup (and any re-log) has resolved. The
-    final settle means the re-logged reused set is complete, so
-    ``TaskLogger.reuse_sweep_settled`` releases the attempt's
-    destination-write hold and writes the set in one deterministic flush —
-    keyed to an exact event rather than a stale timer, it fires no earlier
-    (no partial-sweep flushes, so the attempt's first on-disk version already
-    carries every reused sample) and no later (no idle wait). A
-    SampleSource-driven task can add planned runs after the seed sweep
-    settles; ``add`` raises the count again so a later settle drains any
-    follow-up reuse.
-
-    No lock: count mutations happen on the eval's single event-loop thread
-    with no await point between read and write.
-    """
-
-    def __init__(self, logger: TaskLogger, planned_runs: int) -> None:
-        self._logger = logger
-        self._remaining = planned_runs
-
-    def add(self, planned_runs: int) -> None:
-        self._remaining += planned_runs
-
-    def settle_one(self) -> None:
-        self._remaining -= 1
-        if self._remaining == 0:
-            self._logger.reuse_sweep_settled()
-
-
 def _sample_transcript_config(
     logger: TaskLogger | None, sample_id: str | int, epoch: int
 ) -> tuple[bool, TranscriptHistoryProvider | None]:
@@ -819,7 +778,7 @@ async def task_run(options: TaskRunOptions, task_cancel: TaskCancel | None) -> E
     total_samples = len(dataset) * epochs
 
     # capture sample ids now, before `dataset` may be paged to disk and
-    # deleted below — used by register_eval and carry_forward_unlogged_samples
+    # deleted below — used by register_eval and the prior-log seed
     sample_ids = [s.id for s in dataset if s.id is not None]
 
     # sample id -> fanout index, for the requeue directive's resolution
@@ -895,10 +854,6 @@ async def task_run(options: TaskRunOptions, task_cancel: TaskCancel | None) -> E
             mark_eval_retry_pending(logger.eval.eval_id)
         return await _finish_task_log(
             logger=logger,
-            sample_source=options.sample_source,
-            sample_ids=sample_ids,
-            epochs=epochs,
-            log_images=log_images,
             status=status,
             stats=stats,
             results=results,
@@ -924,8 +879,7 @@ async def task_run(options: TaskRunOptions, task_cancel: TaskCancel | None) -> E
     # before anything that needs unwinding is set up — the paged-to-disk
     # sample store below (its temp file is only unlinked by the close in the
     # finally, which an abandoned attempt never reaches), the log_start
-    # destination header (a zero-seed retry has no destination hold, so
-    # log_start writes a stray `started` log the retry-cleanup sweep would
+    # destination header (a stray `started` log the retry-cleanup sweep would
     # prefer over the errored attempt's log), and the display task row (an
     # abandoned row with no result would become the last row for this task id
     # and read as incomplete in the rich header for the rest of the run).
@@ -1045,13 +999,28 @@ async def task_run(options: TaskRunOptions, task_cancel: TaskCancel | None) -> E
         # start the log (do this outside fo the try b/c the try/except assumes
         # that the log is initialized)
         eval_plan = plan_to_eval_plan(plan, generate_config)
-        # a retry attempt with a non-empty seed defers every destination write
-        # until its reuse sweep settles (the countdown below fires
-        # reuse_sweep_settled, which releases the hold). A zero-seed
-        # SampleSource-driven task skips the hold: its samples arrive over
-        # time, so there is no early settle event to key the release to.
-        if sample_source is not None and store_len * epochs > 0:
-            logger.hold_destination_writes()
+        # a retry attempt seeds its log with the prior attempt's sample
+        # records before the first destination write, so from log_start's
+        # flush on the log is a superset of the prior log however the attempt
+        # ends (design/retry-seeded-attempt-log.md). A failure here (the prior
+        # log unreadable after retries) escapes before any destination write,
+        # so the attempt leaves no log and its retry keeps the same source.
+        # With sample logging off nothing is seeded (as nothing is re-logged)
+        # and the sweep below falls back to reading the prior source.
+        if sample_source is not None and sample_source.seed is not None and log_samples:
+            await logger.seed_from_prior(
+                sample_source.seed.location,
+                sample_source.seed.samples,
+                # a SampleSource-driven task has no upfront plan: keep everything
+                keep=None
+                if sample_feed is not None
+                else {
+                    (sample_id, epoch)
+                    for sample_id in sample_ids
+                    for epoch in range(1, epochs + 1)
+                },
+                log_images=log_images,
+            )
         await logger.log_start(eval_plan)
 
         try:
@@ -1065,13 +1034,6 @@ async def task_run(options: TaskRunOptions, task_cancel: TaskCancel | None) -> E
                 model.api,
                 task_id=logger.eval.task_id,
             )
-
-            # retry reuse sweep coordination: a throttle bounding concurrent
-            # prior-sample body reads/re-logs, and a countdown that schedules
-            # one destination flush of the re-logged set once every planned
-            # sample has resolved its reuse check
-            reuse_read_throttle = anyio.Semaphore(REUSED_SAMPLE_READ_CONCURRENCY)
-            reuse_settle = _ReuseSweepCountdown(logger, store_len * epochs)
 
             # sample dispatch goes through the pause gate wrapped around the
             # semaphore (a stamped cancel escapes the gate so held samples
@@ -1317,74 +1279,52 @@ async def task_run(options: TaskRunOptions, task_cancel: TaskCancel | None) -> E
                     # PreviousError); kept distinct from the sample-level
                     # retry list so it doesn't suppress sample init/start emits
                     previous_attempt_errors: list[EvalRetryError] = []
-                    previous_sample: (
-                        EvalSample | ResumeCheckpoint | PreviousError | None
-                    ) = None
-                    try:
-                        if requeue_prior is not None:
-                            # requeued re-run (design/ctl/sample-requeue.md):
-                            # seeded from the prior terminal record exactly as
-                            # a task-level retry would be — resume from a
-                            # checkpoint when one exists, else carry the prior
-                            # errors (the fresh sample uuid and retry_on_error
-                            # budget come with the fresh TaskState below). Drop
-                            # the prior attempt's buffered events first, the
-                            # same call the retry loop makes; the flushed
-                            # (id, epoch) log record is superseded when the
-                            # re-run logs.
-                            if sample_id is not None:
-                                logger.remove_sample(sample_id, epoch)
-                                resume_checkpoint = await _resume_if_checkpointed(
-                                    requeue_checkpoints_dir, sample_id, epoch
-                                )
-                            if resume_checkpoint is None:
-                                previous_attempt_errors = _seed_error_retries(
-                                    requeue_prior
-                                )
-                        elif sample_source and sample_id is not None:
-                            # a presence hit reads a full prior sample body, so
-                            # it takes the reuse read throttle; the probe itself
-                            # stays outside so true misses — samples absent from
-                            # the prior log — proceed immediately rather than
-                            # queueing behind reused-sample body reads
-                            throttled = await sample_source.prior_exists(
+                    previous_sample: PriorResolution = None
+                    if requeue_prior is not None:
+                        # requeued re-run (design/ctl/sample-requeue.md):
+                        # seeded from the prior terminal record exactly as
+                        # a task-level retry would be — resume from a
+                        # checkpoint when one exists, else carry the prior
+                        # errors (the fresh sample uuid and retry_on_error
+                        # budget come with the fresh TaskState below). Drop
+                        # the prior attempt's buffered events first, the
+                        # same call the retry loop makes; the flushed
+                        # (id, epoch) log record is superseded when the
+                        # re-run logs.
+                        if sample_id is not None:
+                            logger.remove_sample(sample_id, epoch)
+                            resume_checkpoint = await _resume_if_checkpointed(
+                                requeue_checkpoints_dir, sample_id, epoch
+                            )
+                        if resume_checkpoint is None:
+                            previous_attempt_errors = _seed_error_retries(requeue_prior)
+                    elif sample_source and sample_id is not None:
+                        if logger.prior_seeded and sample_source.seed is not None:
+                            # the prior record is already in this attempt's
+                            # log: read it back locally (never the prior log)
+                            # and classify it — the body carries the error /
+                            # invalidation state the summary lacks and the
+                            # full-size scores and metadata the reporter
+                            # needs (summaries are thinned)
+                            previous_sample = await sample_source.seed.classify(
+                                sample_id,
+                                epoch,
+                                await logger.read_prior_sample(sample_id, epoch),
+                            )
+                            if isinstance(previous_sample, EvalSample):
+                                reporter.progress()
+                                logger.note_reused_sample(previous_sample)
+                        else:
+                            previous_sample = await sample_source.lookup(
                                 sample_id, epoch
                             )
-                            if throttled:
-                                await reuse_read_throttle.acquire()
-                            try:
-                                previous_sample = await sample_source.lookup(
-                                    sample_id, epoch
-                                )
-                                if isinstance(previous_sample, EvalSample):
-                                    reporter.progress()
-                                    if logger and log_samples:
-                                        # write_through: the reused set is
-                                        # re-logged in bulk before any flush
-                                        # trigger, so park each sample in the
-                                        # recorder's temp zip rather than
-                                        # keeping the whole set resident
-                                        await logger.complete_sample(
-                                            condense_sample(
-                                                previous_sample, log_images
-                                            ),
-                                            flush=False,
-                                            write_through=True,
-                                        )
-                            finally:
-                                if throttled:
-                                    reuse_read_throttle.release()
-                    finally:
-                        # settle before resume_scan_previous_sample (which
-                        # acquires the sample semaphore and can block behind
-                        # long-running live samples) and sample_complete
-                        # (which awaits the early-stopping hook) so they can't
-                        # delay the sweep's settle flush; a cancelled
-                        # run_sample still settles here. A requeued re-run is
-                        # an extra invocation of an already-settled key, so
-                        # settling it would corrupt the countdown.
-                        if requeue_prior is None:
-                            reuse_settle.settle_one()
+                            if isinstance(previous_sample, EvalSample):
+                                reporter.progress()
+                                if log_samples:
+                                    await logger.complete_sample(
+                                        condense_sample(previous_sample, log_images),
+                                        flush=False,
+                                    )
 
                     if isinstance(previous_sample, EvalSample):
                         sample_scores = (
@@ -1615,10 +1555,7 @@ async def task_run(options: TaskRunOptions, task_cancel: TaskCancel | None) -> E
                         if added.indexes:
                             # grow the planned totals (display denominator,
                             # fail_on_error threshold, control-channel counters)
-                            # and the reuse-sweep countdown (added samples run
-                            # the same prior-attempt lookup)
                             total_samples += len(added.indexes) * epochs
-                            reuse_settle.add(len(added.indexes) * epochs)
                             sample_error_handler.total_samples = total_samples
                             record_samples_added(
                                 logger.eval.eval_id,
@@ -3465,26 +3402,6 @@ def eval_log_sample_source(
     async def no_sample_source(id: int | str, epoch: int) -> None:
         return None
 
-    async def no_error_history() -> set[tuple[int | str, int]]:
-        return set()
-
-    async def error_history_from_file() -> set[tuple[int | str, int]]:
-        """The prior log's errored `(id, epoch)` pairs, from its summaries.
-
-        One bounded read of the summaries index — never per-sample log
-        reads. Degrades to "no candidates" on failure: this feeds teardown
-        carry-forward, which must not fail (or stall) task shutdown.
-        """
-        assert eval_log_info is not None
-        try:
-            summaries = await read_eval_log_sample_summaries_async(eval_log_info)
-            return {(s.id, s.epoch) for s in summaries if s.error is not None}
-        except Exception as ex:
-            py_logger.warning(
-                f"Unable to read sample summaries from retry log file: {ex}"
-            )
-            return set()
-
     async def _resume_or_seed_retry(
         id: int | str, epoch: int, sample: EvalSample | None
     ) -> ResumeCheckpoint | PreviousError | None:
@@ -3506,15 +3423,23 @@ def eval_log_sample_source(
             return PreviousError(sample=sample)
         return None
 
+    async def classify(
+        id: int | str, epoch: int, sample: EvalSample | None
+    ) -> PriorResolution:
+        """Resolve a prior record: clean → reuse it, otherwise resume / seed / rerun."""
+        if sample is not None and sample.error is None and sample.invalidation is None:
+            return sample
+        return await _resume_or_seed_retry(id, epoch, sample)
+
     # take care of no log or no samples in log. Note we still proceed when
     # in-memory samples and `eval_log_info` are both absent if a
     # `eval_checkpoints_dir` is available — the prior eval may have been
     # killed before writing any sample, and on-disk checkpoint files
     # can still drive resume detection in `read_from_memory` below.
     if not eval_log:
-        return EvalSampleSource(no_sample_source, no_error_history)
+        return EvalSampleSource(no_sample_source)
     elif not eval_log.samples and not eval_log_info and not eval_checkpoints_dir:
-        return EvalSampleSource(no_sample_source, no_error_history)
+        return EvalSampleSource(no_sample_source)
 
     # determine whether all samples in the dataset have ids (if not, then we can't
     # provide a sample source in the case where either dataset is shuffled, as the ids
@@ -3528,28 +3453,18 @@ def eval_log_sample_source(
             "Unable to re-use samples from retry log file because the dataset was shuffled "
             + "and some samples in the dataset do not have an 'id' field."
         )
-        return EvalSampleSource(no_sample_source, no_error_history)
+        return EvalSampleSource(no_sample_source)
 
     elif eval_log.eval.dataset.samples != len(dataset):
         py_logger.warning(
             "Unable to re-use samples from retry log file because the dataset size changed "
             + f"(log samples {eval_log.eval.dataset.samples}, dataset samples {len(dataset)})"
         )
-        return EvalSampleSource(no_sample_source, no_error_history)
+        return EvalSampleSource(no_sample_source)
     elif eval_log_info:
         reader: AsyncZipReader | None = None
-        prior_entry_names: set[str] | None = None
-        probe_failures = 0
-        # serializes the central-directory fetch across concurrent probes:
-        # all run_sample coroutines probe at once, and without this lock each
-        # would pass the failure-cap check while the count is still 0, then
-        # perform its own fetch attempt (entries() caches only success) —
-        # N attempts instead of PRIOR_PROBE_MAX_FAILURES
-        probe_lock = anyio.Lock()
 
-        async def read_from_file(
-            id: int | str, epoch: int
-        ) -> EvalSample | ResumeCheckpoint | PreviousError | None:
+        async def read_from_file(id: int | str, epoch: int) -> PriorResolution:
             nonlocal reader
             if not reader:
                 reader = AsyncZipReader(get_async_filesystem(), eval_log_info.name)
@@ -3563,73 +3478,15 @@ def eval_log_sample_source(
                 # failed before its first flush, e.g. an errored log_start()).
                 # Either way there is no prior sample to reuse.
                 return await _resume_if_checkpointed(eval_checkpoints_dir, id, epoch)
-            if sample.error is None and sample.invalidation is None:
-                return sample
-            return await _resume_or_seed_retry(id, epoch, sample)
-
-        async def prior_exists_in_file(id: int | str, epoch: int) -> bool:
-            """Presence of the prior sample's zip entry, without a body read.
-
-            Shares `read_from_file`'s reader, whose central directory is
-            fetched once and cached — index-only, so it's safe to call for
-            every planned sample before deciding to take the throttled body
-            read. Presence is broader than "reusable": an errored or
-            invalidated prior sample is a presence hit too (error status
-            lives in the sample body) — accepted, since errored transcripts
-            can be as large as completed ones and equally need bounded
-            concurrent residency. A missing prior log (the prior attempt
-            failed before its first flush) definitively has no entries, so
-            no-presence is cached and the unthrottled lookup surfaces the
-            same condition. Any other fetch failure may be transient, so
-            it is retried on subsequent probes — up to
-            PRIOR_PROBE_MAX_FAILURES, so a persistently unreadable log
-            isn't re-fetched per probe — before giving up with a warning
-            that the reuse read throttle is disabled for this retry.
-            """
-            nonlocal reader, prior_entry_names, probe_failures
-            if prior_entry_names is None:
-                async with probe_lock:
-                    # re-check under the lock: another probe may have resolved
-                    # (or exhausted the cap for) the fetch while we queued
-                    if prior_entry_names is None:
-                        if probe_failures >= PRIOR_PROBE_MAX_FAILURES:
-                            return False
-                        if not reader:
-                            reader = AsyncZipReader(
-                                get_async_filesystem(), eval_log_info.name
-                            )
-                        try:
-                            cd = await reader.entries()
-                            prior_entry_names = {e.filename for e in cd.entries}
-                        except FileNotFoundError:
-                            prior_entry_names = set()
-                        except Exception as ex:
-                            probe_failures += 1
-                            if probe_failures >= PRIOR_PROBE_MAX_FAILURES:
-                                py_logger.warning(
-                                    "Unable to read the retry log file's central directory "
-                                    + f"after {probe_failures} attempts — reused sample reads "
-                                    + f"will not be throttled for this retry: {ex}"
-                                )
-                            return False
-            return _sample_filename(id, epoch) in prior_entry_names
+            return await classify(id, epoch, sample)
 
         return EvalSampleSource(
             read_from_file,
-            error_history_from_file,
-            # presence probing reads the zip central directory, so it only
-            # applies to .eval prior logs; a .json prior log keeps the
-            # default never-probe (its lookups read the whole file — no
-            # index exists to answer presence cheaply)
-            prior_exists_in_file
-            if EvalRecorder.handles_location(eval_log_info.name)
-            else _never_prior_exists,
+            SeedSource(location=eval_log_info.name, samples=None, classify=classify),
         )
     else:
 
-        async def read_from_memory(
-            id: int | str, epoch: int
-        ) -> EvalSample | ResumeCheckpoint | PreviousError | None:
+        async def read_from_memory(id: int | str, epoch: int) -> PriorResolution:
             match = next(
                 (
                     sample
@@ -3638,20 +3495,14 @@ def eval_log_sample_source(
                 ),
                 None,
             )
-            if match is not None and match.error is None and match.invalidation is None:
-                return match
-            return await _resume_or_seed_retry(id, epoch, match)
+            return await classify(id, epoch, match)
 
-        memory_error_ids = {
-            (sample.id, sample.epoch)
-            for sample in (eval_log.samples or [])
-            if sample.error is not None
-        }
-
-        async def memory_error_history() -> set[tuple[int | str, int]]:
-            return memory_error_ids
-
-        return EvalSampleSource(read_from_memory, memory_error_history)
+        return EvalSampleSource(
+            read_from_memory,
+            SeedSource(
+                location=None, samples=list(eval_log.samples or []), classify=classify
+            ),
+        )
 
 
 def create_sample_semaphore(
@@ -3830,59 +3681,9 @@ def _seed_error_retries(sample: EvalSample) -> list[EvalRetryError]:
     return seed
 
 
-async def carry_forward_unlogged_samples(
-    logger: TaskLogger,
-    sample_source: EvalSampleSource | None,
-    sample_ids: list[str | int],
-    epochs: int,
-    log_images: bool,
-) -> None:
-    """Re-log carried error history for planned samples this attempt never logged.
-
-    When a task fails and is retried, the next attempt's sample source is
-    built from THIS attempt's log. A sample that errored in an earlier
-    attempt but was still pending when this attempt was torn down (a sibling
-    failed first, cancelling the rest) would otherwise be absent from this
-    log — breaking the per-attempt retry-history chain so the eventual
-    surviving sample under-reports its retry count.
-
-    Re-logging the prior record for such samples keeps the chain intact.
-    Only samples carrying genuine error history (`PreviousError`) need this,
-    and only the prior attempt's *errored* samples can yield one — so the
-    probe set is ``sample_source.error_history_ids()`` (at most one
-    summaries read) rather than the full plan. This runs at teardown,
-    inside the cancellation shield on the Ctrl-C path: probing every
-    planned ``(id, epoch)`` stalled shutdown of a large remote retry for
-    minutes, uninterruptibly.
-    """
-    if sample_source is None:
-        return
-    candidates = await sample_source.error_history_ids()
-    if not candidates:
-        return
-    summaries = await logger.sample_summaries()
-    logged = {(s.id, s.epoch) for s in (summaries or [])}
-    planned = {
-        (sample_id, epoch) for sample_id in sample_ids for epoch in range(1, epochs + 1)
-    }
-    # sorted for a deterministic re-log order
-    for sample_id, epoch in sorted(candidates, key=lambda k: (str(k[0]), k[1])):
-        if (sample_id, epoch) in logged or (sample_id, epoch) not in planned:
-            continue
-        previous = await sample_source.lookup(sample_id, epoch)
-        if isinstance(previous, PreviousError):
-            await logger.complete_sample(
-                condense_sample(previous.sample, log_images), flush=True
-            )
-
-
 async def _finish_task_log(
     *,
     logger: TaskLogger,
-    sample_source: EvalSampleSource | None,
-    sample_ids: list[str | int],
-    epochs: int,
-    log_images: bool,
     status: EvalStatus,
     stats: EvalStats,
     results: EvalResults | None = None,
@@ -3891,7 +3692,7 @@ async def _finish_task_log(
     record_logged_samples: bool = False,
     resolved_unlogged_samples: int | None = None,
 ) -> EvalLog:
-    """Finish the task log, preserving retry history first on non-success.
+    """Finish the task log.
 
     ``record_logged_samples`` stamps ``results.logged_samples`` (the count
     eval-set's completeness check prefers over the planned total) from the
@@ -3899,29 +3700,15 @@ async def _finish_task_log(
     logger therefore saw no samples, from ``resolved_unlogged_samples``, the
     attempt's resolved count per its terminal counters.
 
-    The single finish chokepoint for ``task_run``'s terminal branches: any
-    non-success finish is (or may be) a teardown that left planned samples
-    unlogged this attempt, and this attempt's log seeds the next attempt — so
-    unlogged samples' prior-attempt history is carried forward before the
-    finish is written. Routing every terminal branch through here means a
-    finish path can't forget the carry-forward (the external-cancellation
-    branch once did, silently dropping retry history on Ctrl-C — and
-    cancelled logs ARE retry seeds: ``retryable_eval_logs`` includes them and
-    eval-set treats any non-success log as incomplete).
-
-    Safe to call on fully-logged attempts (eg. an ``error`` status from the
-    ``fail_on_error`` threshold with every sample run): the carry-forward
-    re-logs only planned samples absent from this attempt's log whose source
-    carries genuine prior error history (``PreviousError``), so it degrades
-    to a no-op.
+    The single finish chokepoint for ``task_run``'s terminal branches. A
+    non-success finish may be a teardown that left planned samples unrun
+    this attempt, and this attempt's log seeds the next attempt — that log
+    is nonetheless complete, because the attempt's log was seeded with every
+    prior record before its first write (see ``TaskLogger.seed_from_prior``),
+    so nothing needs carrying forward here.
     """
-    if status != "success":
-        await carry_forward_unlogged_samples(
-            logger, sample_source, sample_ids, epochs, log_images
-        )
     # log_samples_complete (_eval/evalset.py) prefers this count over the
-    # planned total_samples. Read after the carry-forward above so re-logged
-    # samples are counted.
+    # planned total_samples; seeded prior records count toward it too.
     if results is not None and record_logged_samples:
         results.logged_samples = (
             logger.samples_logged

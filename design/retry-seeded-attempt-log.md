@@ -169,20 +169,18 @@ own work appends on top:
   local read costs a decompress plus `model_validate`; the remote range
   read, condense, re-serialize and recompress that dominate today's sweep
   are gone.
-- **Invalidation is decided from the prior header, then the body.**
-  `EvalSampleSummary` has no invalidation field: `invalidate_samples`
-  (`log/_edit.py`) sets `EvalSample.invalidation` on the body and
-  `EvalLog.invalidated` on the header, and `EvalSample.summary()` emits
-  neither. So the summaries alone cannot tell an invalidated sample from a
-  clean one. The seed reads the prior `header.json` before pruning it: when
-  `invalidated` is `False` (the common case) every clean summary is clean;
-  when it is `True`, each kept sample body is read from the local seeded zip
-  and `invalidation is not None` marks the key for re-run. This is the same
-  body-level test `run_sample` applies today, done once at seed against a
-  local file rather than per key against the remote log. A prior log with no
-  `header.json` (a `started` log) has no invalidations by construction —
-  invalidation is an offline edit of a finished log — and is treated as
-  `invalidated=False`.
+- **Invalidation is decided from the body.** `EvalSampleSummary` has no
+  invalidation field: `invalidate_samples` (`log/_edit.py`) sets
+  `EvalSample.invalidation` on the body and `EvalLog.invalidated` on the
+  header, and `EvalSample.summary()` emits neither. So the summaries alone
+  cannot tell an invalidated sample from a clean one. Since every planned
+  key's body is read from the local seeded zip anyway (the reporter needs
+  the full-size scores), the sweep applies the same body-level test
+  `run_sample` applies today — `error is None and invalidation is None` —
+  to the local copy; no header read or separate invalidation scan is
+  needed. (An earlier revision of this design gated a body scan on the
+  prior header's `invalidated` flag; that was only worthwhile while clean
+  samples were meant to skip the body read.)
 
 At seed time a few entries are pruned from the central directory (dead bytes,
 not rewritten): the prior `header.json`, `summaries.json`, `reductions.json`
@@ -230,19 +228,19 @@ its failure cap). The `EvalSampleSource` abstraction stays for the
 eligibility decision and for in-memory sources, but its file-backed path reads
 the local seeded zip.
 
-What A adds: a `prior_log` argument to `EvalRecorder.log_init` that
-`ZipLogFile.init` acts on (download/copy into the temp file *before* the zip
-is opened, open in append mode, prune, rewrite the summaries journal), a
-`JSONRecorder` counterpart (load the prior log's planned samples into its
-in-memory buffer — the `.json` format holds the whole log in memory anyway),
-an in-memory write-through fallback used when the prior log's format differs
-from the attempt's (`eval_retry(..., log_format=...)` allows a `.eval` prior
-to be retried into a `.json` attempt and vice versa, and a byte copy is only
-valid same-format), a `seed` field on `EvalSampleSource` that carries the
-prior location once the eligibility checks pass so `TaskLogger.init` can act
-on it, and a
-**compaction** step at a successful `log_finish` that rewrites the temp zip
-without dead bytes (see below).
+What A adds: a `Recorder.log_seed(eval, prior_log, keep)` hook that
+`EvalRecorder` implements over `ZipLogFile.seed_from_prior_log` (copy the
+prior file into the temp zip, open in append mode, prune, rewrite the
+summaries journal) and that returns `False` when it cannot seed from the
+prior's format; a write-through re-log fallback in `TaskLogger` for that
+case — an in-memory prior log, or one in a different format
+(`eval_retry(..., log_format=...)` allows a `.eval` prior to be retried into
+a `.json` attempt and vice versa, and a byte copy is only valid same-format)
+— which also covers the `.json` recorder (the format holds the whole log in
+memory anyway); a `seed` field on `EvalSampleSource` that carries the prior
+location (or samples) once the eligibility checks pass so `task_run` can seed
+the log before `log_start`; and a **compaction** step at a successful
+`log_finish` that rewrites the temp zip without dead bytes (see below).
 
 **Dead bytes and compaction.** Each attempt's seeded zip carries the prior
 attempt's superseded metadata entries plus, once re-run samples complete,
@@ -414,30 +412,43 @@ flush, carry-forward) be deleted rather than extended.
 
 ## Mechanism (A1)
 
-### `ZipLogFile.init(..., prior_log=...)`
+### `ZipLogFile.seed_from_prior_log(prior_log, keep)`
 
 ```
-async def init(self, ..., prior_log: str | None = None,
-               keep: set[tuple[int | str, int]] | None = None) -> None
+async def seed_from_prior_log(
+    self, prior_log: str, keep: set[tuple[int | str, int]] | None
+) -> None
 ```
 
-The parameter is `prior_log`, not `seed_from`, because `ZipLogFile` already
-has a "seeded" notion: `_destination_seeded` records that `init()` was
-opened over an *existing destination* (`score --overwrite` re-logging into a
-file), and `discard()` uses it to decide whether the destination is ours to
-remove. A prior-log seed is the opposite shape — a fresh destination whose
-temp zip starts from another file — and `discard()` must still remove that
-destination. Keeping the names distinct keeps the two rules from being
-confused there.
+Reached through `Recorder.log_seed(eval, prior_log, keep) -> bool`, which
+`EvalRecorder` implements (returning `False` for a prior in another
+format) and the base `Recorder` declines. The parameter is `prior_log`, not
+`seed_from`, because `ZipLogFile` already has a "seeded" notion:
+`_destination_seeded` records that `init()` was opened over an *existing
+destination* (`score --overwrite` re-logging into a file), and `discard()`
+uses it to decide whether the destination is ours to remove. A prior-log
+seed is the opposite shape — a fresh destination whose temp zip starts from
+another file — and `discard()` must still remove that destination. Keeping
+the names distinct keeps the two rules from being confused there.
 
-The seed is part of `init()` rather than a separate call after it, because
-**the copy must land before any `ZipFile` is opened over the temp file**.
-`ZipFile(mode="a")` over an empty file sets `_didModify = True` and
-`start_dir = 0`; its `close()` then seeks to offset 0 and writes an
-end-of-central-directory record over the first bytes of whatever is there.
-Dropping the handle without calling `close()` does not avoid this —
-`ZipFile.__del__` calls `close()` — so the only safe ordering is copy first,
-open second. Under `_lock`:
+The seed runs *after* `init()`, from `task_run` (see below), because that
+is where a seed failure has the right blast radius: it is an attempt
+failure — no log written, the retry keeps its source — rather than a
+failure of `TaskLogger.init`, which runs in the dispatcher (up front for
+every task in `eval_run`, or inside `run_one` for an in-process retry) and
+would take the whole run down. It also means a run with many queued tasks
+does not download every prior log at startup. `init()` has already opened
+an append-mode `ZipFile` over the empty temp file, and **the copy must not
+land under such a handle**: `ZipFile(mode="a")` over an empty file sets
+`_didModify = True` and `start_dir = 0`, so its `close()` seeks to offset 0
+and writes an end-of-central-directory record over the first bytes of
+whatever is there — and dropping the handle without `close()` does not
+avoid this, `ZipFile.__del__` calls `close()`. The seed therefore closes
+that handle *explicitly* first (the end record lands in the still-empty
+file), truncates the temp file, copies, and only then opens a new handle;
+nothing can write over the copied bytes. Any `_journal/config_updates/*`
+members `init()` had written (inherited process-scoped retunes) go with
+the truncation and are re-journaled after the copy. Under `_lock`:
 
 1. **Copy bytes** into the still-empty `_temp_file`. `_temp_file` is an
    anonymous `tempfile.TemporaryFile()` (unlinked on Linux), so
@@ -478,144 +489,146 @@ open second. Under `_lock`:
    same contract: `summaries.json` if present, else the journal members in
    index order, then `_dedupe_summaries`. The result is filtered to `keep`
    by typed `(id, epoch)` (every summary when `keep` is `None`); these are
-   the **kept summaries** the following steps work from. When `invalidated`
-   is `True`, each kept body is read with `zip.read` in the same thread and
-   the keys whose `invalidation is not None` are recorded in
-   `_prior_invalidated`.
+   the **kept summaries** the following steps work from.
 4. **Prune** from `filelist`/`NameToInfo`: `header.json`, `summaries.json`,
-   `reductions.json`, `_journal/config_updates/*`, every
-   `_journal/summaries/*`, and every `samples/*` member whose name is not in
-   `{_sample_filename(s.id, s.epoch) for s in kept summaries}`. Names are
-   generated and compared, never parsed: `_sample_filename` interpolates
-   the id as a plain string, so `samples/1_epoch_1.json` does not say
-   whether the id was `1` or `"1"`, and a string id containing `_epoch_`
-   cannot be split back. A body member with no summary row is pruned too —
-   `lookup` could not classify it. Dead bytes only; no rewrite.
-   `_journal/start.json` is left in place and superseded by the new
-   attempt's `start()` (readers take the last entry).
+   `reductions.json`, `_journal/start.json`, `_journal/config_updates/*`,
+   every `_journal/summaries/*`, and every `samples/*` member whose name is
+   not in `{_sample_filename(s.id, s.epoch) for s in kept summaries}`.
+   Names are generated and compared, never parsed: `_sample_filename`
+   interpolates the id as a plain string, so `samples/1_epoch_1.json` does
+   not say whether the id was `1` or `"1"`, and a string id containing
+   `_epoch_` cannot be split back. A body member with no summary row is
+   pruned too — `lookup` could not classify it. Dead bytes only; no
+   rewrite. (The prior's `start.json` is pruned rather than left to be
+   superseded so no stale eval_id member lingers; the new attempt's
+   `start()` writes its own.)
 5. **Rewrite the summaries journal**: set `_summaries` to the kept
    summaries, `_summary_counter = 1`, and append them as
    `_journal/summaries/1.json`. `_read_summary_counter` takes the maximum
    index present, so pruning the prior journal and starting at 1 is
    consistent for every reader. Nothing goes into `_samples` or
-   `_streaming_samples`.
-6. Record `_prior_keys = {(s.id, s.epoch) for s in kept summaries}` — typed
-   keys from the summaries, not parsed from member names — and
-   `_prior_size` (bytes) for the compaction heuristic.
+   `_streaming_samples`. Then re-journal the config updates recorded
+   before the seed.
+6. Register the kept member names in `_local_sample_names` (the set
+   `buffered_sample` serves from the local zip) and the pruned members'
+   compressed size in `_pruned_bytes` for the compaction heuristic.
 
-`buffered_sample(id, epoch)` gains a third tier after `_samples` and
-`_streaming_samples`: a seeded key is read from the local zip with
-`self._zip.read(name)` (reading is permitted in append mode). That is a
-synchronous decompress of a whole sample body, so it runs in
-`anyio.to_thread.run_sync` — the temp file is local, so the fsspec rule
-does not apply — while `_lock` is held, exactly as a flush holds it. The
-event loop stays free; concurrent sample writes wait on the lock for the
-read's duration, which is the same contention a flush imposes today. The
-caller's `EvalSample.model_validate` runs after the lock is released.
-`TaskLogger.read_sample`'s disk fallback therefore never needs the
-destination for a seeded sample.
+`buffered_sample(id, epoch)` gains a tier between `_samples` and
+`_streaming_samples`: a member registered in `_local_sample_names` (a
+seeded record, or a write-through re-log) is read from the local zip with
+`self._zip.read(name)` (reading is permitted in append mode), which
+resolves to the freshest member under that name — a re-run's superseding
+record wins, as for every zip reader. That is a synchronous decompress of a
+whole sample body, so it runs in `anyio.to_thread.run_sync` — the temp file
+is local, so the fsspec rule does not apply — while `_lock` is held, exactly
+as a flush holds it. The event loop stays free; concurrent sample writes
+wait on the lock for the read's duration, which is the same contention a
+flush imposes today. `EvalSample.model_validate` runs after the lock is
+released. `TaskLogger.read_sample`'s disk fallback therefore never needs the
+destination for a seeded sample. Live samples' flushed members stay on the
+disk path (its `exclude_fields` streaming serves the control channel's
+event-page reads).
 
-`JSONRecorder.log_init(..., prior_log=...)` reads the prior `.json` log and
-buffers its kept samples (the format is whole-log-in-memory; this matches
-today's in-memory source residency and is strictly less than today's
-duplicate copy). The invalidation decision reads `sample.invalidation`
-directly, since the bodies are in memory.
+**Cross-format and in-memory seeds.** `eval_retry(..., log_format=...)` can
+name a format that differs from the prior log's, so `EvalRecorder.log_seed`
+copies bytes only when `prior_log` is a `.eval` file and returns `False`
+otherwise; `JSONRecorder` inherits the declining base implementation. When
+the recorder declines — or the source is an in-memory `EvalLog`
+(`eval_retry` on a loaded log, `log_info=None`) — `TaskLogger.seed_from_prior`
+reads the prior (`read_eval_log_async`, or the in-memory samples) and
+writes each kept sample through `recorder.log_sample(write_through=True)`
+before `log_start`: today's write-through, done sequentially up front.
+`JSONRecorder.log_sample` supersedes an existing record for the same
+`(id, epoch)` (rather than appending a duplicate) so a seeded errored
+record is replaced by its re-run, matching the `.eval` readers' rule.
+Rejecting a format mismatch instead would break a retry that works today,
+so the fallback is the only acceptable behaviour; it is slower than the
+byte copy but no slower than today's sweep.
 
-**Cross-format seeds.** `eval_retry(..., log_format=...)` can name a format
-that differs from the prior log's, so `EvalRecorder.log_init` seeds by byte
-copy only when `prior_log` is a `.eval` file, and `JSONRecorder.log_init`
-only when it is a `.json` file. Any other pairing falls back to the
-in-memory path used for `EvalLog` sources (below): read the prior through
-`read_eval_log`, then write the kept samples through before `log_start`.
-Rejecting the mismatch instead would break a retry that works today, so the
-fallback is the only acceptable behaviour; it is slower than the byte copy
-but no slower than today's sweep.
+### `task_run` seeds the log before `log_start`
 
-### `TaskLogger.init` passes the seed through
-
-`EvalSampleSource` is a `NamedTuple` of three callables (`lookup`,
-`error_history_ids`, `prior_exists`), so `TaskLogger.init` cannot tell from
-`options.sample_source` whether the source is file-backed, whether it passed
-eligibility, or where the prior log lives. `eval_log_sample_source` therefore
-grows a fourth field, `seed: SeedSource | None`, where `SeedSource` is a
-small `NamedTuple` of `location: str` and `log_format: Literal["eval",
-"json"]`. It is set only on the `eval_log_info` branch, *after* the
+`EvalSampleSource` is a `NamedTuple` of callables, so nothing downstream can
+tell from `options.sample_source` whether the source is file-backed, whether
+it passed eligibility, or where the prior log lives. `eval_log_sample_source`
+therefore sets a `seed: SeedSource | None` field, where `SeedSource` is a
+small `NamedTuple` of `location: str | None` (the prior log file), `samples:
+list[EvalSample] | None` (an in-memory prior log) and `classify`, the
+resolver described under the sweep below. It is set only *after* the
 shuffle-without-ids and dataset-size checks pass (the branches that warn and
 return the no-reuse source leave it `None`), so eligibility is decided once,
-where it is decided today, and the logger just reads the field.
-`TaskLogger.init()`/`reinit()` call `recorder.log_init(eval,
-prior_log=source.seed.location, keep=...)` when the field is set. `keep`
-comes from the plan (`sample_ids × range(1, epochs+1)`; `None` for a
-dynamic-feed task). Both `init()` (in `eval_run`) and `reinit()` (in
-`run_task_retry_attempts`) run before `task_run` slices the dataset, but
-the plan is already available: `TaskLogger.__init__` slices with the same
-`limit`/`sample_id`/`dynamic` arguments and stores the typed ids on
-`self.eval.dataset.sample_ids`, and `self.eval.config.epochs` gives the
-epoch count, so `keep` is built from those two fields and `log_init` stays
-where it is. The logger records the seeded key set and the
-invalidated subset for bookkeeping: `samples_logged` becomes "distinct keys
-present in the log minus cancelled" derived from `sample_summaries()`, so
-the count is right even for seeded keys whose `run_sample` never ran before
-a teardown. `hold_destination_writes()` is no longer called for retries;
+where it is decided today. `error_history_ids` and `prior_exists` are gone
+from the tuple: the carry-forward and the presence probe they served are
+deleted.
+
+`task_run` calls `logger.seed_from_prior(seed.location, seed.samples, keep,
+log_images)` immediately before `log_start` when the source carries a seed
+and sample logging is on (with `log_samples=False` nothing is seeded, as
+nothing is re-logged today, and the sweep falls back to `lookup`). `keep`
+is the plan `task_run` has just sliced (`sample_ids × range(1, epochs+1)`;
+`None` for a dynamic-feed task). `TaskLogger.seed_from_prior` asks the
+recorder to `log_seed`, falls back to the write-through re-log when it
+declines, then records every kept summary's key in `_logged_sample_keys`
+(cancelled ones in `_cancelled_sample_keys`), so `samples_logged` is right
+even for seeded keys whose `run_sample` never ran before a teardown, and
+sets `prior_seeded`. `samples_completed` (a display count of clean
+completions) is incremented when the sweep reaches a reusable key
+(`note_reused_sample`), not at seed time, so an invalidated record that is
+re-run is not counted twice. `hold_destination_writes()` no longer exists;
 `log_start` flushes immediately as a fresh eval does, and that first flush
 carries the complete prior set.
 
 ### The reuse sweep becomes bookkeeping
 
-`run_sample`'s `sample_source` branch:
+`run_sample`'s `sample_source` branch, when `logger.prior_seeded`:
 
-- `lookup(id, epoch)` on the file-backed source consults the *logger's*
-  seeded summaries (in memory) to classify the key, never the remote prior
-  log. Clean (`error is None` and the key is not in the logger's
-  prior-invalidated set, computed at seed time from the prior header and,
-  when flagged, the local bodies) → the body is read via
-  `logger.read_sample` from the local seeded zip (the `buffered_sample` tier
-  below) and the reporter is fed `SampleScore(score=...,
-  sample_metadata=sample.metadata)` from the full body, exactly as today;
-  the key is marked logged. No re-log, no write-through. The summary is not
-  used for the feed because its scores and metadata are thinned at
-  validation (see Options A); `model_usage` and `message_count` on the
-  summary are exact, but a body read is needed for the scores anyway, so
-  everything the reporter and `resume_scan_previous_sample` want comes from
-  the one local read.
-- Errored → `PreviousError` seeded from the body read locally (needs
-  `error_retries`; the summary's `retries` count is not enough);
-  invalidated/absent → checkpoint resume or fresh run, as today. The
-  re-run's completion appends a superseding member.
-- `prior_exists`, the read throttle and the presence probe are removed: no
-  remote body read happens in the sweep, so there is nothing to throttle.
-- `_ReuseSweepCountdown` is kept only for the dynamic-feed `add()`/settle
-  cycles if anything still depends on the settle event; the settle *flush*
-  is deleted (nothing is written through). If nothing depends on it, delete
-  the countdown too.
-- `carry_forward_unlogged_samples` and its `_finish_task_log` call are
-  deleted: an unreached errored key's prior record is already in the seeded
-  zip, which is exactly what carry-forward re-logged.
-
-In-memory sources (`eval_retry` on an already-loaded `EvalLog`,
-`log_info=None`) seed by writing the log's kept samples into the temp zip
-before `log_start` — today's write-through, done sequentially up front.
+- `logger.read_prior_sample(id, epoch)` reads the key's record from this
+  attempt's own log (the `buffered_sample` tier above; an absent key costs
+  no remote read) and `seed.classify(id, epoch, sample)` resolves it with
+  the same rule `lookup` applies to a record read from the prior source:
+  clean (`error is None and invalidation is None`) → the sample; errored →
+  `PreviousError` (seeded from the body's `error_retries`; the summary's
+  `retries` count is not enough); invalidated/absent → checkpoint resume or
+  fresh run, as today. For a clean sample the reporter is fed
+  `SampleScore(score=..., sample_metadata=sample.metadata)` from the full
+  body, exactly as today (the summary's scores and metadata are thinned at
+  validation, see Options A), and `logger.note_reused_sample` does the
+  bookkeeping `complete_sample` used to — nothing is re-logged or written
+  through. The re-run's completion appends a superseding member.
+- When the log was not seeded (sample logging off, or no eligible prior)
+  the branch is today's: `lookup` against the prior source, and a clean
+  sample is re-logged with `complete_sample(flush=False)` when sample
+  logging is on.
+- The read throttle, the presence probe, `_ReuseSweepCountdown`, the settle
+  flush, the quiet pending list and `carry_forward_unlogged_samples` (with
+  its `_finish_task_log` call) are deleted: no remote body read happens in
+  the sweep, nothing is written through during it, and an unreached errored
+  key's prior record is already in the seeded zip, which is exactly what
+  carry-forward re-logged.
 
 ### Compaction at successful finish
 
-In `EvalRecorder.log_finish` when `status == "success"` and dead bytes exceed
-a threshold (say 10% of the file, or any pruned/superseded sample member):
-rewrite the temp zip keeping only the referenced members, in a worker thread
-(local file, CPU-bound). Prefer a raw member copy if it can be written
-against documented `zipfile` behaviour; otherwise the decompress+recompress
-loop from `_rewrite_eval_zip_with_new_header`. Then write
-`summaries.json`/`reductions.json`/`header.json` and flush as today. A fresh
-eval has no dead bytes and skips this.
+In `EvalRecorder.log_finish` when `status == "success"` and dead bytes
+(pruned prior members plus members superseded under the same name) exceed
+`COMPACT_DEAD_BYTES_FRACTION` (10%) of the file: rewrite the temp zip
+keeping only the referenced members, in a worker thread (local file,
+CPU-bound), using the decompress+recompress loop from
+`_rewrite_eval_zip_with_new_header` (`zipfile` has no documented raw-copy
+surface). Then write `summaries.json`/`reductions.json`/`header.json` and
+flush as today. A fresh eval has no dead bytes and skips this; a retry that
+re-ran only a few small samples tolerates their stale copies rather than
+paying a full rewrite for them.
 
 ### `run_task_retry_attempts`: keep the prior source when the attempt wrote no log
 
-`TaskRunResult` gains `log_written: bool` (or the retry branch checks
-`filesystem(location).exists`). When a retry is scheduled for an attempt
-that wrote nothing — a seed failure, or a failed `log_start` flush — the
-retry reuses `options.sample_source` instead of building one from an
-absent file. Today that case degrades to no reuse; this is the E change and
-A needs it for the seed-failure path. eval_set with `retry_immediate=False`
-needs nothing: no file means the next pass selects the older log.
+The retry branch checks `filesystem(location).exists(location)` for the
+failed attempt's log. When the attempt wrote nothing — a seed failure, or a
+failed `log_start` flush — the retry reuses `options.sample_source` instead
+of building one from an absent file. Today that case degrades to no reuse;
+this is the E change and A needs it for the seed-failure path (the seed
+raises inside `task_run`, which `_run_task` already converts into an
+errored `EvalLog` without a file, the same path a failed `log_start` flush
+takes). eval_set with `retry_immediate=False` needs nothing: no file means
+the next pass selects the older log.
 
 ### Seed download retry (H)
 
@@ -690,16 +703,11 @@ warning names the prior log and the error.
   keys pruned at seed; the log holds exactly the plan (plus dead bytes until
   compaction). More epochs than the prior: new epochs are absent keys and
   run live.
-- **Invalidated sample in the prior**: the prior header's `invalidated`
-  flag triggers a body scan of the kept keys at seed time (local zip), so
-  the summary's clean `error` does not mask the body's `invalidation`. Its
-  record is seeded (so an in-progress read shows it), it re-runs, and the
-  re-run supersedes it. The log-level `invalidated` flag comes from the new
-  header. A body carrying `invalidation` under a header whose flag is
-  `False` is not a state `invalidate_samples`/`uninvalidate_samples` can
-  produce; no body is read for such a log, so the key reads as clean. That
-  is the documented behaviour (the header flag is the retry contract), and a
-  test pins it.
+- **Invalidated sample in the prior**: its record is seeded (so an
+  in-progress read shows it); the sweep's local body read sees
+  `invalidation`, so the summary's clean `error` does not mask it; it
+  re-runs, and the re-run supersedes it. The log-level `invalidated` flag
+  comes from the new header.
 - **Requeue within the attempt**: unchanged — a requeued re-run appends a
   superseding member as it does today; compaction treats it like any other
   superseded entry.
@@ -727,61 +735,50 @@ warning names the prior log and the error.
 
 Unit (`tests/log/test_task_log.py` and a recorder test module):
 
-- `ZipLogFile.init(prior_log=...)`: seeded temp zip contains every prior
-  sample member and its first bytes are the prior log's (no
-  end-of-central-directory record written over them); pruned names are
-  absent from the central directory but the file stays valid; pruning is
-  by generated member name, so a prior holding the string id `"1"` and a
-  string id containing `_epoch_` keeps exactly the planned keys and
-  `_prior_keys` preserves id type; `_read_all_summaries` over the seeded
-  zip matches `_read_all_summaries_async` on the same file for both a
-  `summaries.json` prior and a journal-only `started` prior; `_summaries`
-  matches the kept keys and the journal holds exactly one member listing
-  them, so an in-progress `read_eval_log_sample_summaries` over the seeded
-  log lists no pruned key; `buffered_sample` serves a seeded key from the
-  local zip without blocking the event loop; `start()` after seed makes an
-  in-progress read return the *new* start record, not the prior header; a
-  re-run's completion supersedes the seeded member (last-entry-wins on
-  read); compaction removes dead bytes and the compacted log round-trips
-  identically through `read_eval_log`; a seed download failure leaves the
-  temp zip empty and raises; `discard()` after a prior-log seed removes the
-  attempt's destination (the `_destination_seeded` rule does not apply).
-- Invalidation at seed: a prior with `invalidated=True` marks exactly the
-  bodies carrying `invalidation` for re-run; a prior with `invalidated=False`
-  reads no bodies, and a body with `invalidation` under such a header reads
-  as clean (pinned behaviour).
+- `EvalRecorder.log_seed` / `ZipLogFile.seed_from_prior_log`: the seeded
+  temp zip contains every kept prior sample member and its member bytes are
+  the prior log's (no end-of-central-directory record written over them);
+  pruned names are absent from the central directory but the file stays
+  valid; pruning is by generated member name, so a prior holding a string id
+  containing `_epoch_` keeps exactly the planned keys and an int/str id
+  mismatch still matches; the seed reads both a `summaries.json` prior and a
+  journal-only `started` prior; the journal holds exactly one member listing
+  the kept keys, so an in-progress `read_eval_log_sample_summaries` over the
+  seeded log lists no pruned key; `buffered_sample` serves a seeded key from
+  the local zip; `start()` after seed makes an in-progress read return the
+  *new* start record, not the prior header; a re-run's completion supersedes
+  the seeded member for every reader; compaction removes dead bytes and the
+  compacted log round-trips through `read_eval_log`; a missing prior raises
+  and leaves the log usable, a transient copy failure is retried; config
+  updates journaled before the seed survive it; `discard()` after a
+  prior-log seed removes the attempt's destination (the
+  `_destination_seeded` rule does not apply); a `.json` prior is declined.
+- `seed.classify`: a clean record is returned as-is, an errored one yields
+  `PreviousError`, an invalidated or absent one yields `None`.
 - Cross-format: a `.eval` prior retried with `log_format="json"` and a
   `.json` prior retried with `log_format="eval"` both reuse every clean
   sample through the write-through fallback.
-- `TaskLogger.init` with a seed: `samples_logged` counts seeded keys; no
-  hold is set; `log_start` creates the destination containing the prior set;
-  `eval_log_sample_source` sets `seed` only when the eligibility checks
-  pass (shuffled-without-ids and size-mismatch priors yield `None`).
-- `run_task_retry_attempts`: an attempt that wrote no log retries with the
-  unchanged prior source (`tests/test_retry.py`).
-- Sample-source bookkeeping (`tests/test_task_retry_error_history.py`):
-  clean seeded key → one local body read, no remote read, and the reporter's
-  `SampleScore` carries the full-length `Score.explanation` and untruncated
-  `sample_metadata` (pinned with a prior sample whose explanation and a
-  metadata value both exceed the summary thin limit, so `reductions.json`
-  and a `grouped()` metric match a fresh run); errored → `PreviousError`
-  from the local body; invalidated → fresh run; scanner configured → body
-  read from the local zip.
+- `TaskLogger.seed_from_prior` (`tests/log/test_task_log.py`): seeded and
+  re-logged (cross-format, in-memory) seeds alike count seeded keys toward
+  `samples_logged` (cancelled ones excluded), `read_prior_sample` serves
+  them locally, `note_reused_sample` counts a completion, `log_start`
+  creates the destination containing the prior set, and a missing prior
+  raises before any destination write; `eval_log_sample_source` sets `seed`
+  only when the eligibility checks pass (shuffled-without-ids and
+  size-mismatch priors yield `None`) (`tests/test_eval.py`).
 
-Eval-level (`tests/test_eval_set.py`, parametrized over `retry_immediate`):
+Eval-level (`tests/test_eval_set.py`):
 
-- The issue's repro: attempt 1 completes s1–s3 and errors on s4; attempt 2's
-  live s4 errors again while the (now local) reuse bookkeeping is stalled;
-  assert attempt 2's log holds `{s1, s2, s3, s4}`, s2 and s3 run exactly once
-  overall, and after success only the final log remains with
-  `retry_cleanup=True`.
-- Seed failure: the prior log read raises on attempt 2; assert no log file
-  is written for attempt 2, attempt 3 reuses s1–s3, and total solver calls
-  equal today's minimum.
-- Hard kill during the seed (subprocess `os._exit` inside the download):
-  no destination file; the next eval_set run reuses everything.
-- `sample_id` subset retry: the new log holds only the subset.
-- Same shape with `eval(retry_attempts=2)` (no eval_set) for the
+- The issue's repro, parametrized over `retry_immediate`: attempt 1
+  completes s1–s3 and errors on s4; attempt 2 errors on s4 again; every
+  attempt's log holds `{s1, s2, s3, s4}`, s1–s3 run exactly once overall,
+  and the final log carries s4's two-entry error history.
+- Seed failure: the prior log copy raises on attempt 2; no log file is
+  written for attempt 2 and attempt 3 reuses s1–s3.
+- Hard kill after the seed, before `log_start` (subprocess `SIGKILL` from
+  the crash harness): no destination file; the next eval_set run reuses
+  everything.
+- Same repro with `eval(task_retry_attempts=1)` (no eval_set) for the
   `run_task_retry_attempts` path.
 
 Run the async tests with `--runtrio` as well.

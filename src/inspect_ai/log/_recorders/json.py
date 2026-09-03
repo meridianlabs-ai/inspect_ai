@@ -125,7 +125,14 @@ class JSONRecorder(FileRecorder):
         log = self.data[self._log_file_key(eval)]
         if log.data.samples is None:
             log.data.samples = []
+        # a re-log of the same (id, epoch) supersedes the earlier record — a
+        # requeued sample's re-run, or a retry re-running a prior attempt's
+        # errored sample that seeded this log — matching the .eval readers'
+        # last-entry-wins rule rather than listing the sample twice
+        key = (sample.id, sample.epoch)
+        log.data.samples = [s for s in log.data.samples if (s.id, s.epoch) != key]
         log.data.samples.append(sample)
+        log.summaries = [s for s in log.summaries if (s.id, s.epoch) != key]
         log.summaries.append(sample.summary())
 
     @override

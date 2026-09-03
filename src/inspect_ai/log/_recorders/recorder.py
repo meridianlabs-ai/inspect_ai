@@ -40,6 +40,25 @@ class Recorder(abc.ABC):
     @abc.abstractmethod
     async def log_init(self, eval: EvalSpec, location: str | None = None) -> str: ...
 
+    async def log_seed(
+        self,
+        eval: EvalSpec,
+        prior_log: str,
+        keep: set[tuple[str | int, int]] | None,
+    ) -> bool:
+        """Seed an initialized (not yet started) log from a prior attempt's log file.
+
+        A retry attempt's log starts out holding every sample record the
+        prior attempt's log holds (restricted to the planned ``keep`` keys
+        when given), so the attempt's log is a superset of the prior log from
+        its first flush no matter how the attempt ends (see
+        ``design/retry-seeded-attempt-log.md``). Returns ``False`` when this
+        recorder cannot seed from ``prior_log`` (e.g. the prior log is in a
+        different format); the caller then re-logs the prior samples itself.
+        The base implementation never seeds.
+        """
+        return False
+
     @abc.abstractmethod
     async def log_start(self, eval: EvalSpec, plan: EvalPlan) -> None: ...
 

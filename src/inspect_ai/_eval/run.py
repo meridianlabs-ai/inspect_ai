@@ -9,7 +9,7 @@ from typing import Any, Awaitable, Callable, Iterable, NamedTuple, Set, cast
 from inspect_ai._eval.task.constants import TASK_ALL_PARAMS_ATTR
 from inspect_ai._util._async import Wake
 from inspect_ai._util.environ import environ_vars
-from inspect_ai._util.file import cleanup_s3_sessions
+from inspect_ai._util.file import cleanup_s3_sessions, filesystem
 from inspect_ai._util.task import task_display_name
 from inspect_ai._util.trace import trace_action
 from inspect_ai.util._anyio import inner_exception
@@ -84,6 +84,7 @@ from .loader import (
 from .task.log import TaskLogger
 from .task.resolved import ResolvedTask
 from .task.run import (
+    EvalSampleSource,
     TaskRunOptions,
     eval_log_sample_source,
     plan_agent_name,
@@ -866,26 +867,40 @@ async def run_task_retry_attempts(
                         mark_eval_retry_pending(result.eval.eval_id)
 
                         # build sample_source from the failed log so completed
-                        # samples are reused on retry (mirrors legacy eval_set retry)
-                        failed_log_info = EvalLogInfo(
-                            name=options.logger.location,
-                            type="file",
-                            size=0,
-                            mtime=None,
-                            task=options.task.name,
-                            task_id=options.logger.eval.task_id,
-                            suffix=None,
-                        )
-                        sample_source = eval_log_sample_source(
-                            result,
-                            failed_log_info,
-                            options.task.dataset,
-                            eval_checkpoints_dir_from_config(
-                                options.logger.location,
-                                options.checkpoint,
-                                options.eval_checkpoint,
-                            ),
-                        )
+                        # samples are reused on retry (mirrors legacy eval_set
+                        # retry). An attempt that wrote no log — its prior-log
+                        # seed failed, or its log_start() flush did — has
+                        # nothing newer to offer: the retry keeps the source
+                        # this attempt ran with (the same prior log), rather
+                        # than a source over an absent file that reuses nothing
+                        failed_location = options.logger.location
+                        sample_source: EvalSampleSource | None
+                        if filesystem(failed_location).exists(failed_location):
+                            failed_log_info = EvalLogInfo(
+                                name=failed_location,
+                                type="file",
+                                size=0,
+                                mtime=None,
+                                task=options.task.name,
+                                task_id=options.logger.eval.task_id,
+                                suffix=None,
+                            )
+                            sample_source = eval_log_sample_source(
+                                result,
+                                failed_log_info,
+                                options.task.dataset,
+                                eval_checkpoints_dir_from_config(
+                                    failed_location,
+                                    options.checkpoint,
+                                    options.eval_checkpoint,
+                                ),
+                            )
+                        else:
+                            log.info(
+                                f"Task '{options.task.name}' wrote no log for this "
+                                "attempt; retrying with the prior attempt's sample source"
+                            )
+                            sample_source = options.sample_source
 
                         # reinit logger for a fresh eval entry
                         await options.logger.reinit()

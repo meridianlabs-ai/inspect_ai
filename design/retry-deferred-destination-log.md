@@ -4,6 +4,14 @@ Design for [meridianlabs-ai/inspect_ai#240](https://github.com/meridianlabs-ai/i
 Builds on the reuse-sweep settle-flush machinery from
 [retry-reused-sample-flush.md](retry-reused-sample-flush.md).
 
+> **Superseded.** The destination-write hold, the settle flush and the
+> teardown carry-forward described here were removed by
+> [retry-seeded-attempt-log.md](retry-seeded-attempt-log.md): a retry
+> attempt now seeds its log with the prior attempt's sample records before
+> its first destination write, so the invariant this design enforced with a
+> hold ("no destination file without the complete reused set") holds by
+> construction. Retained as the record of the problem and the interim fix.
+
 ## Problem
 
 A retry attempt (eval_set retry, in-process task retry, or `eval-retry`)

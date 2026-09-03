@@ -10,7 +10,7 @@ import time
 import zipfile
 from copy import deepcopy
 from pathlib import Path
-from typing import Callable, cast
+from typing import BinaryIO, Callable, cast
 from unittest.mock import patch
 
 import pytest
@@ -2130,17 +2130,19 @@ def test_eval_set_retry_immediate(retry_immediate: bool | None) -> None:
         ]
 
 
-def test_retry_attempt_killed_mid_sweep_leaves_completed_samples_reusable(
+def test_retry_attempt_killed_after_seed_leaves_completed_samples_reusable(
     tmp_path: Path,
 ) -> None:
-    """A retry attempt hard-killed before its reuse sweep settles loses nothing.
+    """A retry attempt hard-killed after seeding its log loses nothing.
 
-    Regression for the failure in ``design/retry-deferred-destination-log.md``:
-    the killed attempt used to leave a start-only log that became the newest
-    log for the task, so the next retry found nothing to reuse and re-ran every
-    completed sample (permanently losing them once ``retry_cleanup`` deleted
-    the prior log). The attempt now writes nothing until its sweep settles, so
-    the kill leaves no file and the next retry chains to the prior log.
+    Regression for the failure in ``design/retry-deferred-destination-log.md``
+    (now covered by ``design/retry-seeded-attempt-log.md``): the killed
+    attempt used to leave a start-only log that became the newest log for the
+    task, so the next retry found nothing to reuse and re-ran every completed
+    sample (permanently losing them once ``retry_cleanup`` deleted the prior
+    log). The attempt's first destination write now carries the complete
+    prior sample set, so a kill before it leaves no file (the next retry
+    chains to the prior log) and a kill after it leaves a complete one.
     """
     import subprocess
     import sys
@@ -2152,22 +2154,22 @@ def test_retry_attempt_killed_mid_sweep_leaves_completed_samples_reusable(
     tests_dir = Path(__file__).parent
     harness = str(tests_dir / "test_helpers" / "retry_deferred_log_harness.py")
 
-    def run_harness(kill_at_settle: bool) -> subprocess.CompletedProcess[bytes]:
+    def run_harness(kill_at_seed: bool) -> subprocess.CompletedProcess[bytes]:
         env = {
             **os.environ,
             "PYTHONPATH": os.pathsep.join(
                 p for p in (str(tests_dir), os.environ.get("PYTHONPATH", "")) if p
             ),
         }
-        if kill_at_settle:
-            env["INSPECT_TEST_KILL_AT_SETTLE"] = "1"
+        if kill_at_seed:
+            env["INSPECT_TEST_KILL_AT_SEED"] = "1"
         return subprocess.run(
             [sys.executable, harness, log_dir, probe_dir], env=env, timeout=600
         )
 
     # attempt 1 completes s1 and errors s2; the in-process retry attempt is
-    # killed the moment its reuse sweep settles
-    killed = run_harness(kill_at_settle=True)
+    # killed the moment its log has been seeded from attempt 1's log
+    killed = run_harness(kill_at_seed=True)
     assert killed.returncode == -signal.SIGKILL, (
         f"expected the child to die by SIGKILL; got returncode {killed.returncode}"
     )
@@ -2179,7 +2181,7 @@ def test_retry_attempt_killed_mid_sweep_leaves_completed_samples_reusable(
     assert read_eval_log(logs[0].name, header_only=True).status == "error"
 
     # a fresh eval_set pass reuses s1 and re-runs only s2
-    assert run_harness(kill_at_settle=False).returncode == 0
+    assert run_harness(kill_at_seed=False).returncode == 0
 
     with open(os.path.join(probe_dir, "solver_calls.txt")) as f:
         calls = f.read().split()
@@ -2189,6 +2191,154 @@ def test_retry_attempt_killed_mid_sweep_leaves_completed_samples_reusable(
     assert final.status == "success"
     assert final.samples is not None
     assert {(s.id, s.epoch) for s in final.samples} == {("s1", 1), ("s2", 1)}
+
+
+def _seeded_retry_task(
+    calls: list[str], *, fail_s4_times: int
+) -> tuple[Task, Callable[[], int]]:
+    """Four-sample task whose s4 errors on its first `fail_s4_times` runs."""
+    solver_id = id(calls)
+
+    @solver(name=f"seeded_retry_solver_{solver_id}")
+    def seeded_retry_solver() -> Solver:
+        async def solve(state: TaskState, generate: Generate) -> TaskState:
+            calls.append(str(state.sample_id))
+            if state.sample_id == "s4" and calls.count("s4") <= fail_s4_times:
+                raise ValueError(f"s4 fails on run {calls.count('s4')}")
+            return state
+
+        return solve
+
+    return Task(
+        dataset=[Sample(id=f"s{i}", input="x", target="y") for i in (1, 2, 3, 4)],
+        solver=[seeded_retry_solver()],
+        name="seeded_retry_task",
+    ), lambda: calls.count("s4")
+
+
+@pytest.mark.parametrize("retry_immediate", [True, False])
+def test_errored_retry_attempt_log_holds_every_prior_sample(
+    retry_immediate: bool, tmp_path: Path
+) -> None:
+    """An errored retry attempt's log is a superset of the prior attempt's log.
+
+    Regression for meridianlabs-ai/inspect_ai#420: attempt 1 completes s1–s3
+    and errors on s4; attempt 2 errors on s4 again. Attempt 2's log used to
+    hold only what its lazy reuse sweep had copied before the teardown, so
+    attempt 3 (seeded from that newest log) re-ran the missing completed
+    samples. Every attempt's log now holds all four samples, and s1–s3 run
+    exactly once overall.
+    """
+    calls: list[str] = []
+    seeded_task, _ = _seeded_retry_task(calls, fail_s4_times=2)
+
+    log_dir = str(tmp_path / "logs")
+    # three attempts are needed; the legacy pass loop counts the initial pass
+    # against retry_attempts, so allow one more than the immediate path needs
+    success, logs = eval_set(
+        tasks=[seeded_task],
+        log_dir=log_dir,
+        model="mockllm/model",
+        retry_attempts=3,
+        retry_wait=0.1,
+        retry_immediate=retry_immediate,
+        retry_cleanup=False,
+        retry_on_error=0,
+        max_samples=1,
+    )
+    assert success
+    assert calls == ["s1", "s2", "s3", "s4", "s4", "s4"], calls
+
+    all_logs = sorted(
+        (read_eval_log(info.name) for info in list_eval_logs(log_dir)),
+        key=lambda log: log.eval.created,
+    )
+    assert [log.status for log in all_logs] == ["error", "error", "success"]
+    for log in all_logs:
+        assert log.samples is not None
+        assert {s.id for s in log.samples} == {"s1", "s2", "s3", "s4"}, (
+            f"{log.status} log {log.location} is missing prior samples"
+        )
+        assert {s.id for s in log.samples if s.error is not None} == (
+            {"s4"} if log.status == "error" else set()
+        )
+    # the final log carries s4's error history from both failed attempts
+    final = all_logs[-1]
+    assert final.samples is not None
+    s4 = next(s for s in final.samples if s.id == "s4")
+    assert s4.error_retries is not None and len(s4.error_retries) == 2
+
+
+def test_eval_task_retry_attempt_log_holds_every_prior_sample(tmp_path: Path) -> None:
+    """The in-process `eval(task_retry_attempts=...)` path seeds the same way."""
+    calls: list[str] = []
+    seeded_task, _ = _seeded_retry_task(calls, fail_s4_times=1)
+
+    logs = eval(
+        seeded_task,
+        model="mockllm/model",
+        log_dir=str(tmp_path),
+        task_retry_attempts=1,
+        retry_on_error=0,
+        max_samples=1,
+    )
+    assert calls == ["s1", "s2", "s3", "s4", "s4"], calls
+    assert len(logs) == 1 and logs[0].status == "success"
+    assert logs[0].samples is not None
+    assert {s.id for s in logs[0].samples} == {"s1", "s2", "s3", "s4"}
+
+
+def test_retry_seed_failure_writes_no_log_and_next_attempt_reuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A retry attempt whose prior-log seed fails leaves no log; its retry keeps the source.
+
+    Attempt 1 completes s1–s3 and errors on s4. Attempt 2's copy of the
+    prior log fails (a storage failure) before anything is written, so it
+    leaves no destination log and the dispatcher retries with the same
+    sample source. Attempt 3 seeds from attempt 1's log and reuses s1–s3.
+    """
+    import inspect_ai.log._recorders.eval as eval_recorder_module
+
+    original_copy = eval_recorder_module._copy_prior_log
+    copies = {"n": 0}
+
+    async def flaky_copy(prior_log: str, dest: BinaryIO) -> None:
+        copies["n"] += 1
+        if copies["n"] == 1:
+            raise OSError("simulated storage failure")
+        await original_copy(prior_log, dest)
+
+    monkeypatch.setattr(eval_recorder_module, "_copy_prior_log", flaky_copy)
+
+    calls: list[str] = []
+    seeded_task, _ = _seeded_retry_task(calls, fail_s4_times=1)
+
+    log_dir = str(tmp_path / "logs")
+    success, _ = eval_set(
+        tasks=[seeded_task],
+        log_dir=log_dir,
+        model="mockllm/model",
+        retry_attempts=2,
+        retry_wait=0.1,
+        retry_immediate=True,
+        retry_cleanup=False,
+        retry_on_error=0,
+        max_samples=1,
+    )
+    assert success
+    assert copies["n"] == 2
+    assert calls == ["s1", "s2", "s3", "s4", "s4"], calls
+
+    all_logs = sorted(
+        (read_eval_log(info.name) for info in list_eval_logs(log_dir)),
+        key=lambda log: log.eval.created,
+    )
+    # attempt 1's error log and attempt 3's success log; attempt 2 wrote none
+    assert [log.status for log in all_logs] == ["error", "success"]
+    for log in all_logs:
+        assert log.samples is not None
+        assert {s.id for s in log.samples} == {"s1", "s2", "s3", "s4"}
 
 
 def test_carried_forward_samples_remain_condensed() -> None:

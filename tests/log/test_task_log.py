@@ -24,6 +24,10 @@ from inspect_ai._util.git import GitContext
 from inspect_ai._util.package import DirectUrl, VcsInfo
 from inspect_ai.dataset import Sample
 from inspect_ai.log import EvalRevision
+from inspect_ai.log._file import (
+    read_eval_log_async,
+    read_eval_log_sample_summaries_async,
+)
 from inspect_ai.log._log import (
     EvalConfig,
     EvalDataset,
@@ -38,7 +42,7 @@ from inspect_ai.log._recorders.buffer.database import SampleBufferDatabase
 from inspect_ai.log._recorders.eval import EvalRecorder
 from inspect_ai.log._recorders.json import JSONRecorder
 from inspect_ai.log._recorders.recorder import Recorder
-from inspect_ai.model import get_model
+from inspect_ai.model import ModelOutput, get_model
 
 
 def _fake_dist(name: str, version: str = "1.0.0") -> types.SimpleNamespace:
@@ -229,8 +233,6 @@ def _flush_logger(
     logger.eval = _eval_spec()
     logger.flush_buffer = flush_buffer
     logger.flush_pending = []
-    logger.flush_quiet = []
-    logger.flush_quiet_retry = False
     logger._samples_completed = 0
     return logger
 
@@ -861,324 +863,22 @@ async def test_task_logger_reinit_waits_for_in_flight_stale_flush_and_restarts(
 
 
 @pytest.mark.anyio
-async def test_task_logger_quiet_samples_skip_threshold_and_timer() -> None:
-    # reused samples are re-logged with flush=False: they land in flush_quiet,
-    # never count toward the flush_buffer threshold, and never arm the
-    # stale-flush timer on their own
-    recorder = _FlushRecorder()
-    logger = _flush_logger(flush_buffer=2, recorder=recorder)
-
-    async with _running_stale_flush_timer(logger, start=False):
-        for i in range(3):
-            await logger.complete_sample(
-                _sample().model_copy(update={"id": f"reused-{i}"}),
-                flush=False,
-                write_through=True,
-            )
-        assert recorder.flush_count == 0
-        assert logger._stale_flush_cancel_scope is None
-
-    assert logger.flush_pending == []
-    assert logger.flush_quiet == [("reused-0", 1), ("reused-1", 1), ("reused-2", 1)]
-
-
-@pytest.mark.anyio
-async def test_flush_samples_drains_quiet_only_state() -> None:
-    # `inspect ctl task log-flush` regression: with only reused (quiet)
-    # samples buffered, the on-demand flush used to no-op and report 0
-    recorder = _FlushRecorder()
-    logger = _flush_logger(flush_buffer=10, recorder=recorder)
-    logger.flush_quiet = [("reused", 1), ("reused-2", 1)]
-
-    async with _running_stale_flush_timer(logger, start=False):
-        flushed = await logger.flush_samples()
-
-    assert flushed == 2
-    assert recorder.flush_count == 1
-    assert logger.flush_quiet == []
-
-
-@pytest.mark.anyio
-async def test_flush_pending_samples_drains_both_lists_and_counts_both() -> None:
-    recorder = _FlushRecorder()
-    buffer_db = _FlushBufferDB()
-    logger = _flush_logger(flush_buffer=10, buffer_db=buffer_db, recorder=recorder)
-    logger.flush_pending = [("live", 1)]
-    logger.flush_quiet = [("reused", 1)]
-
-    async with _running_stale_flush_timer(logger, start=False):
-        flushed = await logger._flush_pending_samples()
-
-    assert flushed == 2
-    assert logger.flush_pending == []
-    assert logger.flush_quiet == []
-    # reused samples never had a buffer-db row, so only live ones are removed
-    assert buffer_db.removed == [("live", 1)]
-
-
-@pytest.mark.anyio
-async def test_task_logger_flush_preserves_quiet_tail() -> None:
-    recorder = _FlushRecorder()
-    recorder.allow_flush = anyio.Event()
-    logger = _flush_logger(flush_buffer=10, recorder=recorder)
-    logger.flush_quiet = [("reused", 1)]
-
-    async with _running_stale_flush_timer(logger, start=False):
-        async with anyio.create_task_group() as tg:
-            tg.start_soon(logger._flush_pending_samples)
-            await recorder.flush_started.wait()
-            logger.flush_quiet.append(("reused-late", 1))
-            recorder.allow_flush.set()
-
-    assert recorder.flush_count == 1
-    assert logger.flush_quiet == [("reused-late", 1)]
-
-
-@pytest.mark.anyio
-async def test_reuse_sweep_settled_writes_reused_samples() -> None:
-    recorder = _FlushRecorder()
-    logger = _flush_logger(flush_buffer=10, recorder=recorder)
-    logger.flush_quiet = [("reused", 1)]
-
-    async with _running_stale_flush_timer(logger, start=False):
-        logger.reuse_sweep_settled()
-        with anyio.fail_after(5):
-            while logger.flush_quiet:
-                await anyio.sleep(0.01)
-
-    assert recorder.flush_count == 1
-    assert logger.flush_quiet == []
-    assert logger.flush_quiet_retry is False
-
-
-@pytest.mark.anyio
-async def test_reuse_sweep_settled_noop_when_nothing_quiet() -> None:
-    recorder = _FlushRecorder()
-    logger = _flush_logger(flush_buffer=10, recorder=recorder)
-
-    async with _running_stale_flush_timer(logger, start=False):
-        logger.reuse_sweep_settled()
-        await anyio.sleep(0.05)
-
-    assert recorder.flush_count == 0
-
-
-@pytest.mark.anyio
-async def test_quiet_settle_flush_failure_arms_sticky_retry_timer() -> None:
-    # a failed settle flush must arm the stale timer for quiet-only pending
-    # state, and the permit must be sticky: a second failure re-arms the
-    # retry rather than dying after one attempt
-    recorder = _FlushRecorder()
-    recorder.fail_times = 2
-    logger = _flush_logger(flush_buffer=10, recorder=recorder)
-    logger.flush_quiet = [("reused", 1)]
-    logger._stale_flush_interval = 0.01
-
-    async with _running_stale_flush_timer(logger, start=False):
-        logger.reuse_sweep_settled()
-        with anyio.fail_after(5):
-            while logger.flush_quiet:
-                await anyio.sleep(0.01)
-
-    # settle flush failed (arming the retry timer), the timer's flush failed
-    # again (sticky flag re-armed it), and the third attempt wrote
-    assert recorder.flush_count == 3
-    assert logger.flush_quiet == []
-    assert logger.flush_quiet_retry is False
-
-
-@pytest.mark.anyio
-async def test_log_finish_clears_quiet_pending_state() -> None:
-    recorder = _FinishRecorder()
-    logger = _flush_logger(flush_buffer=10, recorder=recorder)
-    logger.header_only = False
-    logger.flush_quiet = [("reused", 1)]
-    logger.flush_quiet_retry = True
-
-    async with _running_stale_flush_timer(logger, start=False):
-        await logger.log_finish("success", EvalStats())
-
-    assert logger._finished is True
-    assert logger.flush_quiet == []
-    assert logger.flush_quiet_retry is False
-
-
-@pytest.mark.anyio
-async def test_reinit_clears_quiet_pending_state(monkeypatch, tmp_path) -> None:
-    recorder = _FlushRecorder(str(tmp_path / "reinit-quiet.eval"))
-    logger = _flush_logger(flush_buffer=10, recorder=recorder)
-    logger.flush_quiet = [("reused", 1)]
-    logger.flush_quiet_retry = True
-    monkeypatch.setattr(
-        task_log_module, "SampleBufferDatabase", lambda **kwargs: _FlushBufferDB()
-    )
-
-    async with _running_stale_flush_timer(logger, start=False):
-        await logger.reinit()
-
-    assert logger.flush_quiet == []
-    assert logger.flush_quiet_retry is False
-
-
-@pytest.mark.anyio
-async def test_log_start_flushes_immediately_without_hold() -> None:
+async def test_log_start_flushes_immediately() -> None:
     recorder = _FlushRecorder()
     logger = _flush_logger(recorder=recorder)
 
     await logger.log_start(EvalPlan())
 
     assert recorder.flush_count == 1
-
-
-@pytest.mark.anyio
-async def test_held_log_start_performs_no_destination_write() -> None:
-    # design/retry-deferred-destination-log.md: a held retry attempt performs
-    # no destination write until its reuse sweep settles, so a crash in the
-    # sweep window leaves no file (rather than an empty newest log that the
-    # next retry would chain to, losing every completed sample)
-    recorder = _FlushRecorder()
-    logger = _flush_logger(recorder=recorder)
-    logger.hold_destination_writes()
-
-    await logger.log_start(EvalPlan())
-
-    assert recorder.flush_count == 0
-
-
-@pytest.mark.anyio
-async def test_flush_paths_noop_while_destination_held() -> None:
-    # while held nothing drains: pending lists and buffer-db rows stay intact
-    # for the settle flush, and the ctl log-flush path reports 0 — without
-    # disarming the stale timer covering the live pending samples (its flush
-    # would no-op, so there is nothing to replace the retry it stopped)
-    recorder = _FlushRecorder()
-    buffer_db = _FlushBufferDB()
-    logger = _flush_logger(flush_buffer=10, buffer_db=buffer_db, recorder=recorder)
-    logger.hold_destination_writes()
-    logger._stale_flush_interval = 60
-    logger.flush_pending = [("live", 1)]
-    logger.flush_quiet = [("reused", 1)]
-
-    async with _running_stale_flush_timer(logger):
-        assert logger._stale_flush_cancel_scope is not None
-        assert await logger._flush_pending_samples() == 0
-        assert await logger.flush_samples() == 0
-        assert logger._stale_flush_cancel_scope is not None
-
-    assert recorder.flush_count == 0
-    assert logger.flush_pending == [("live", 1)]
-    assert logger.flush_quiet == [("reused", 1)]
-    assert buffer_db.removed == []
-
-
-@pytest.mark.anyio
-async def test_stale_flush_during_hold_rearms_itself() -> None:
-    # a stale-timer fire that no-ops under the hold must leave a timer armed:
-    # its own fire cleared the previous one, and if the sweep never settles
-    # (torn down before the last settle) nothing else would retry the write
-    recorder = _FlushRecorder()
-    logger = _flush_logger(flush_buffer=10, recorder=recorder)
-    logger.hold_destination_writes()
-    logger._stale_flush_interval = 0.01
-    logger.flush_pending = [("live", 1)]
-
-    async with _running_stale_flush_timer(logger):
-        await anyio.sleep(0.1)
-        assert recorder.flush_count == 0
-        assert logger._stale_flush_cancel_scope is not None
-
-    assert logger.flush_pending == [("live", 1)]
-
-
-@pytest.mark.anyio
-async def test_reuse_sweep_settled_releases_hold_and_drains_quiet() -> None:
-    recorder = _FlushRecorder()
-    logger = _flush_logger(flush_buffer=10, recorder=recorder)
-    logger.hold_destination_writes()
-    logger.flush_quiet = [("reused", 1)]
-
-    async with _running_stale_flush_timer(logger, start=False):
-        logger.reuse_sweep_settled()
-        # released synchronously, before the background flush runs
-        assert logger._destination_hold is False
-        with anyio.fail_after(5):
-            while logger.flush_quiet:
-                await anyio.sleep(0.01)
-
-    assert recorder.flush_count == 1
-
-
-@pytest.mark.anyio
-async def test_live_completions_during_hold_land_at_settle() -> None:
-    # a live sample completing mid-sweep hits the flush_buffer threshold, which
-    # no-ops under the hold — the settle flush must then drain it along with
-    # the reused samples rather than leaving it stranded
-    recorder = _FlushRecorder()
-    buffer_db = _FlushBufferDB()
-    logger = _flush_logger(flush_buffer=1, buffer_db=buffer_db, recorder=recorder)
-    logger.hold_destination_writes()
-
-    async with _running_stale_flush_timer(logger, start=False):
-        await logger.complete_sample(
-            _sample().model_copy(update={"id": "reused"}),
-            flush=False,
-            write_through=True,
-        )
-        await logger.complete_sample(
-            _sample().model_copy(update={"id": "live"}), flush=True
-        )
-        assert recorder.flush_count == 0
-        assert logger.flush_pending == [("live", 1)]
-
-        logger.reuse_sweep_settled()
-        with anyio.fail_after(5):
-            while logger.flush_pending or logger.flush_quiet:
-                await anyio.sleep(0.01)
-
-    assert recorder.flush_count == 1
-    assert buffer_db.removed == [("live", 1)]
-
-
-@pytest.mark.anyio
-async def test_reuse_sweep_settled_creates_destination_when_nothing_reused() -> None:
-    # a held attempt that reused nothing (prior log empty or unreadable,
-    # log_samples=False) still gets its destination created at settle: the
-    # forced flush writes the temp zip (start.json) even with nothing pending
-    recorder = _FlushRecorder()
-    logger = _flush_logger(flush_buffer=10, recorder=recorder)
-    logger.hold_destination_writes()
-
-    async with _running_stale_flush_timer(logger, start=False):
-        logger.reuse_sweep_settled()
-        assert logger._destination_hold is False
-        with anyio.fail_after(5):
-            while recorder.flush_count == 0:
-                await anyio.sleep(0.01)
-
-    assert recorder.flush_count == 1
-
-
-@pytest.mark.anyio
-async def test_reinit_resets_destination_hold(monkeypatch, tmp_path) -> None:
-    recorder = _FlushRecorder(str(tmp_path / "reinit-hold.eval"))
-    logger = _flush_logger(flush_buffer=10, recorder=recorder)
-    logger.hold_destination_writes()
-    monkeypatch.setattr(
-        task_log_module, "SampleBufferDatabase", lambda **kwargs: _FlushBufferDB()
-    )
-
-    async with _running_stale_flush_timer(logger, start=False):
-        await logger.reinit()
-
-    assert logger._destination_hold is False
 
 
 @pytest.mark.anyio
 async def test_read_sample_disk_fallback_returns_none_when_no_destination(
     tmp_path,
 ) -> None:
-    # while held the destination log doesn't exist; a ctl per-sample read must
-    # degrade to None (like a not-found sample) rather than raising
+    # before log_start's flush the destination log doesn't exist; a ctl
+    # per-sample read must degrade to None (like a not-found sample) rather
+    # than raising
     recorder = _FlushRecorder()
     logger = _flush_logger(recorder=recorder)
     logger._location = str(tmp_path / "missing.eval")
@@ -1186,16 +886,165 @@ async def test_read_sample_disk_fallback_returns_none_when_no_destination(
     assert await logger.read_sample("sample", 1) is None
 
 
-def test_buffer_config_pending_includes_quiet() -> None:
-    logger = _flush_logger(flush_buffer=10)
-    logger._buffer_db = None
-    logger.flush_pending = [("live", 1)]
-    logger.flush_quiet = [("reused", 1), ("reused-2", 1)]
-
-    assert logger.buffer_config().pending == 3
+# ---------------------------------------------------------------------------
+# seed_from_prior: a retry attempt's log starts out holding the prior
+# attempt's sample records (design/retry-seeded-attempt-log.md)
+# ---------------------------------------------------------------------------
 
 
-@pytest.mark.anyio
+def _error(message: str) -> EvalError:
+    return EvalError(message=message, traceback="", traceback_ansi="")
+
+
+async def _write_prior_log(recorder: Recorder, samples: list[EvalSample]) -> str:
+    spec = _eval_spec().model_copy(update={"eval_id": "prior-attempt"})
+    location = await recorder.log_init(spec)
+    await recorder.log_start(spec, EvalPlan())
+    for sample in samples:
+        await recorder.log_sample(spec, sample)
+    await recorder.log_finish(spec, "error", EvalStats(), None, None, _error("boom"))
+    return location
+
+
+def _prior_samples() -> list[EvalSample]:
+    return [
+        EvalSample(id=1, epoch=1, input="q1", target="a", output=ModelOutput()),
+        EvalSample(
+            id=2, epoch=1, input="q2", target="a", error=_error("RuntimeError('boom')")
+        ),
+        EvalSample(
+            id=3,
+            epoch=1,
+            input="q3",
+            target="a",
+            error=_error("CancelledError('cancelled by operator')"),
+        ),
+        EvalSample(id=4, epoch=1, input="q4", target="a", output=ModelOutput()),
+    ]
+
+
+def _seed_logger(recorder: Recorder) -> TaskLoggerShim:
+    logger = TaskLoggerShim(_FlushBufferDB())
+    logger.recorder = recorder
+    logger.eval = _eval_spec().model_copy(update={"eval_id": "retry-attempt"})
+    logger.header_only = False
+    logger.flush_buffer = 10
+    logger.flush_pending = []
+    return logger
+
+
+@pytest.mark.parametrize("recorder_type", [EvalRecorder, JSONRecorder])
+async def test_task_logger_seed_from_prior_log(
+    recorder_type: type, tmp_path: Path
+) -> None:
+    # same-format seed (a byte copy for .eval, a re-log for .json): the kept
+    # keys are in the log and counted before any sample runs, minus the
+    # planned key the prior never held and the cancelled one; the first
+    # destination write (log_start) already carries them
+    recorder = recorder_type(str(tmp_path))
+    prior = await _write_prior_log(recorder, _prior_samples())
+    logger = _seed_logger(recorder)
+    logger._location = await recorder.log_init(logger.eval)
+
+    await logger.seed_from_prior(
+        prior, None, keep={(1, 1), (2, 1), (3, 1), (5, 1)}, log_images=True
+    )
+
+    assert logger.prior_seeded
+    assert logger.samples_logged == 2  # 1 and 2 (3 is cancelled, 4 unplanned)
+    assert logger.samples_completed == 0
+    summaries = await logger.sample_summaries()
+    assert summaries is not None
+    assert {s.id for s in summaries} == {1, 2, 3}
+
+    clean = await logger.read_prior_sample(1, 1)
+    assert clean is not None and clean.error is None and clean.input == "q1"
+    errored = await logger.read_prior_sample(2, 1)
+    assert errored is not None and errored.error is not None
+    assert await logger.read_prior_sample(4, 1) is None
+    assert await logger.read_prior_sample(5, 1) is None
+
+    logger.note_reused_sample(clean)
+    assert logger.samples_completed == 1
+    assert logger.samples_logged == 2
+
+    await logger.log_start(EvalPlan())
+    assert {
+        s.id for s in await read_eval_log_sample_summaries_async(logger.location)
+    } == {1, 2, 3}
+    header = await read_eval_log_async(logger.location, header_only=True)
+    assert header.eval.eval_id == "retry-attempt"
+
+
+async def test_task_logger_seed_from_prior_relogs_across_formats(
+    tmp_path: Path,
+) -> None:
+    # a .eval prior retried into a .json log cannot be byte-copied: the kept
+    # samples are re-logged through the recorder instead, with the same
+    # bookkeeping and the same local read-back
+    prior = await _write_prior_log(
+        EvalRecorder(str(tmp_path / "prior")), _prior_samples()
+    )
+    recorder = JSONRecorder(str(tmp_path / "retry"))
+    logger = _seed_logger(recorder)
+    logger._location = await recorder.log_init(logger.eval)
+
+    await logger.seed_from_prior(prior, None, keep={(1, 1), (2, 1)}, log_images=True)
+
+    assert logger.prior_seeded
+    assert logger.samples_logged == 2
+    summaries = await logger.sample_summaries()
+    assert summaries is not None and {s.id for s in summaries} == {1, 2}
+    clean = await logger.read_prior_sample(1, 1)
+    assert clean is not None and clean.input == "q1"
+    await logger.log_start(EvalPlan())
+    assert {
+        s.id for s in await read_eval_log_sample_summaries_async(logger.location)
+    } == {1, 2}
+
+
+async def test_task_logger_seed_from_prior_in_memory_samples(tmp_path: Path) -> None:
+    # an in-memory prior log (eval_retry on a loaded EvalLog) seeds by
+    # re-logging its samples before the log starts
+    recorder = EvalRecorder(str(tmp_path))
+    logger = _seed_logger(recorder)
+    logger._location = await recorder.log_init(logger.eval)
+
+    await logger.seed_from_prior(None, _prior_samples(), keep=None, log_images=True)
+
+    assert logger.samples_logged == 3  # all four keys minus the cancelled one
+    prior = await logger.read_prior_sample(4, 1)
+    assert prior is not None and prior.input == "q4"
+    await logger.log_start(EvalPlan())
+    assert {
+        s.id for s in await read_eval_log_sample_summaries_async(logger.location)
+    } == {
+        1,
+        2,
+        3,
+        4,
+    }
+
+
+async def test_task_logger_seed_from_prior_missing_log_raises_before_any_write(
+    tmp_path: Path,
+) -> None:
+    # the attempt fails without a destination file, so its retry keeps the
+    # prior source rather than chaining to an empty newest log
+    recorder = EvalRecorder(str(tmp_path))
+    logger = _seed_logger(recorder)
+    logger._location = await recorder.log_init(logger.eval)
+
+    with pytest.raises(FileNotFoundError):
+        await logger.seed_from_prior(
+            str(tmp_path / "never-written.eval"), None, keep=None, log_images=True
+        )
+
+    assert not logger.prior_seeded
+    assert logger.samples_logged == 0
+    assert not Path(logger.location).exists()
+
+
 async def test_task_logger_log_finish_stops_stale_flush_timer(tmp_path) -> None:
     recorder = EvalRecorder(str(tmp_path))
     spec = _eval_spec()

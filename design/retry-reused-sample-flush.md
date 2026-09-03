@@ -2,6 +2,15 @@
 
 Design for [meridianlabs-ai/inspect_ai#117](https://github.com/meridianlabs-ai/inspect_ai/issues/117).
 
+> **Superseded.** The quiet pending list, the reuse-sweep countdown and the
+> settle flush described here were removed by
+> [retry-seeded-attempt-log.md](retry-seeded-attempt-log.md): reused
+> samples are no longer re-logged one by one during the attempt — the
+> attempt's log is seeded from the prior log before `log_start`, whose flush
+> carries the whole reused set. `write_through` survives as the recorder
+> path the seed's re-log fallback uses. Retained as the record of the
+> problem and the interim fix.
+
 ## Problem
 
 When a retry attempt starts, every completed sample reused from the prior

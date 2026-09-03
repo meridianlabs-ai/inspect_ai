@@ -4,7 +4,8 @@ import os
 import re
 import tempfile
 from datetime import datetime, timezone
-from typing import Literal, cast
+from pathlib import Path
+from typing import BinaryIO, Literal, cast
 from zipfile import ZipFile
 
 import pytest
@@ -38,7 +39,7 @@ from inspect_ai.log._file import (
     read_eval_log_samples,
     write_eval_log,
 )
-from inspect_ai.log._log import EvalLog, EvalSample
+from inspect_ai.log._log import EvalLog, EvalSample, EvalSpec
 from inspect_ai.model import get_model
 from inspect_ai.model._generate_config import GenerateConfig
 from inspect_ai.model._model_output import ModelOutput
@@ -1586,14 +1587,18 @@ async def test_eval_recorder_log_sample_write_through(tmp_path) -> None:
     assert summaries is not None
     assert [(s.id, s.epoch) for s in summaries] == [(1, 1)]
 
-    # pre-flush reads serve the retained event-less copy
+    # reads serve the whole sample (events included) from the local temp zip,
+    # before and after the flush
     buffered = await recorder.buffered_sample(spec, 1, 1)
     assert buffered is not None
-    assert buffered.events == []
+    assert [e.data for e in buffered.events if isinstance(e, InfoEvent)] == ["hello"]
 
-    # a flush drops the retained copy and lands the full sample on disk
+    # a flush drops the retained event-less copy and lands the sample on disk
     await recorder.flush(spec)
-    assert await recorder.buffered_sample(spec, 1, 1) is None
+    assert zip_log._streaming_samples == {}
+    buffered = await recorder.buffered_sample(spec, 1, 1)
+    assert buffered is not None
+    assert [e.data for e in buffered.events if isinstance(e, InfoEvent)] == ["hello"]
     read_back = await EvalRecorder.read_log_sample(location, 1, 1)
     assert [e.data for e in read_back.events if isinstance(e, InfoEvent)] == ["hello"]
 
@@ -1649,3 +1654,286 @@ async def test_file_recorder_read_log_sample_uuid_and_missing_args() -> None:
         sample = await FileRecorder.read_log_sample("dummy.eval", uuid="real-uuid")
         assert sample.id == 1
         assert sample.uuid == "real-uuid"
+
+
+# ---------------------------------------------------------------------------
+# EvalRecorder.log_seed: a retry attempt's log seeded from the prior log
+# (design/retry-seeded-attempt-log.md)
+# ---------------------------------------------------------------------------
+
+
+def _seed_spec(eval_id: str) -> "EvalSpec":
+    from inspect_ai.log._log import EvalConfig, EvalDataset, EvalSpec
+
+    return EvalSpec(
+        eval_id=eval_id,
+        created=datetime.now(timezone.utc).isoformat(),
+        task="seed_test",
+        model="mockllm/model",
+        dataset=EvalDataset(name="test", samples=3),
+        config=EvalConfig(),
+    )
+
+
+def _seed_sample(id: str | int, text: str, *, error: str | None = None) -> EvalSample:
+    from inspect_ai.log import EvalError
+
+    return EvalSample(
+        id=id,
+        epoch=1,
+        input=text,
+        target="target",
+        metadata={"text": text},
+        events=[InfoEvent(data=text)],
+        error=EvalError(message=error, traceback="", traceback_ansi="")
+        if error
+        else None,
+    )
+
+
+async def _write_seed_prior(
+    log_dir: Path, samples: list[EvalSample], *, finish: bool = True
+) -> str:
+    """Write a prior attempt's log; `finish=False` leaves it a started (journal-only) log."""
+    from inspect_ai.log._log import EvalPlan, EvalStats
+    from inspect_ai.log._recorders.eval import EvalRecorder
+
+    spec = _seed_spec("prior-attempt")
+    recorder = EvalRecorder(str(log_dir))
+    location = await recorder.log_init(spec, clean=True)
+    await recorder.log_start(spec, EvalPlan())
+    for sample in samples:
+        await recorder.log_sample(spec, sample)
+    if finish:
+        await recorder.log_finish(spec, "error", EvalStats(), None, None)
+    else:
+        await recorder.flush(spec)
+    return location
+
+
+async def test_eval_recorder_seed_copies_prunes_and_supersedes(tmp_path) -> None:
+    from inspect_ai.log._file import (
+        read_eval_log_async,
+        read_eval_log_sample_async,
+        read_eval_log_sample_summaries_async,
+    )
+    from inspect_ai.log._log import EvalPlan, EvalStats
+    from inspect_ai.log._recorders.eval import EvalRecorder
+
+    # sample 3 is large so pruning it leaves enough dead bytes to compact
+    big = os.urandom(200_000).hex()
+    prior = await _write_seed_prior(
+        tmp_path / "prior",
+        [
+            _seed_sample(1, "one"),
+            _seed_sample(2, "two", error="RuntimeError('boom')"),
+            _seed_sample(3, big),
+        ],
+    )
+    prior_bytes = Path(local_path(prior)).read_bytes()
+
+    spec = _seed_spec("retry-attempt")
+    recorder = EvalRecorder(str(tmp_path / "retry"))
+    location = await recorder.log_init(spec)
+    assert await recorder.log_seed(spec, prior, keep={(1, 1), (2, 1), (9, 1)})
+
+    zip_log = recorder.data[recorder._log_file_key(spec)]
+    assert zip_log._zip is not None
+    # the prior log's member bytes were copied verbatim (no end record written
+    # over them); only its central directory is rewritten, as any append is
+    prior_members_end = ZipFile(io.BytesIO(prior_bytes)).start_dir
+    zip_log._temp_file.seek(0)
+    assert zip_log._temp_file.read(prior_members_end) == prior_bytes[:prior_members_end]
+    names = set(zip_log._zip.NameToInfo)
+    assert {"samples/1_epoch_1.json", "samples/2_epoch_1.json"} <= names
+    assert "samples/3_epoch_1.json" not in names
+    assert not names & {"header.json", "summaries.json", "reductions.json"}
+    assert "_journal/start.json" not in names
+    journal = [n for n in names if n.startswith("_journal/summaries/")]
+    assert journal == ["_journal/summaries/1.json"]
+
+    summaries = await recorder.sample_summaries(spec)
+    assert summaries is not None
+    assert {s.id for s in summaries} == {1, 2}
+
+    # seeded records are served from the local zip; a pruned key is not
+    seeded = await recorder.buffered_sample(spec, 1, 1)
+    assert seeded is not None and seeded.input == "one"
+    assert [e.data for e in seeded.events if isinstance(e, InfoEvent)] == ["one"]
+    assert await recorder.buffered_sample(spec, 3, 1) is None
+
+    # the first destination write carries the prior set and this attempt's
+    # start record, not the prior attempt's finished header
+    await recorder.log_start(spec, EvalPlan())
+    await recorder.flush(spec)
+    summaries = await read_eval_log_sample_summaries_async(location)
+    assert {s.id for s in summaries} == {1, 2}
+    header = await read_eval_log_async(location, header_only=True)
+    assert header.eval.eval_id == "retry-attempt"
+    assert header.status == "started"
+
+    # a re-run supersedes the seeded record for every reader
+    await recorder.log_sample(spec, _seed_sample(2, "two again"))
+    await recorder.flush(spec)
+    rerun = await recorder.buffered_sample(spec, 2, 1)
+    assert rerun is not None and rerun.input == "two again" and rerun.error is None
+    assert (await read_eval_log_sample_async(location, 2, 1)).input == "two again"
+
+    # a successful finish compacts the dead bytes away and round-trips
+    await recorder.log_finish(spec, "success", EvalStats(), None, None)
+    with ZipFile(local_path(location)) as zf:
+        member_names = zf.namelist()
+        assert len(member_names) == len(set(member_names))
+        assert "samples/3_epoch_1.json" not in member_names
+    assert Path(local_path(location)).stat().st_size < len(prior_bytes)
+    final = await read_eval_log_async(location)
+    assert final.status == "success"
+    assert final.samples is not None
+    assert {(s.id, s.input) for s in final.samples} == {(1, "one"), (2, "two again")}
+    summaries = await read_eval_log_sample_summaries_async(location)
+    assert {s.id for s in summaries} == {1, 2}
+
+
+async def test_eval_recorder_seed_from_started_prior_reads_journal(tmp_path) -> None:
+    from inspect_ai.log._recorders.eval import EvalRecorder
+
+    prior = await _write_seed_prior(
+        tmp_path / "prior",
+        [_seed_sample(1, "one"), _seed_sample(2, "two")],
+        finish=False,
+    )
+    spec = _seed_spec("retry-attempt")
+    recorder = EvalRecorder(str(tmp_path / "retry"))
+    await recorder.log_init(spec)
+
+    assert await recorder.log_seed(spec, prior, keep=None)
+
+    summaries = await recorder.sample_summaries(spec)
+    assert summaries is not None and {s.id for s in summaries} == {1, 2}
+
+
+async def test_eval_recorder_seed_prunes_by_member_name(tmp_path) -> None:
+    # names are generated and compared, never parsed: a string id containing
+    # `_epoch_` and an int-vs-str id are handled by the same rule the sample
+    # readers use
+    from inspect_ai.log._recorders.eval import EvalRecorder
+
+    prior = await _write_seed_prior(
+        tmp_path / "prior",
+        [
+            _seed_sample("a_epoch_1", "a"),
+            _seed_sample("b", "b"),
+            _seed_sample(7, "seven"),
+        ],
+    )
+    spec = _seed_spec("retry-attempt")
+    recorder = EvalRecorder(str(tmp_path / "retry"))
+    await recorder.log_init(spec)
+
+    assert await recorder.log_seed(spec, prior, keep={("a_epoch_1", 1), ("7", 1)})
+
+    summaries = await recorder.sample_summaries(spec)
+    assert summaries is not None
+    assert {s.id for s in summaries} == {"a_epoch_1", 7}
+    zip_log = recorder.data[recorder._log_file_key(spec)]
+    assert zip_log._zip is not None
+    assert "samples/b_epoch_1.json" not in zip_log._zip.NameToInfo
+    assert await recorder.buffered_sample(spec, "a_epoch_1", 1) is not None
+
+
+async def test_eval_recorder_seed_rejects_other_format(tmp_path) -> None:
+    from inspect_ai.log._recorders.eval import EvalRecorder
+
+    spec = _seed_spec("retry-attempt")
+    recorder = EvalRecorder(str(tmp_path))
+    await recorder.log_init(spec)
+    assert not await recorder.log_seed(spec, str(tmp_path / "prior.json"), keep=None)
+
+
+async def test_eval_recorder_seed_missing_prior_raises_and_keeps_log_usable(
+    tmp_path,
+) -> None:
+    from inspect_ai.log._log import EvalPlan, EvalStats
+    from inspect_ai.log._recorders.eval import EvalRecorder
+
+    spec = _seed_spec("retry-attempt")
+    recorder = EvalRecorder(str(tmp_path))
+    location = await recorder.log_init(spec)
+
+    with pytest.raises(FileNotFoundError):
+        await recorder.log_seed(spec, str(tmp_path / "never-written.eval"), keep=None)
+    assert not Path(location).exists()
+
+    # the log is empty but intact: the attempt can still start and finish
+    await recorder.log_start(spec, EvalPlan())
+    await recorder.log_sample(spec, _seed_sample(1, "one"))
+    log = await recorder.log_finish(spec, "success", EvalStats(), None, None)
+    assert log.samples is not None and [s.id for s in log.samples] == [1]
+
+
+async def test_eval_recorder_seed_retries_transient_copy_failure(
+    tmp_path, monkeypatch
+) -> None:
+    import inspect_ai.log._recorders.eval as eval_module
+    from inspect_ai.log._recorders.eval import EvalRecorder
+
+    prior = await _write_seed_prior(tmp_path / "prior", [_seed_sample(1, "one")])
+    original = eval_module._copy_local_file
+    failures = {"n": 0}
+
+    def flaky_copy(path: str, dest: BinaryIO) -> None:
+        if failures["n"] < 2:
+            failures["n"] += 1
+            raise OSError("simulated storage failure")
+        original(path, dest)
+
+    monkeypatch.setattr(eval_module, "_copy_local_file", flaky_copy)
+    monkeypatch.setattr(eval_module, "SEED_COPY_BACKOFF_SECONDS", 0.0)
+
+    spec = _seed_spec("retry-attempt")
+    recorder = EvalRecorder(str(tmp_path / "retry"))
+    await recorder.log_init(spec)
+    assert await recorder.log_seed(spec, prior, keep=None)
+    assert failures["n"] == 2
+    assert await recorder.buffered_sample(spec, 1, 1) is not None
+
+    # a persistent failure surfaces after the retries
+    failures["n"] = -10
+    spec2 = _seed_spec("retry-attempt-2")
+    await recorder.log_init(spec2)
+    with pytest.raises(OSError, match="simulated storage failure"):
+        await recorder.log_seed(spec2, prior, keep=None)
+
+
+async def test_eval_recorder_seed_preserves_config_updates_and_discard(
+    tmp_path,
+) -> None:
+    from inspect_ai.log._config_update import ConfigUpdate, ConfigValueChange
+    from inspect_ai.log._file import read_eval_log_async
+    from inspect_ai.log._log import EvalPlan
+    from inspect_ai.log._recorders.eval import EvalRecorder
+
+    prior = await _write_seed_prior(tmp_path / "prior", [_seed_sample(1, "one")])
+    spec = _seed_spec("retry-attempt")
+    recorder = EvalRecorder(str(tmp_path / "retry"))
+    location = await recorder.log_init(spec)
+    # a process-scoped retune recorded between init and the seed must survive
+    # the seed's rewrite of the temp zip
+    update = ConfigUpdate(
+        changes=[ConfigValueChange(config="eval", name="time_limit", value=10)],
+        scope="process",
+        provenance=ProvenanceData(author="test"),
+    )
+    await recorder.log_config_update(spec, update)
+
+    assert await recorder.log_seed(spec, prior, keep=None)
+    await recorder.log_start(spec, EvalPlan())
+    await recorder.flush(spec)
+    header = await read_eval_log_async(location, header_only=True)
+    assert header.config_updates is not None
+    assert [c.name for u in header.config_updates for c in u.changes] == ["time_limit"]
+
+    # the seeded log's destination is this attempt's own: discard removes it
+    await recorder.log_discard(spec)
+    assert not Path(location).exists()
+    assert Path(local_path(prior)).exists()
