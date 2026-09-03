@@ -33,6 +33,7 @@ activity.
 
 from __future__ import annotations
 
+import math
 import time
 from collections import defaultdict
 from functools import partial
@@ -324,12 +325,14 @@ async def current_sample_summaries(
 
     Merged and deduped by ``(sample_id, epoch)``; a terminal record
     (completed / error) supersedes a running one, which supersedes a
-    pending one — except a terminal record that predates the running
-    sample's start, which is a prior attempt's record awaiting its re-run
-    (a retry attempt's log is seeded with the prior attempt's samples, see
-    ``TaskLogger.seed_from_prior``), not a finish of the running one.
-    Sorted running → terminal → pending. Returns an empty list when the
-    eval isn't in this process.
+    pending one — except a prior attempt's record awaiting its re-run (a
+    retry attempt's log is seeded with the prior attempt's samples, see
+    ``TaskLogger.seed_from_prior``): one that predates the running sample's
+    start is not a finish of the running one, and an errored or cancelled
+    one that predates the attempt's registration with no running row yet
+    is a pending re-run, not this attempt's error (see
+    :func:`_is_prior_record_awaiting_rerun`). Sorted running → terminal →
+    pending. Returns an empty list when the eval isn't in this process.
 
     Each entry has: ``sample_id``, ``epoch``, ``status`` (a
     :data:`SAMPLE_STATUSES` member), ``started_at``, ``completed_at``,
@@ -388,12 +391,21 @@ async def current_sample_summaries(
     # its key on the same loop and its fresh record is in `completed` — a
     # pre-await snapshot would render that finished sample as a phantom
     # `queued` row for one response.
+    from inspect_ai._control.eval_state import get_eval_state
+
     requeue_pending = _pending_requeue_keys(eval_id)
+    state = get_eval_state(eval_id)
+    registered_at = state.registered_at if state is not None else None
+    planned_ids = set(state.sample_ids) if state is not None else set()
     for summary in completed:
         key = (summary["sample_id"], summary["epoch"])
         if (str(summary["sample_id"]), summary["epoch"]) in requeue_pending:
             if key not in by_key:
                 by_key[key] = _requeued_summary(summary)
+            continue
+        if _is_prior_record_awaiting_rerun(summary, registered_at, planned_ids):
+            if key not in by_key:
+                by_key[key] = _pending_summary(summary["sample_id"], summary["epoch"])
             continue
         _merge(summary)
 
@@ -535,6 +547,39 @@ def _add_pending_samples(
             key = (sample_id, epoch)
             if key not in by_key:
                 by_key[key] = _pending_summary(sample_id, epoch)
+
+
+def _is_prior_record_awaiting_rerun(
+    summary: dict[str, Any],
+    registered_at: float | None,
+    planned_ids: set[Any],
+) -> bool:
+    """Whether a terminal record is a seeded prior attempt's whose re-run is still to come.
+
+    A retry attempt's log is seeded with the prior attempt's records before
+    the attempt registers (``TaskLogger.seed_from_prior``), so a record that
+    completed before ``EvalState.registered_at`` is the prior's. Its clean
+    records are this attempt's results (reused as-is) and stay terminal; its
+    errored and cancelled ones are re-run. Until such a re-run has a running
+    row, the sample is pending — as it read before logs were seeded — not
+    the prior attempt's error: rendering the error would put a queued sample
+    in ``inspect ctl sample errors`` triage and over-count ``error`` in the
+    histogram. Only a still-planned id qualifies: a finished eval drops its
+    plan (``_maybe_mark_finished``), and its seeded errors then are the
+    samples' final records (a drain abandoned their re-runs).
+
+    The stamp is compared floored to the second so a record of this attempt
+    completing in the registration second (a second-precision
+    ``completed_at``) is never taken for the prior's; a prior record from
+    that same second reads as this attempt's error instead, the pre-seed
+    rendering, for that sub-second window only.
+    """
+    if registered_at is None or summary["status"] not in ("error", "cancelled"):
+        return False
+    completed_at = summary["completed_at"]
+    if completed_at is None or completed_at >= math.floor(registered_at):
+        return False
+    return summary["sample_id"] in planned_ids
 
 
 def _pending_requeue_keys(eval_id: str) -> frozenset[SampleKey]:

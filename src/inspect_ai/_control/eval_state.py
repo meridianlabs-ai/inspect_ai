@@ -312,6 +312,16 @@ class EvalState:
     listings) correctly see the eval as running. Cleared by
     :func:`finalize_eval`, the task's single true finish point."""
 
+    registered_at: float | None = None
+    """Unix timestamp of this attempt's registration, just before its first
+    sample dispatch (see :func:`register_eval`). ``None`` for reused/synthetic
+    evals. A retry attempt's log is seeded with the prior attempt's sample
+    records before it registers, so the per-sample listing uses this to tell
+    a seeded prior record (completed before this stamp) from one of this
+    attempt's own — the prior's errored samples are re-run and read as
+    pending until they are. Distinct from :attr:`started_at`, the first
+    *sample's* start, which is unknown until a sample has started."""
+
     started_at: float | None = None
     """Earliest observed sample-start time, tracked as a running minimum.
 
@@ -453,12 +463,17 @@ def register_eval(
     will_retry: bool = False,
     task_cancel: "TaskCancel | None" = None,
     dynamic: bool = False,
+    registered_at: float | None = None,
 ) -> EvalState:
     """Initialize tracking for a new eval.
 
     Idempotent on ``eval_id`` — re-registering an existing eval (eg. on
     retry, which mints a fresh ``eval_id`` via ``TaskLogger.reinit``) returns
     the existing state without resetting its counters.
+
+    ``registered_at`` is the attempt's registration time (see
+    :attr:`EvalState.registered_at`); the task runner passes the current
+    time, callers registering an eval that will not run samples leave it.
     """
     with _lock:
         existing = _eval_states.get(eval_id)
@@ -482,6 +497,7 @@ def register_eval(
             will_retry=will_retry,
             task_cancel=task_cancel,
             dynamic=dynamic,
+            registered_at=registered_at,
         )
         _eval_states[eval_id] = state
         # A zero-sample eval (``total == 0``, eg. a limit past the dataset) is

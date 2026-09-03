@@ -870,10 +870,17 @@ async def run_task_retry_attempts(
                         # samples are reused on retry (mirrors legacy eval_set
                         # retry). An attempt whose log never finished — its
                         # prior-log seed failed, or a log write did — has
-                        # nothing newer to offer: the retry keeps the source
-                        # this attempt ran with (the same prior log), rather
-                        # than a source over an absent or partial file that
-                        # reuses nothing
+                        # left either no destination file or a partial one
+                        # that reinit() below discards, so the retry keeps
+                        # the source this attempt ran with (the same prior
+                        # log). Accepted cost: a partial file (log_finish
+                        # failed after earlier flushes) also held this
+                        # attempt's flushed live completions, which are
+                        # re-run rather than reused. Preferring it would
+                        # need a read-back probe of a remote file on this
+                        # dispatcher loop, against storage that just failed,
+                        # to recover work that is only re-run, never lost
+                        # (the prior log survives until retry cleanup).
                         failed_location = options.logger.location
                         sample_source: EvalSampleSource | None
                         if options.logger.finished:

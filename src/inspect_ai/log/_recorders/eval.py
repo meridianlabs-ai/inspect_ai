@@ -1010,9 +1010,6 @@ class ZipLogFile:
         # (a prior-log seed's copied records and write-through re-logs) rather
         # than deferring to the destination log
         self._local_sample_names: set[str] = set()
-        # dead-byte accounting for `compact`: bytes of prior-log members
-        # pruned from the central directory at seed time
-        self._pruned_bytes = 0
         self._etag: str | None = None
 
     async def init(
@@ -1473,7 +1470,7 @@ class ZipLogFile:
                     if _sample_filename(s.id, s.epoch) in keep_names
                 ]
             kept_names = {_sample_filename(s.id, s.epoch) for s in summaries}
-            self._pruned_bytes = self._prune_prior_members(kept_names)
+            self._prune_prior_members(kept_names)
 
             # the prior's journal is pruned above (its batched files would list
             # pruned keys to in-progress readers), so the kept summaries become
@@ -1489,7 +1486,7 @@ class ZipLogFile:
             self._rejournal_config_updates()
             self._local_sample_names.update(kept_names)
 
-    def _prune_prior_members(self, kept_sample_names: set[str]) -> int:
+    def _prune_prior_members(self, kept_sample_names: set[str]) -> None:
         """Drop the prior log's superseded members from the central directory.
 
         Removes its finished-log metadata (``header.json``, ``summaries.json``,
@@ -1497,8 +1494,8 @@ class ZipLogFile:
         summaries) — an in-progress read of this log would otherwise return
         the prior attempt's header and eval_id — and every sample member not
         in ``kept_sample_names``. Bytes stay in the file unreferenced (the
-        idiom ``_replace_eval_header_in_place`` uses); returns their
-        compressed size for the compaction heuristic. Caller holds ``_lock``.
+        idiom ``_replace_eval_header_in_place`` uses) until :meth:`compact`
+        measures and reclaims them. Caller holds ``_lock``.
         """
         assert self._zip is not None
         metadata = {
@@ -1523,7 +1520,6 @@ class ZipLogFile:
         ]
         for info in pruned:
             self._zip.NameToInfo.pop(info.filename, None)
-        return sum(info.compress_size for info in pruned)
 
     def _rejournal_config_updates(self) -> None:
         """Re-append the config updates recorded so far as journal members 1..n.
@@ -1546,14 +1542,18 @@ class ZipLogFile:
     async def compact(self) -> None:
         """Rewrite the temp zip without dead bytes when they are worth reclaiming.
 
-        Dead bytes are members pruned by a prior-log seed plus members
-        superseded by a later write under the same name (a re-run of a
-        seeded or requeued sample). Rewriting decompresses and recompresses
-        every live member, so it runs only when the dead bytes exceed
-        ``COMPACT_DEAD_BYTES_FRACTION`` of the file — a fresh eval never
-        qualifies — and only at a successful finish, the log's last write.
-        Local CPU in a worker thread; a failure warns and leaves the
-        uncompacted (still correct) zip in place.
+        Dead bytes are every byte of the member area no live member accounts
+        for: members pruned by a prior-log seed, members superseded by a
+        later write under the same name (a re-run of a seeded or requeued
+        sample), and the same left behind in the prior log by *its* seed and
+        re-runs, which its non-success finish never compacted and the byte
+        copy carried along (see :meth:`_should_compact`). Rewriting
+        decompresses and recompresses every live member, so it runs only
+        when the dead bytes exceed ``COMPACT_DEAD_BYTES_FRACTION`` of the
+        file — a fresh eval never qualifies — and only at a successful
+        finish, the log's last write. Local CPU in a worker thread; a
+        failure warns and leaves the uncompacted (still correct) zip in
+        place.
         """
         async with self._lock:
             assert self._zip is not None
@@ -1570,21 +1570,32 @@ class ZipLogFile:
             else:
                 self._temp_file.close()
                 self._temp_file = compacted
-                self._pruned_bytes = 0
             finally:
                 self._open()
 
     def _should_compact(self) -> bool:
+        """Whether dead bytes are at least ``COMPACT_DEAD_BYTES_FRACTION`` of the member area.
+
+        Measured from the file rather than tracked per prune or supersede,
+        so dead bytes inherited from the prior log count too: the member
+        area runs from offset 0 to ``start_dir`` (where the central directory
+        is written at close), and whatever the live members' local headers
+        and compressed data don't cover is dead. A local header is
+        reconstructed as ``FileHeader(zip64=True)``: exact for the members
+        ``_zip_open_write`` streams with ``force_zip64``, and 20 bytes over
+        for ``writestr`` members, so dead bytes are if anything
+        under-counted (a fresh eval measures none).
+        """
         assert self._zip is not None
-        live = {id(info) for info in self._zip.NameToInfo.values()}
-        superseded = sum(
-            info.compress_size for info in self._zip.filelist if id(info) not in live
+        member_area = self._zip.start_dir
+        live = sum(
+            len(info.FileHeader(zip64=True)) + info.compress_size
+            for info in self._zip.NameToInfo.values()
         )
-        dead = self._pruned_bytes + superseded
-        if dead == 0:
+        dead = member_area - live
+        if dead <= 0:
             return False
-        size = os.fstat(self._temp_file.fileno()).st_size
-        return dead >= size * COMPACT_DEAD_BYTES_FRACTION
+        return dead >= member_area * COMPACT_DEAD_BYTES_FRACTION
 
     # cleanup zip file if we didn't in normal course
     def __del__(self) -> None:

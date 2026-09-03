@@ -355,6 +355,98 @@ async def test_seeded_prior_record_does_not_hide_running_rerun(monkeypatch) -> N
             clear_all_eval_states()
 
 
+async def test_seeded_prior_error_awaiting_rerun_reads_pending(monkeypatch) -> None:
+    """A seeded prior attempt's errored record with no running row is a pending re-run.
+
+    Before the re-run has an ``ActiveSample`` the seeded record is the only
+    row for its key. While the attempt is registered and the id still
+    planned, the sample reads ``pending`` (absent from the errors triage,
+    counted as pending) rather than as the prior attempt's ``error``. A
+    record that postdates the registration is this attempt's own error; so
+    is any record when the attempt carries no registration stamp, or once
+    the plan is cleared (the eval finished with the re-run abandoned). A
+    clean seeded record is the attempt's result and stays ``completed``.
+    """
+    from datetime import datetime, timezone
+
+    from inspect_ai._control.eval_state import (
+        clear_all_eval_states,
+        get_eval_state,
+        register_eval,
+    )
+    from inspect_ai._control.state import (
+        current_sample_listing,
+        current_sample_summaries,
+    )
+
+    monkeypatch.setattr("inspect_ai.log._samples.active_samples", lambda: [])
+    registered_at = 2000.0
+
+    def iso(ts: float) -> str:
+        return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+    def record(id: int, error: str | None, completed_at: float) -> EvalSampleSummary:
+        return EvalSampleSummary(
+            id=id,
+            epoch=1,
+            input="i",
+            target="t",
+            error=error,
+            completed=error is None,
+            started_at=iso(completed_at - 10.0),
+            completed_at=iso(completed_at),
+        )
+
+    prior_error = record(1, _GENUINE, registered_at - 50.0)
+    own_error = record(1, _GENUINE, registered_at + 50.0)
+    prior_clean = record(2, None, registered_at - 50.0)
+
+    async def rows_for(
+        errored: EvalSampleSummary, stamp: float | None, *, finished: bool = False
+    ) -> tuple[dict[Any, dict[str, Any]], list[Any], dict[str, int]]:
+        try:
+            register_eval(
+                "e-queued",
+                2,
+                live=cast("LiveEvalData", _FakeLive([errored, prior_clean])),
+                sample_ids=[1, 2],
+                epochs=1,
+                registered_at=stamp,
+            )
+            if finished:
+                state = get_eval_state("e-queued")
+                assert state is not None
+                state.sample_ids = []
+            rows = await current_sample_summaries("e-queued")
+            errors = await current_sample_summaries("e-queued", sample_filter="errors")
+            listing = await current_sample_listing("e-queued")
+        finally:
+            clear_all_eval_states()
+        return (
+            {r["sample_id"]: r for r in rows},
+            [r["sample_id"] for r in errors],
+            listing.counts,
+        )
+
+    by_id, errors, counts = await rows_for(prior_error, registered_at)
+    assert by_id[1]["status"] == "pending"
+    assert by_id[1]["error"] is None and by_id[1]["retries"] is None
+    assert by_id[2]["status"] == "completed"
+    assert errors == []
+    assert counts["pending"] == 1 and counts["error"] == 0
+
+    for errored, stamp, finished in (
+        (own_error, registered_at, False),
+        (prior_error, None, False),
+        (prior_error, registered_at, True),
+    ):
+        by_id, errors, counts = await rows_for(errored, stamp, finished=finished)
+        assert by_id[1]["status"] == "error"
+        assert by_id[2]["status"] == "completed"
+        assert errors == [1]
+        assert counts["error"] == 1 and counts["pending"] == 0
+
+
 async def test_listing_withholds_error_message_unless_content(monkeypatch) -> None:
     """The listing's error message (agent-influenced free text) is gated.
 

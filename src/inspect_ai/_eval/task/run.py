@@ -1096,6 +1096,7 @@ async def task_run(options: TaskRunOptions, task_cancel: TaskCancel | None) -> E
                 # counters reaching total must not read as "finished" (e.g.
                 # while blocked in next_samples() with an empty seed)
                 dynamic=sample_feed is not None,
+                registered_at=time.time(),
             )
 
             # call hook (after the retry-abandon check above: every task

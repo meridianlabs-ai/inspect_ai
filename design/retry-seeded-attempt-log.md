@@ -643,18 +643,50 @@ running sample started; a record that completed earlier is the prior
 attempt's, and the live row stays. `sample_error_detail` already reads the
 running sample first, so it needs no change.
 
+The same seeded record is wrong before the re-run starts, too: with no
+running row for the key, the prior attempt's `error` (or cancellation) is
+the only row, so a sample merely waiting its turn read as `error`, counted
+as `error` in the histogram, and appeared in `inspect ctl sample errors`
+triage — where before seeding it read `pending` (no errored prior record
+was in the attempt's log until the carry-forward at teardown). The
+attempt's `EvalState` therefore records `registered_at` (stamped by
+`task_run` at `register_eval`, after the seed), and the listing renders an
+errored or cancelled record that completed before that stamp, whose id is
+still planned (`sample_ids`, cleared when the eval finishes) and whose key
+has no running row, as `pending` (`_is_prior_record_awaiting_rerun`). A
+clean seeded record is the attempt's result and stays `completed`. The
+stamp is floored to the second, so a record of this attempt completing in
+the registration second is never taken for the prior's; a prior record from
+that same second reads as `error` (the pre-seed rendering) for that window.
+`EvalState.started_at` is not the anchor: it is the first *sample's* start,
+unknown until a sample starts or a control poll folds one in, which is
+exactly the window in question. Once the eval finishes, `sample_ids` is
+empty and a seeded error whose re-run a drain abandoned reads as the
+sample's final record, as it should.
+
 ### Compaction at successful finish
 
 In `EvalRecorder.log_finish` when `status == "success"` and dead bytes
-(pruned prior members plus members superseded under the same name) exceed
-`COMPACT_DEAD_BYTES_FRACTION` (10%) of the file: rewrite the temp zip
-keeping only the referenced members, in a worker thread (local file,
-CPU-bound), using the decompress+recompress loop from
+exceed `COMPACT_DEAD_BYTES_FRACTION` (10%) of the member area: rewrite the
+temp zip keeping only the referenced members, in a worker thread (local
+file, CPU-bound), using the decompress+recompress loop from
 `_rewrite_eval_zip_with_new_header` (`zipfile` has no documented raw-copy
 surface). Then write `summaries.json`/`reductions.json`/`header.json` and
 flush as today. A fresh eval has no dead bytes and skips this; a retry that
 re-ran only a few small samples tolerates their stale copies rather than
 paying a full rewrite for them.
+
+Dead bytes are *measured*, not tracked: the member area (offset 0 to the
+`ZipFile`'s `start_dir`, where the central directory is written at close)
+minus the live members' local headers and compressed data. Tracking only
+what this attempt pruned and superseded would miss what the prior log
+carried: an errored attempt never compacts, so its own pruned and
+superseded bytes ride along in every later attempt's byte copy, unreferenced
+by the copied central directory. A multi-attempt chain would then
+under-trigger compaction at the final success. The local header is
+reconstructed as `FileHeader(zip64=True)`, exact for the streamed members
+(`force_zip64`) and 20 bytes over for `writestr` members, so the measure
+errs toward *not* compacting.
 
 ### `run_task_retry_attempts`: keep the prior source when the attempt wrote no log
 
@@ -669,6 +701,15 @@ to no reuse; this is the E change and A needs it for the seed-failure path
 an errored `EvalLog` without a file, the same path a failed `log_start`
 flush takes). eval_set with `retry_immediate=False` needs nothing: no file
 means the next pass selects the older log.
+
+The partial-file case gives something up (trade-off 6): a seeded attempt
+whose `log_finish` failed after earlier flushes has a destination holding
+the prior set *plus this attempt's flushed live completions*, and falling
+back to the prior source re-runs those completions where, before this
+change, they were reused from the partial log. Preferring the partial file
+would need a read-back probe of a (possibly remote) file on the dispatcher's
+loop, against storage that has just failed, to recover work that is only
+re-run, never lost. Not worth it.
 
 `TaskLogger.reinit` then releases what the unfinished attempt left behind,
 as `TaskLogger.discard` does for an abandoned attempt: `log_finish` never
@@ -729,11 +770,20 @@ warning names the prior log and the error.
    rule (discard and write nothing). The download streams in constant
    memory only on S3 under asyncio and for local files; other remote
    backends, and S3 under trio, buffer the whole prior log in memory, as
-   `read_log` does for them today (see step 1 of the mechanism).
+   `read_log` does for them today (see step 1 of the mechanism). For the
+   non-S3 remote backends (GCS, Azure) that buffered read is also a
+   synchronous fsspec read *on the event loop*: for the whole download,
+   every sibling task's samples and the control server stall, where the
+   sweep's per-sample range reads blocked in small slices interleaved with
+   other work. No cheap mitigation exists — `to_thread` over a remote fsspec
+   filesystem is ruled out (AGENTS.md) and no async GCS/Azure path exists —
+   so this is a known limit of seeding from those backends.
 2. **Dead bytes between attempts.** A non-success attempt's log carries the
-   prior's superseded metadata and, for re-run samples, their prior records.
-   Bounded by the errored/invalidated set per attempt; reclaimed by
-   compaction at the successful finish; the intermediate logs are removed by
+   prior's superseded metadata and, for re-run samples, their prior records,
+   plus whatever dead bytes the prior log itself carried (its non-success
+   finish never compacted). Bounded by the errored/invalidated set per
+   attempt; reclaimed by compaction at the successful finish, which measures
+   the inherited dead bytes too; the intermediate logs are removed by
    `retry_cleanup` anyway.
 3. **`log_images=False` on a retry of a `log_images=True` prior log keeps the
    prior samples' images**: they are copied as bytes, not condensed. Today's
@@ -747,6 +797,12 @@ warning names the prior log and the error.
    compaction: with no upfront plan there is nothing to prune against.
    Harmless (never re-injected keys are never consulted) and cleaned at the
    successful finish.
+6. **A `log_finish` failure after earlier flushes re-runs that attempt's
+   live completions.** The retry keeps the prior source rather than probing
+   the partial destination (see the `run_task_retry_attempts` section).
+   Needs a storage failure at finish; the cost is re-running rather than
+   losing those samples (the prior log survives until retry cleanup), and
+   the partial file may well be unreadable in the same outage.
 
 ## Edge cases
 
@@ -802,7 +858,8 @@ Unit (`tests/log/test_task_log.py` and a recorder test module):
   the local zip; `start()` after seed makes an in-progress read return the
   *new* start record, not the prior header; a re-run's completion supersedes
   the seeded member for every reader; compaction removes dead bytes and the
-  compacted log round-trips through `read_eval_log`; a missing prior raises
+  compacted log round-trips through `read_eval_log`, including dead bytes
+  inherited from an errored prior's own seed; a missing prior raises
   and leaves the log usable, a transient copy failure is retried; config
   updates journaled before the seed survive it; `discard()` after a
   prior-log seed removes the attempt's destination (the
@@ -820,6 +877,12 @@ Unit (`tests/log/test_task_log.py` and a recorder test module):
   raises before any destination write; `eval_log_sample_source` sets `seed`
   only when the eligibility checks pass (shuffled-without-ids and
   size-mismatch priors yield `None`) (`tests/test_eval.py`).
+- Control channel (`tests/_control/test_state.py`): a seeded prior errored
+  record never hides the sample's live re-run row, and with no running row
+  reads `pending` (absent from the errors triage) while the attempt is
+  registered and the id planned — `error` when the record postdates the
+  registration, when the attempt has no `registered_at`, or once the plan
+  is cleared.
 
 Eval-level (`tests/test_eval_set.py`):
 

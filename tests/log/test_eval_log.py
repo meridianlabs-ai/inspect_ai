@@ -1915,6 +1915,50 @@ async def test_eval_recorder_compacts_superseded_members(tmp_path) -> None:
     assert final.samples is not None and [s.input for s in final.samples] == ["small"]
 
 
+async def test_eval_recorder_compacts_dead_bytes_inherited_from_prior(
+    tmp_path,
+) -> None:
+    # attempt 2 seeds from attempt 1, prunes its large sample and errors: an
+    # errored finish never compacts, so the pruned bytes ride along into
+    # attempt 3's byte copy, unreferenced by the copied central directory.
+    # attempt 3 prunes and supersedes no sample of its own, yet its successful
+    # finish must measure the inherited dead bytes and reclaim them
+    from inspect_ai.log._file import read_eval_log_async
+    from inspect_ai.log._log import EvalPlan, EvalStats
+    from inspect_ai.log._recorders.eval import EvalRecorder
+
+    first = await _write_seed_prior(
+        tmp_path / "first",
+        [
+            _seed_sample(1, "one"),
+            _seed_sample(2, "two", error="RuntimeError('boom')"),
+            _seed_sample(3, os.urandom(200_000).hex()),
+        ],
+    )
+
+    second_spec = _seed_spec("second-attempt")
+    second_recorder = EvalRecorder(str(tmp_path / "second"))
+    second = await second_recorder.log_init(second_spec)
+    await second_recorder.log_seed(second_spec, first, keep={(1, 1), (2, 1)})
+    await second_recorder.log_start(second_spec, EvalPlan())
+    await second_recorder.log_finish(second_spec, "error", EvalStats(), None, None)
+    second_size = Path(local_path(second)).stat().st_size
+    assert second_size > 150_000
+
+    third_spec = _seed_spec("third-attempt")
+    third_recorder = EvalRecorder(str(tmp_path / "third"))
+    third = await third_recorder.log_init(third_spec)
+    await third_recorder.log_seed(third_spec, second, keep={(1, 1), (2, 1)})
+    await third_recorder.log_start(third_spec, EvalPlan())
+    await third_recorder.log_finish(third_spec, "success", EvalStats(), None, None)
+
+    assert Path(local_path(third)).stat().st_size < 50_000
+    final = await read_eval_log_async(third)
+    assert final.status == "success"
+    assert final.samples is not None
+    assert {(s.id, s.input) for s in final.samples} == {(1, "one"), (2, "two")}
+
+
 async def test_json_recorder_relog_supersedes_same_key(tmp_path) -> None:
     # a re-log of the same (id, epoch) — a seeded errored record's re-run, or
     # a requeue — replaces the earlier record rather than listing it twice,
