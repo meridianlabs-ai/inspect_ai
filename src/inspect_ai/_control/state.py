@@ -572,6 +572,12 @@ def _is_prior_record_awaiting_rerun(
     plan (``_maybe_mark_finished``), and its seeded errors then are the
     samples' final records (a drain abandoned their re-runs).
 
+    Known exception: a prior record that is clean but *invalidated* is also
+    re-run (``eval_log_sample_source``'s ``classify`` reuses only records
+    with neither error nor invalidation), yet summaries carry no
+    invalidation marker, so it reads as ``completed`` here until its re-run
+    has a running row.
+
     A sample's ``completed_at`` is a full ``datetime.now()`` stamp (only the
     eval-level stats are recorded to the second), so the comparison against
     the registration stamp is exact: this attempt's own records all complete

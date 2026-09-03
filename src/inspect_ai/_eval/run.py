@@ -876,11 +876,14 @@ async def run_task_retry_attempts(
                         # log). Accepted cost: a partial file (log_finish
                         # failed after earlier flushes) also held this
                         # attempt's flushed live completions, which are
-                        # re-run rather than reused. Preferring it would
-                        # need a read-back probe of a remote file on this
-                        # dispatcher loop, against storage that just failed,
-                        # to recover work that is only re-run, never lost
-                        # (the prior log survives until retry cleanup).
+                        # re-run rather than reused. Preferring it means
+                        # keeping it, and a kept `started` destination is
+                        # the stray log discard exists to remove: the
+                        # retry-cleanup sweep never deletes `started` logs,
+                        # so it would outlive the run, and by mtime it
+                        # would stand as the task's latest log should every
+                        # later attempt fail. The work is only re-run, never
+                        # lost (the prior log survives until retry cleanup).
                         failed_location = options.logger.location
                         sample_source: EvalSampleSource | None
                         if options.logger.finished:

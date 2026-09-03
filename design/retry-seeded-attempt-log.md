@@ -708,10 +708,16 @@ The partial-file case gives something up (trade-off 6): a seeded attempt
 whose `log_finish` failed after earlier flushes has a destination holding
 the prior set *plus this attempt's flushed live completions*, and falling
 back to the prior source re-runs those completions where, before this
-change, they were reused from the partial log. Preferring the partial file
-would need a read-back probe of a (possibly remote) file on the dispatcher's
-loop, against storage that has just failed, to recover work that is only
-re-run, never lost. Not worth it.
+change, they were reused from the partial log. Whether a snapshot landed is
+known without a probe (`ZipLogFile.destination_written`), but preferring the
+partial file means keeping it, and a kept `started` destination is the stray
+log `discard` exists to remove: the retry-cleanup sweep never deletes
+`started` logs, so it would outlive the run, and by mtime it would stand as
+the task's latest log should every later attempt fail (the very selection
+problem noted under `TaskLogger.discard`). Finalizing its header instead
+would be another write to storage that has just failed, as would the next
+attempt's seed download from it. All to recover work that is only re-run,
+never lost. Not worth it.
 
 `TaskLogger.reinit` then releases what the unfinished attempt left behind,
 as `TaskLogger.discard` does for an abandoned attempt: `log_finish` never
@@ -800,11 +806,13 @@ warning names the prior log and the error.
    Harmless (never re-injected keys are never consulted) and cleaned at the
    successful finish.
 6. **A `log_finish` failure after earlier flushes re-runs that attempt's
-   live completions.** The retry keeps the prior source rather than probing
-   the partial destination (see the `run_task_retry_attempts` section).
-   Needs a storage failure at finish; the cost is re-running rather than
-   losing those samples (the prior log survives until retry cleanup), and
-   the partial file may well be unreadable in the same outage.
+   live completions.** The retry keeps the prior source and discards the
+   partial destination rather than keeping a `started` log around as its
+   source (see the `run_task_retry_attempts` section). Needs a storage
+   failure at finish; the cost is re-running rather than losing those
+   samples (the prior log survives until retry cleanup), and the partial
+   file may well be unreadable in the same outage. The CHANGELOG states
+   the re-run cost alongside the stray-log fix.
 
 ## Edge cases
 
