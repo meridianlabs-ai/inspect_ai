@@ -654,10 +654,12 @@ attempt's `EvalState` therefore records `registered_at` (stamped by
 errored or cancelled record that completed before that stamp, whose id is
 still planned (`sample_ids`, cleared when the eval finishes) and whose key
 has no running row, as `pending` (`_is_prior_record_awaiting_rerun`). A
-clean seeded record is the attempt's result and stays `completed`. The
-stamp is floored to the second, so a record of this attempt completing in
-the registration second is never taken for the prior's; a prior record from
-that same second reads as `error` (the pre-seed rendering) for that window.
+clean seeded record is the attempt's result and stays `completed`. Both
+comparisons are exact: a sample's `completed_at` is a full `datetime.now()`
+stamp (only the eval-level `EvalStats` are recorded to the second), so
+neither side is floored — flooring would let a prior record from the same
+second as the re-run's start hide the live row, and a prior record from the
+registration second read as this attempt's `error`.
 `EvalState.started_at` is not the anchor: it is the first *sample's* start,
 unknown until a sample starts or a control poll folds one in, which is
 exactly the window in question. Once the eval finishes, `sample_ids` is

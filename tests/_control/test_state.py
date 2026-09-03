@@ -7,7 +7,6 @@ cancellation error. Those cancellations must not render as ``error`` — a
 sample that will be retried is ``pending``; one that won't is ``cancelled``.
 """
 
-import math
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from inspect_ai._control.state import _summary_from_eval_sample_summary
@@ -292,10 +291,10 @@ async def test_seeded_prior_record_does_not_hide_running_rerun(monkeypatch) -> N
     (``TaskLogger.seed_from_prior``), so while a sample that errored last
     attempt re-runs, the recorder holds its prior ``error`` record alongside
     the running ``ActiveSample``. That record completed before the re-run
-    started, so the running row wins. A record completed after the running
-    row started (the sample finished between the two reads) still supersedes,
-    including one whose second-precision ``completed_at`` falls in the same
-    wall-clock second as the fractional live start.
+    started, so the running row wins — including one that completed within
+    the same wall-clock second as the live start (a fast task-level retry).
+    A record completed after the running row started (the sample finished
+    between the two reads) still supersedes, however narrowly.
     """
     from datetime import datetime, timezone
     from unittest.mock import MagicMock
@@ -341,16 +340,20 @@ async def test_seeded_prior_record_does_not_hide_running_rerun(monkeypatch) -> N
         started_at=iso(running_since),
         completed_at=iso(running_since + 10.0),
     )
-    # Finished within the second it started: `iso_now()` records
-    # `completed_at` to the second, so the stamp (1000) precedes the
-    # fractional live start (1000.7) yet must still supersede it.
-    same_second = fresh.model_copy(
-        update={"completed_at": iso(math.floor(running_since))}
+    # Sample stamps are sub-second, so the same wall-clock second resolves
+    # exactly: a prior record from just before the live start stays the
+    # prior's, and a fresh record from just after it supersedes.
+    prior_same_second = prior.model_copy(
+        update={"completed_at": iso(running_since - 0.3)}
+    )
+    fresh_same_second = fresh.model_copy(
+        update={"completed_at": iso(running_since + 0.2)}
     )
     for completed, expected in (
         (prior, "running"),
+        (prior_same_second, "running"),
         (fresh, "completed"),
-        (same_second, "completed"),
+        (fresh_same_second, "completed"),
     ):
         try:
             register_eval(
@@ -393,7 +396,7 @@ async def test_seeded_prior_error_awaiting_rerun_reads_pending(monkeypatch) -> N
     )
 
     monkeypatch.setattr("inspect_ai.log._samples.active_samples", lambda: [])
-    registered_at = 2000.0
+    registered_at = 2000.4
 
     def iso(ts: float) -> str:
         return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
@@ -411,7 +414,11 @@ async def test_seeded_prior_error_awaiting_rerun_reads_pending(monkeypatch) -> N
         )
 
     prior_error = record(1, _GENUINE, registered_at - 50.0)
+    # a fast retry seeds and registers within one wall-clock second of the
+    # prior attempt's error; the sub-second stamps still order them exactly
+    prior_error_same_second = record(1, _GENUINE, registered_at - 0.3)
     own_error = record(1, _GENUINE, registered_at + 50.0)
+    own_error_same_second = record(1, _GENUINE, registered_at + 0.1)
     prior_clean = record(2, None, registered_at - 50.0)
 
     async def rows_for(
@@ -441,15 +448,17 @@ async def test_seeded_prior_error_awaiting_rerun_reads_pending(monkeypatch) -> N
             listing.counts,
         )
 
-    by_id, errors, counts = await rows_for(prior_error, registered_at)
-    assert by_id[1]["status"] == "pending"
-    assert by_id[1]["error"] is None and by_id[1]["retries"] is None
-    assert by_id[2]["status"] == "completed"
-    assert errors == []
-    assert counts["pending"] == 1 and counts["error"] == 0
+    for errored in (prior_error, prior_error_same_second):
+        by_id, errors, counts = await rows_for(errored, registered_at)
+        assert by_id[1]["status"] == "pending"
+        assert by_id[1]["error"] is None and by_id[1]["retries"] is None
+        assert by_id[2]["status"] == "completed"
+        assert errors == []
+        assert counts["pending"] == 1 and counts["error"] == 0
 
     for errored, stamp, finished in (
         (own_error, registered_at, False),
+        (own_error_same_second, registered_at, False),
         (prior_error, None, False),
         (prior_error, registered_at, True),
     ):

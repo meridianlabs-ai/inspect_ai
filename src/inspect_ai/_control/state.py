@@ -33,7 +33,6 @@ activity.
 
 from __future__ import annotations
 
-import math
 import time
 from collections import defaultdict
 from functools import partial
@@ -368,20 +367,17 @@ async def current_sample_summaries(
         # A terminal record completed before the running sample started is
         # not that: it is the prior attempt's record (seeded into a retry
         # attempt's log) for a sample now re-running, so the live row stays.
-        # `completed_at` is second-precision while the live start is
-        # fractional, so compare against the floored start (as
-        # `_is_prior_record_awaiting_rerun` does): a sample finishing in the
-        # second it started still supersedes its snapshotted running row.
+        # Both stamps are sub-second (a sample's `completed_at` is a full
+        # `datetime.now()`; only the eval-level stats are recorded to the
+        # second), so the comparison is exact — do not floor either side: a
+        # prior record from the same second as the re-run's start would then
+        # hide the live row.
         if existing is None:
             by_key[key] = summary
         elif existing["status"] == "running" and summary["status"] != "running":
             started_at = existing["started_at"]
             completed_at = summary["completed_at"]
-            if (
-                started_at is None
-                or completed_at is None
-                or completed_at >= math.floor(started_at)
-            ):
+            if started_at is None or completed_at is None or completed_at >= started_at:
                 by_key[key] = summary
 
     # Running first (the freshest source for in-flight samples), then the
@@ -576,16 +572,16 @@ def _is_prior_record_awaiting_rerun(
     plan (``_maybe_mark_finished``), and its seeded errors then are the
     samples' final records (a drain abandoned their re-runs).
 
-    The stamp is compared floored to the second so a record of this attempt
-    completing in the registration second (a second-precision
-    ``completed_at``) is never taken for the prior's; a prior record from
-    that same second reads as this attempt's error instead, the pre-seed
-    rendering, for that sub-second window only.
+    A sample's ``completed_at`` is a full ``datetime.now()`` stamp (only the
+    eval-level stats are recorded to the second), so the comparison against
+    the registration stamp is exact: this attempt's own records all complete
+    after it registered, and a prior record from the same second is still
+    the prior's.
     """
     if registered_at is None or summary["status"] not in ("error", "cancelled"):
         return False
     completed_at = summary["completed_at"]
-    if completed_at is None or completed_at >= math.floor(registered_at):
+    if completed_at is None or completed_at >= registered_at:
         return False
     return summary["sample_id"] in planned_ids
 
