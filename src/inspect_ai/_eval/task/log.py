@@ -309,6 +309,11 @@ class TaskLogger:
         # sweep's read-back of those records (see read_prior_sample)
         self._prior_seeded = False
         self._prior_read_limit = anyio.Semaphore(_PRIOR_READ_CONCURRENCY)
+        # seeded (id, epoch) keys the reuse sweep has not yet resolved: the
+        # records sample_summaries withholds from the control channel (see
+        # its docstring). A key leaves when the sweep accepts its record
+        # (note_reused_sample) or a completion for it lands.
+        self._seeded_pending: set[tuple[str | int, int]] = set()
 
         # sample buffer db
         self._buffer_db: SampleBufferDatabase | None = None
@@ -378,6 +383,7 @@ class TaskLogger:
         self._finished = False
         # the retry attempt re-enters task_run, which seeds its fresh log
         self._prior_seeded = False
+        self._seeded_pending = set()
         # the retry attempt gets a fresh log, which must re-record the run's
         # full accumulated process-scoped updates in init() below
         self._process_updates_recorded = 0
@@ -503,6 +509,8 @@ class TaskLogger:
             )
             return
         self._prior_seeded = True
+        seeded = await self.recorder.sample_summaries(self.eval)
+        self._seeded_pending = {(s.id, s.epoch) for s in seeded or []}
 
     async def read_prior_sample(self, id: str | int, epoch: int) -> EvalSample | None:
         """The seeded prior record for ``(id, epoch)``, read from the recorder, or None.
@@ -546,8 +554,20 @@ class TaskLogger:
             self._buffer_db.remove_samples([(id, epoch)])
 
     async def sample_summaries(self) -> list[EvalSampleSummary] | None:
-        """Live completed-sample summaries (handed to the control channel via ``register_eval``)."""
-        return await self.recorder.sample_summaries(self.eval)
+        """Live completed-sample summaries (handed to the control channel via ``register_eval``).
+
+        Withholds the seeded prior records the reuse sweep has not yet
+        resolved (``_seeded_pending``). Until the sweep accepts one as this
+        attempt's result or its re-run completes, it is the prior attempt's
+        record rather than an outcome of this attempt: listed, it would hide
+        the re-run's running row or render a sample still awaiting its
+        re-run as the prior's error. Withheld, the sample reads running or
+        pending exactly as it did before logs were seeded.
+        """
+        summaries = await self.recorder.sample_summaries(self.eval)
+        if summaries is None or not self._seeded_pending:
+            return summaries
+        return [s for s in summaries if (s.id, s.epoch) not in self._seeded_pending]
 
     async def read_sample(
         self,
@@ -652,6 +672,9 @@ class TaskLogger:
     def _record_sample_outcome(self, sample: EvalSample) -> None:
         key = (sample.id, sample.epoch)
         self._logged_sample_keys.add(key)
+        # a seeded record is resolved: accepted by the sweep as-is, or
+        # superseded by its re-run's completion
+        self._seeded_pending.discard(key)
         # same classifier the read/requeue/retry surfaces use to tell a
         # cancelled sample from an errored one; discard on re-log so a
         # requeued cancelled sample's re-run counts again
@@ -1000,6 +1023,7 @@ class TaskLogger:
             # visible under --ctl-server=keep) report a finished no-op / accurate
             # empty pending rather than reporting stale pending.
             self._finished = True
+            self._seeded_pending.clear()
             async with self._flush_pending_lock:
                 self.flush_pending.clear()
 

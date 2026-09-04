@@ -642,39 +642,36 @@ complete prior set.
 
 `current_sample_summaries` merges the recorder's summaries with
 `active_samples`, letting a terminal record supersede a running row (the
-sample finished between the two reads). A seeded log makes that rule wrong
-for a re-running sample: the recorder now holds the prior attempt's errored
-(or cancelled) record for the same `(id, epoch)` while its re-run is live,
-and without a guard the stale record hides the running row — `inspect ctl
-sample list` shows the sample as `error` with no `retries`, and the
-running row's `retries` count with it. The merge therefore lets a terminal
-record supersede a running row only when it completed at or after the
-running sample started; a record that completed earlier is the prior
-attempt's, and the live row stays. `sample_error_detail` already reads the
-running sample first, so it needs no change.
+sample finished between the two reads) and synthesizing `pending` rows for
+planned keys with no record. A seeded log would break both: the recorder
+now holds the prior attempt's errored (or cancelled) record for a key whose
+re-run is live or still queued, so without a guard the stale record hides
+the running row (`inspect ctl sample list` shows `error` with no `retries`)
+or renders a sample merely waiting its turn as `error` — counted in the
+histogram and listed by `inspect ctl sample errors` triage — where before
+seeding it read `pending`.
 
-The same seeded record is wrong before the re-run starts, too: with no
-running row for the key, the prior attempt's `error` (or cancellation) is
-the only row, so a sample merely waiting its turn read as `error`, counted
-as `error` in the histogram, and appeared in `inspect ctl sample errors`
-triage — where before seeding it read `pending` (no errored prior record
-was in the attempt's log until the carry-forward at teardown). The
-attempt's `EvalState` therefore records `registered_at` (stamped by
-`task_run` at `register_eval`, after the seed), and the listing renders an
-errored or cancelled record that completed before that stamp, whose id is
-still planned (`sample_ids`, cleared when the eval finishes) and whose key
-has no running row, as `pending` (`_is_prior_record_awaiting_rerun`). A
-clean seeded record is the attempt's result and stays `completed`. Both
-comparisons are exact: a sample's `completed_at` is a full `datetime.now()`
-stamp (only the eval-level `EvalStats` are recorded to the second), so
-neither side is floored — flooring would let a prior record from the same
-second as the re-run's start hide the live row, and a prior record from the
-registration second read as this attempt's `error`.
-`EvalState.started_at` is not the anchor: it is the first *sample's* start,
-unknown until a sample starts or a control poll folds one in, which is
-exactly the window in question. Once the eval finishes, `sample_ids` is
-empty and a seeded error whose re-run a drain abandoned reads as the
-sample's final record, as it should.
+The fix is at the source rather than in the merge. `TaskLogger` records
+every seeded key at seed time and drops a key when the sweep accepts its
+clean record (`note_reused_sample`) or a completion for it lands
+(`complete_sample`, the re-run superseding the prior record); `log_finish`
+and `reinit` clear the set. `TaskLogger.sample_summaries` — the live
+source `register_eval` hands the control channel — withholds summaries
+whose key is still in that set, so an unresolved seeded record is simply
+absent: its sample reads `running` from `active_samples` or `pending` from
+the plan, exactly as before seeding. No timestamp comparison is involved
+(the seeded stamps were written by another process, possibly on another
+machine's clock). A clean seeded record surfaces the moment the sweep
+accepts it; an invalidated one — clean to the summary, re-run by the
+sweep — stays withheld until its re-run completes; and once the eval
+finishes the live source is gone and the listing reads the on-disk log,
+where a seeded error whose re-run a drain abandoned is the sample's final
+record. `sample_error_detail` reads the running sample first, so it needs
+no change.
+
+Dynamically fed tasks seed with no plan (`keep=None`); a seeded key the
+feed never re-injects is never resolved, so it stays out of the live
+listing until the eval finishes (it remains in the log — see trade-off 5).
 
 ### Compaction at successful finish
 
@@ -897,12 +894,13 @@ Unit (`tests/log/test_task_log.py` and a recorder test module):
   raises before any destination write; `eval_log_sample_source` sets `seed`
   only when the eligibility checks pass (shuffled-without-ids and
   size-mismatch priors yield `None`) (`tests/test_eval.py`).
-- Control channel (`tests/_control/test_state.py`): a seeded prior errored
-  record never hides the sample's live re-run row, and with no running row
-  reads `pending` (absent from the errors triage) while the attempt is
-  registered and the id planned — `error` when the record postdates the
-  registration, when the attempt has no `registered_at`, or once the plan
-  is cleared.
+- Live listing source (`tests/log/test_task_log.py`): after the seed
+  `sample_summaries` withholds every seeded record while `read_prior_sample`
+  still serves them to the sweep; a record surfaces when the sweep accepts
+  it (`note_reused_sample`) or its re-run completes (`complete_sample`, the
+  listed row being the re-run's), an unresolved errored record stays
+  withheld, and after `log_finish` the source is gone and the on-disk log
+  holds the unresolved record as the sample's final one.
 
 Eval-level (`tests/test_eval_set.py`):
 

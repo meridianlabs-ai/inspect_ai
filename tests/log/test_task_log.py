@@ -33,6 +33,7 @@ from inspect_ai.log._log import (
     EvalDataset,
     EvalPlan,
     EvalResults,
+    EvalRetryError,
     EvalSample,
     EvalSampleSummary,
     EvalSpec,
@@ -1014,9 +1015,9 @@ async def test_task_logger_seed_from_prior_log(
     assert logger.prior_seeded
     assert logger.samples_logged == 0
     assert logger.samples_completed == 0
-    summaries = await logger.sample_summaries()
-    assert summaries is not None
-    assert {s.id for s in summaries} == {1, 2, 3}
+    # the seeded records are in the log but not yet this attempt's: the live
+    # listing source withholds them until the sweep resolves each one
+    assert await logger.sample_summaries() == []
 
     clean = await logger.read_prior_sample(1, 1)
     assert clean is not None and clean.error is None and clean.input == "q1"
@@ -1028,6 +1029,8 @@ async def test_task_logger_seed_from_prior_log(
     logger.note_reused_sample(clean)
     assert logger.samples_completed == 1
     assert logger.samples_logged == 1
+    summaries = await logger.sample_summaries()
+    assert summaries is not None and {s.id for s in summaries} == {1}
 
     await logger.log_start(EvalPlan())
     assert {
@@ -1035,6 +1038,64 @@ async def test_task_logger_seed_from_prior_log(
     } == {1, 2, 3}
     header = await read_eval_log_async(logger.location, header_only=True)
     assert header.eval.eval_id == "retry-attempt"
+
+
+@pytest.mark.parametrize("recorder_type", [EvalRecorder, JSONRecorder])
+async def test_task_logger_seeded_records_surface_as_the_sweep_resolves_them(
+    recorder_type: type, tmp_path: Path
+) -> None:
+    # the control channel lists an attempt's samples from sample_summaries
+    # (EvalState.live). A seeded prior record must not appear there while its
+    # sample is still to be re-run: listed, the prior's error would hide the
+    # re-run's running row or read as this attempt's error while the sample
+    # merely waits its turn. Each record surfaces only once the sweep accepts
+    # it (clean) or the re-run's completion supersedes it (errored/cancelled)
+    recorder = recorder_type(str(tmp_path))
+    prior = await _write_prior_log(recorder, _prior_samples())
+    logger = _seed_logger(recorder)
+    logger._location = await recorder.log_init(logger.eval)
+    await logger.seed_from_prior(prior, keep={(1, 1), (2, 1), (3, 1)})
+    await logger.log_start(EvalPlan())
+
+    assert await logger.sample_summaries() == []
+    # withheld from the listing, still served to the sweep
+    assert await logger.read_prior_sample(2, 1) is not None
+
+    clean = await logger.read_prior_sample(1, 1)
+    assert clean is not None
+    logger.note_reused_sample(clean)
+    listed = await logger.sample_summaries()
+    assert listed is not None and {s.id for s in listed} == {1}
+
+    rerun = EvalSample(
+        id=2,
+        epoch=1,
+        input="q2",
+        target="a",
+        output=ModelOutput(),
+        error_retries=[
+            EvalRetryError(
+                message="RuntimeError('boom')", traceback="", traceback_ansi=""
+            )
+        ],
+    )
+    await logger.complete_sample(rerun, flush=False)
+    listed = await logger.sample_summaries()
+    assert listed is not None
+    by_id = {s.id: s for s in listed}
+    assert set(by_id) == {1, 2}
+    # the listed record is the re-run's, not the seeded prior error
+    assert by_id[2].error is None and by_id[2].retries == 1
+    # the cancelled prior record stays withheld until its own re-run completes
+    assert 3 not in by_id
+
+    await logger.log_finish("error", EvalStats(), None, None, _error("boom"))
+    # torn down: the control channel falls back to the on-disk log, where the
+    # unresolved seeded record is the sample's final record
+    assert await logger.sample_summaries() is None
+    assert {
+        s.id for s in await read_eval_log_sample_summaries_async(logger.location)
+    } == {1, 2, 3}
 
 
 async def test_task_logger_seed_from_prior_relogs_across_formats(
@@ -1053,10 +1114,12 @@ async def test_task_logger_seed_from_prior_relogs_across_formats(
     await logger.seed_from_prior(prior, keep={(1, 1), (2, 1)})
 
     assert logger.prior_seeded
-    summaries = await logger.sample_summaries()
-    assert summaries is not None and {s.id for s in summaries} == {1, 2}
+    assert await logger.sample_summaries() == []
     clean = await logger.read_prior_sample(1, 1)
     assert clean is not None and clean.input == "q1"
+    logger.note_reused_sample(clean)
+    summaries = await logger.sample_summaries()
+    assert summaries is not None and {s.id for s in summaries} == {1}
     await logger.log_start(EvalPlan())
     assert {
         s.id for s in await read_eval_log_sample_summaries_async(logger.location)
