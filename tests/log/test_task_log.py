@@ -1104,6 +1104,43 @@ async def test_task_logger_seeded_records_surface_as_the_sweep_resolves_them(
     } == {1, 2, 3}
 
 
+@pytest.mark.parametrize("recorder_type", [EvalRecorder, JSONRecorder])
+async def test_task_logger_read_sample_exclude_fields_keeps_required_fields(
+    recorder_type: type, tmp_path: Path
+) -> None:
+    # a record served from the recorder's copy honours exclude_fields by
+    # resetting the fields to their defaults; a required field has none, so
+    # excluding it must leave the field alone rather than plant
+    # PydanticUndefined in the copy (which fails at serialization)
+    recorder = recorder_type(str(tmp_path))
+    prior = await _write_prior_log(
+        recorder,
+        [
+            EvalSample(
+                id=1,
+                epoch=1,
+                input="q1",
+                target="a",
+                output=ModelOutput(),
+                store={"k": 1},
+            )
+        ],
+    )
+    logger = _seed_logger(recorder)
+    logger._location = await recorder.log_init(logger.eval)
+    await logger.seed_from_prior(prior, keep={(1, 1)})
+    await logger.log_start(EvalPlan())
+    seeded = await logger.read_prior_sample(1, 1)
+    assert seeded is not None
+    logger.note_reused_sample(seeded)
+
+    read = await logger.read_sample(1, 1, exclude_fields={"store", "id", "input"})
+    assert read is not None
+    assert read.store == {}
+    assert read.id == 1 and read.input == "q1"
+    assert read.model_dump(mode="json")["id"] == 1
+
+
 async def test_task_logger_seed_from_prior_relogs_across_formats(
     tmp_path: Path,
 ) -> None:

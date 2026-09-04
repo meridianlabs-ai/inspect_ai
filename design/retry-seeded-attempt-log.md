@@ -520,9 +520,13 @@ config update) — and the swap onward under it:
    summaries, `_summary_counter = 1`, and append them as
    `_journal/summaries/1.json`. `_read_summary_counter` takes the maximum
    index present, so pruning the prior journal and starting at 1 is
-   consistent for every reader. Nothing goes into `_samples` or
-   `_streaming_samples`. Then re-journal the config updates recorded
-   before the seed.
+   consistent for every reader. That one member holds the whole kept list
+   (tens of MB of JSON for a prior with tens of thousands of samples), so
+   it is serialized and deflated in a worker thread with `_lock` held, as
+   `buffered_sample` reads and `compact` rewrites are, rather than
+   stalling the loop for the other tasks in the process. Nothing goes into
+   `_samples` or `_streaming_samples`. Then re-journal the config updates
+   recorded before the seed.
 6. Register the kept member names in `_local_sample_names` (the set
    `buffered_sample` serves from the local zip) and the pruned members'
    compressed size in `_pruned_bytes` for the compaction heuristic.

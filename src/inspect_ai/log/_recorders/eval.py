@@ -1425,8 +1425,8 @@ class ZipLogFile:
         metadata members and the sample members outside ``keep`` from the
         central directory (dead bytes, reclaimed by :meth:`compact` at a
         successful finish), rewrites the summaries journal to list exactly
-        the kept samples, and re-journals any config updates recorded since
-        :meth:`init`.
+        the kept samples (one member, built in a worker thread), and
+        re-journals any config updates recorded since :meth:`init`.
 
         ``keep`` restricts the seed to the attempt's planned ``(id, epoch)``
         keys; ``None`` keeps every prior sample (a dynamically fed task has no
@@ -1490,9 +1490,20 @@ class ZipLogFile:
             self._summary_counter = 0
             if summaries:
                 self._summary_counter = 1
-                self._zip_writestr(
-                    _journal_summary_path(_journal_summary_file(1)), summaries
-                )
+                journal = _journal_summary_path(_journal_summary_file(1))
+                zip_file = self._zip
+
+                def write_journal() -> None:
+                    # `_zip_writestr` is not used: it quiets zipfile's
+                    # duplicate-name warning via the process-wide warnings
+                    # filters, which a worker thread must not touch. The name
+                    # is fresh here (the prior's journal was pruned above)
+                    zip_file.writestr(journal, to_json_safe(summaries, indent=None))
+
+                # one member for the whole kept list (tens of MB of JSON for a
+                # large prior), so serialize and deflate in a worker thread
+                # with `_lock` held, as `buffered_sample` and `compact` do
+                await anyio.to_thread.run_sync(write_journal)
             self._rejournal_config_updates()
             self._local_sample_names.update(kept_names)
 
