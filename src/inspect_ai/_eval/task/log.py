@@ -464,6 +464,19 @@ class TaskLogger:
         return self._prior_seeded
 
     @property
+    def destination_written(self) -> bool:
+        """Whether anything has reached this attempt's destination log file.
+
+        A finished log was written by definition (``log_finish`` sets
+        ``_finished`` only after the recorder's final flush succeeded, and
+        the recorder stops tracking the eval at that point). Otherwise the
+        recorder reports whether any flush has landed.
+        """
+        if self._finished:
+            return True
+        return self.recorder.destination_written(self.eval)
+
+    @property
     def finished(self) -> bool:
         """Whether :meth:`log_finish` completed for this attempt (its log is written)."""
         return self._finished

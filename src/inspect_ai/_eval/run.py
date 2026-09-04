@@ -604,19 +604,22 @@ async def _run_task(options: TaskRunOptions, can_retry: bool = False) -> TaskRun
         # errors generally don't escape from tasks -- the exception is a
         # failure to write the log itself (e.g. the log_start() header flush,
         # or the log_finish() of an already-errored task, when log storage is
-        # unreachable). propagating would tear down the entire run (and all
-        # sibling tasks) for one task's failed write, so record an errored
-        # EvalLog instead: the dispatcher re-queues errored tasks and
-        # eval_set() retries them once storage recovers.
+        # unreachable) or of a retry's checkpoint startup copy, which runs
+        # before the log's first write. propagating would tear down the
+        # entire run (and all sibling tasks) for one task's failed write, so
+        # record an errored EvalLog instead: the dispatcher re-queues errored
+        # tasks and eval_set() retries them once storage recovers.
         if options.debug_errors:
             raise
         inner = inner_exception(ex)
         log.error(
-            f"Task '{options.task.name}' encountered an error while writing its log: {inner}"
+            f"Task '{options.task.name}' encountered an error while starting "
+            f"or writing its log: {inner}"
         )
         # location points at the log file the write was destined for — it may
-        # not exist (a failed log_start() header flush) or may hold a partial
-        # log (a failed error-status log_finish())
+        # not exist (a failed log_start() header flush, or a retry's failed
+        # checkpoint startup copy) or may hold a partial log (a failed
+        # error-status log_finish())
         result = EvalLog(
             status="error",
             eval=options.logger.eval,

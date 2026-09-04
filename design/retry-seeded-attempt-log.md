@@ -818,8 +818,11 @@ warning names the prior log and the error.
    source (see the `run_task_retry_attempts` section). Needs a storage
    failure at finish; the cost is re-running rather than losing those
    samples (the prior log survives until retry cleanup), and the partial
-   file may well be unreadable in the same outage. The CHANGELOG states
-   the re-run cost alongside the stray-log fix.
+   file may well be unreadable in the same outage. The attempt's checkpoint
+   dir (keyed on its log basename) is likewise not the next attempt's copy
+   source, so its samples' checkpointed progress is redone rather than
+   resumed. The CHANGELOG states the re-run cost alongside the stray-log
+   fix.
 
 ## Edge cases
 
@@ -847,8 +850,14 @@ warning names the prior log and the error.
   changes.
 - **JSON logs**: `JSONRecorder.log_init(prior_log=...)` buffers the prior's
   kept samples; compaction is a no-op (the writer emits one document).
-- **Checkpoints**: still keyed off the *prior* log's basename via
-  `eval_checkpoints_dir_from_config`; absent keys consult them as today.
+- **Checkpoints**: orthogonal to the seed. The retry startup copy
+  (`copy_resume_payloads`, `design/checkpoint-snapshot-strategy.md` §4.5)
+  replicates the prior attempt's sample checkpoint dirs into this attempt's
+  own eval checkpoints dir before `log_start` — after the seed, so a copy
+  failure discards the seeded temp zip with the attempt and a seed failure
+  copies nothing — and `run_sample` resolves resume for every non-clean
+  prior against this attempt's dir (an invalidated prior's copied dir is
+  deleted; a fresh run starts from an empty one).
 - **Prior log written by an older Inspect version**: the seed is a byte
   copy, so the samples keep their original schema version; readers already
   handle mixed-version members (the format has always been append-only).

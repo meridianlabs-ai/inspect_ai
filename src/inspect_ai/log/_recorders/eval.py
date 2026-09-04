@@ -197,6 +197,16 @@ class EvalRecorder(FileRecorder):
             await super().log_seed(eval, prior, keep)
 
     @override
+    def destination_written(self, eval: EvalSpec) -> bool:
+        log = self.data.get(self._log_file_key(eval))
+        if log is None:
+            raise RuntimeError(
+                f"No log in progress for eval {eval.eval_id} "
+                "(finished, discarded, or never initialised)"
+            )
+        return log.destination_written
+
+    @override
     async def log_start(self, eval: EvalSpec, plan: EvalPlan) -> None:
         log = self.data[self._log_file_key(eval)]
         start = LogStart(version=LOG_SCHEMA_VERSION, eval=eval, plan=plan)
