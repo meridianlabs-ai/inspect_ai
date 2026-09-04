@@ -1058,7 +1058,10 @@ async def test_task_logger_seeded_records_surface_as_the_sweep_resolves_them(
     await logger.log_start(EvalPlan())
 
     assert await logger.sample_summaries() == []
-    # withheld from the listing, still served to the sweep
+    # withheld from the listing and from the per-sample read the requeue /
+    # cancel / error-detail directives resolve state from; still served to
+    # the sweep
+    assert await logger.read_sample(2, 1) is None
     assert await logger.read_prior_sample(2, 1) is not None
 
     clean = await logger.read_prior_sample(1, 1)
@@ -1066,6 +1069,7 @@ async def test_task_logger_seeded_records_surface_as_the_sweep_resolves_them(
     logger.note_reused_sample(clean)
     listed = await logger.sample_summaries()
     assert listed is not None and {s.id for s in listed} == {1}
+    assert await logger.read_sample(1, 1) is not None
 
     rerun = EvalSample(
         id=2,
@@ -1086,6 +1090,8 @@ async def test_task_logger_seeded_records_surface_as_the_sweep_resolves_them(
     assert set(by_id) == {1, 2}
     # the listed record is the re-run's, not the seeded prior error
     assert by_id[2].error is None and by_id[2].retries == 1
+    read = await logger.read_sample(2, 1)
+    assert read is not None and read.error is None
     # the cancelled prior record stays withheld until its own re-run completes
     assert 3 not in by_id
 

@@ -589,7 +589,16 @@ class TaskLogger:
         *,
         exclude_fields: set[str] | None = None,
     ) -> EvalSample | None:
-        """Read one full sample (recorder buffer, then on-disk log), or None."""
+        """Read one full sample (recorder buffer, then on-disk log), or None.
+
+        Withholds an unresolved seeded prior record exactly as
+        :meth:`sample_summaries` does: the per-sample directives (requeue,
+        cancel, error detail) resolve a sample's state from this read, and a
+        seeded record served here would make a sample that has not yet run
+        look terminal — accepting a requeue that then runs it twice, or
+        answering a cancel with "already finished". The reuse sweep reads
+        seeded records through :meth:`read_prior_sample` instead.
+        """
         # The whole-sample counterpart to `sample_summaries`, handed to the
         # control channel via `register_eval` so per-sample reads (error detail,
         # event pages) source from the *same* place the samples listing does.
@@ -597,6 +606,8 @@ class TaskLogger:
         # to the finalized on-disk log once it's flushed / the recorder is torn
         # down — otherwise those reads see only the on-disk log and miss a
         # just-completed (or reused-on-retry) sample the listing already shows.
+        if (id, epoch) in self._seeded_pending:
+            return None
         buffered = await self.recorder.buffered_sample(self.eval, id, epoch)
         if buffered is not None:
             # the recorder's copy is whole (resident, or a local zip member

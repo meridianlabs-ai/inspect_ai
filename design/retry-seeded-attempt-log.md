@@ -636,7 +636,12 @@ complete prior set.
   its `_finish_task_log` call) are deleted: no remote body read happens in
   the sweep, nothing is written through during it, and an unreached errored
   key's prior record is already in the seeded zip, which is exactly what
-  carry-forward re-logged.
+  carry-forward re-logged. The one remaining per-sample remote step in the
+  sweep is the checkpoint resume probe (and the delete for a fresh run) that
+  every non-clean prior takes against this attempt's checkpoint dir, bounded
+  by `checkpoint_probe_limit` (`CHECKPOINT_PROBE_CONCURRENCY`); on a remote
+  checkpoint store it sets the length of the window before a re-run is
+  queued.
 
 ### The control channel's samples listing
 
@@ -666,8 +671,13 @@ accepts it; an invalidated one — clean to the summary, re-run by the
 sweep — stays withheld until its re-run completes; and once the eval
 finishes the live source is gone and the listing reads the on-disk log,
 where a seeded error whose re-run a drain abandoned is the sample's final
-record. `sample_error_detail` reads the running sample first, so it needs
-no change.
+record. `TaskLogger.read_sample` — the whole-sample read behind
+`sample_error_detail`, `ctl sample requeue` and `ctl sample cancel` —
+withholds the same keys, so a sample awaiting its re-run resolves as
+"planned, not yet at the queue" (a 409 for requeue and cancel, see
+`design/ctl/queued-sample-cancel.md`) rather than as a terminal record
+that requeue would run a second time and cancel would report as already
+finished.
 
 Dynamically fed tasks seed with no plan (`keep=None`); a seeded key the
 feed never re-injects is never resolved, so it stays out of the live
@@ -848,8 +858,9 @@ warning names the prior log and the error.
   sequential write-through.
 - **Explicit `resume=` log in eval_set**: seeds from it; nothing else
   changes.
-- **JSON logs**: `JSONRecorder.log_init(prior_log=...)` buffers the prior's
-  kept samples; compaction is a no-op (the writer emits one document).
+- **JSON logs**: the generic `Recorder.log_seed` re-logs the prior's kept
+  samples into the in-memory log; compaction is a no-op (the writer emits
+  one document).
 - **Checkpoints**: orthogonal to the seed. The retry startup copy
   (`copy_resume_payloads`, `design/checkpoint-snapshot-strategy.md` §4.5)
   replicates the prior attempt's sample checkpoint dirs into this attempt's
@@ -896,8 +907,9 @@ Unit (`tests/log/test_task_log.py` and a recorder test module):
   `.json` prior retried with `log_format="eval"` both reuse every clean
   sample through the write-through fallback.
 - `TaskLogger.seed_from_prior` (`tests/log/test_task_log.py`): seeded and
-  re-logged (cross-format, in-memory) seeds alike count seeded keys toward
-  `samples_logged` (cancelled ones excluded), `read_prior_sample` serves
+  re-logged (cross-format, in-memory) seeds alike leave `samples_logged`
+  and `samples_completed` at zero until the sweep accepts a record or a
+  re-run completes, `read_prior_sample` serves
   them locally, `note_reused_sample` counts a completion, `log_start`
   creates the destination containing the prior set, and a missing prior
   raises before any destination write; `eval_log_sample_source` sets `seed`
@@ -905,7 +917,8 @@ Unit (`tests/log/test_task_log.py` and a recorder test module):
   size-mismatch priors yield `None`) (`tests/test_eval.py`).
 - Live listing source (`tests/log/test_task_log.py`): after the seed
   `sample_summaries` withholds every seeded record while `read_prior_sample`
-  still serves them to the sweep; a record surfaces when the sweep accepts
+  still serves them to the sweep and `read_sample` (the per-sample
+  directives' read) withholds them too; a record surfaces when the sweep accepts
   it (`note_reused_sample`) or its re-run completes (`complete_sample`, the
   listed row being the re-run's), an unresolved errored record stays
   withheld, and after `log_finish` the source is gone and the on-disk log

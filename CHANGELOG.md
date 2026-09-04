@@ -10,7 +10,7 @@
 - Eval Set: A retry attempt that itself errors or is interrupted no longer causes the next attempt to re-run (or, with `retry_cleanup`, lose) samples an earlier attempt completed.
 - Eval Set: A retry attempt's live samples now start after the prior attempt's completed samples have been carried into its log, rather than alongside that copy.
 - Eval Set: Retrying with `log_images=False` keeps the images already recorded in the prior attempt's reused samples.
-- Eval Set: A retry attempt whose log could not be written no longer leaves a stray `started` log behind (or holds its unfinished log open) once the next attempt begins; that next attempt re-runs the unfinished attempt's own completed samples rather than reusing them from its partial log.
+- Eval Set: A retry attempt whose log could not be written no longer leaves a stray `started` log behind (or holds its unfinished log open) once the next attempt begins; that next attempt re-runs the unfinished attempt's own completed samples (and redoes their checkpointed progress) rather than reusing them from its partial log.
 
 ## 0.3.263 (03 September 2026)
 
