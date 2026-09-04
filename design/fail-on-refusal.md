@@ -188,7 +188,17 @@ way that lets the error reach the sample runner:
   `bridge.request_fail(ex)`, and still returns the provider-dialect error
   payload so the scaffold is not left waiting on a reply; the monitor task
   tears the sample down regardless of what the scaffold does with that
-  response. The alternative is a service-level special case like the
+  response. Two details for the implementer. `_forward_provider_errors`
+  today closes over only the generate method and has no reference to the
+  bridge, so it grows a `bridge` parameter (`run_model_service`, which
+  builds the wrappers, already has it). And a `ModelRefusalError` has no
+  `status_code`, so `provider_error_payload` (via `status_code_of`) gives it
+  `status: None`; the existing `status is None` branch would then log it as
+  "Agent bridge model request failed with a non-provider error" with a
+  traceback. The refusal branch returns the payload without that warning,
+  since the failure is reported once through the monitor task, the same
+  double-reporting concern handled for `background()` above. The
+  alternative is a service-level special case like the
   `LimitExceededError` branch in `_handle_request`; rejected because it would
   teach the generic sandbox service about a model-layer error type, whereas
   the bridge already owns a mechanism built for exactly this.
@@ -201,8 +211,9 @@ Consequences, all intentional:
 
 - The sample is marked errored rather than scored, and `fail_on_error`
   accounting treats it like any other sample error. Note the default:
-  `fail_on_error` defaults to `True`, which fails the eval on the *first*
-  sample error (`eval()` in `src/inspect_ai/_eval/eval.py`). So
+  `eval()` declares `fail_on_error: bool | float | None = None`, and
+  `_should_eval_fail` in `src/inspect_ai/_eval/task/error.py` treats `None`
+  like `True`, failing the eval on the *first* sample error. So
   `--fail-on-refusal` on its own means one refusal in any sample aborts the
   whole eval. That is the "stop and say why" behaviour the issue asks for,
   but it is stricter than "this sample errored, the run continues". Users
@@ -380,8 +391,9 @@ help text and `docs/options.qmd` entry state that, with the default
   `SandboxAgentBridge`, generalizing the terminate signal;
   `src/inspect_ai/agent/_bridge/sandbox/bridge.py`: `_monitor_failure` raises
   the stored error; `src/inspect_ai/agent/_bridge/sandbox/service.py`:
-  `_forward_provider_errors` calls `request_fail` on `ModelRefusalError` and
-  still returns the provider error payload.
+  `_forward_provider_errors` takes the bridge, calls `request_fail` on
+  `ModelRefusalError`, and still returns the provider error payload without
+  the non-provider-error warning.
 - `src/inspect_ai/_cli/eval.py`, `src/inspect_ai/_util/generate_config_args.py`:
   flag and env var.
 - Docs: `docs/fallbacks.qmd` (the refusals page), `docs/react-agent.qmd`
@@ -412,15 +424,18 @@ help text and `docs/options.qmd` entry state that, with the default
   `react_no_submit()`.
 - Bridge equivalent in `tests/agent/`, including a `filter` that returns a
   `content_filter` output.
-- `tests/agent/test_bridge_provider_errors.py` (already exercises
-  `_forward_provider_errors`): a `ModelRefusalError` from the wrapped
-  generate still returns a provider error payload (the scaffold gets a reply)
-  and sets the bridge's failure signal.
-- Sandbox bridge end to end, alongside the `_monitor_terminate` tests in
-  `tests/agent/test_bridge_approval.py`: the monitor task raises the stored
-  `ModelRefusalError`, and a solver using `sandbox_agent_bridge()` with a
-  refusing model produces an errored sample, asserting on the sample, not
-  just on the wrapper.
+- `tests/agent/test_bridge_provider_errors.py`: its five existing
+  `_forward_provider_errors(fn)` call sites are updated for the new `bridge`
+  argument, and a new case checks that a `ModelRefusalError` from the wrapped
+  generate still returns a provider error payload (the scaffold gets a
+  reply), sets the bridge's failure signal, and does not log the
+  non-provider-error warning.
+- Sandbox bridge end to end, alongside the existing monitor tests in
+  `tests/agent/test_bridge_approval.py` (which import `_monitor_terminate` by
+  name and so are updated for the `_monitor_failure` rename): the monitor
+  task raises the stored `ModelRefusalError`, and a solver using
+  `sandbox_agent_bridge()` with a refusing model produces an errored sample,
+  asserting on the sample, not just on the wrapper.
 - Deepagent: a synchronous subagent refusal fails the sample; a background
   subagent refusal behaves per the answer to open question 4, and if it
   propagates, no `Background worker error` line is logged for it.
