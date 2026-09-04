@@ -2135,14 +2135,14 @@ def test_retry_attempt_killed_after_seed_leaves_completed_samples_reusable(
 ) -> None:
     """A retry attempt hard-killed after seeding its log loses nothing.
 
-    Regression for the failure in ``design/retry-deferred-destination-log.md``
-    (now covered by ``design/retry-seeded-attempt-log.md``): the killed
-    attempt used to leave a start-only log that became the newest log for the
-    task, so the next retry found nothing to reuse and re-ran every completed
-    sample (permanently losing them once ``retry_cleanup`` deleted the prior
-    log). The attempt's first destination write now carries the complete
-    prior sample set, so a kill before it leaves no file (the next retry
-    chains to the prior log) and a kill after it leaves a complete one.
+    Regression for the hard-kill shape in ``design/retry-seeded-attempt-log.md``
+    (originally meridianlabs-ai/inspect_ai#240): the killed attempt used to
+    leave a start-only log that became the newest log for the task, so the
+    next retry found nothing to reuse and re-ran every completed sample
+    (permanently losing them once ``retry_cleanup`` deleted the prior log).
+    The attempt's first destination write now carries the complete prior
+    sample set, so a kill before it leaves no file (the next retry chains to
+    the prior log) and a kill after it leaves a complete one.
     """
     import subprocess
     import sys

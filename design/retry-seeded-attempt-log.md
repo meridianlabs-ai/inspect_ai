@@ -2,9 +2,13 @@
 
 Design for [meridianlabs-ai/inspect_ai#420](https://github.com/meridianlabs-ai/inspect_ai/issues/420)
 (upstream [UKGovernmentBEIS/inspect_ai#5213](https://github.com/UKGovernmentBEIS/inspect_ai/issues/5213)).
-Follows on from [retry-deferred-destination-log.md](retry-deferred-destination-log.md)
-(the hard-kill variant, #4933) and the reuse-sweep machinery in
-[retry-reused-sample-flush.md](retry-reused-sample-flush.md).
+Third design in this area. The two it replaces — the reuse-sweep
+write-through and settle flush (#117, `design/retry-reused-sample-flush.md`)
+and the destination-write hold for the hard-kill variant (#240 / upstream
+#4933, `design/retry-deferred-destination-log.md`) — were removed from
+`design/` when this landed; their mechanisms are gone from the code and the
+problem history below covers what they addressed. Read them from git history
+if the interim reasoning is needed.
 
 This revision supersedes an earlier draft that proposed chaining the retry
 sample source across a task's older logs. Review feedback (ransomr): log files
@@ -120,9 +124,15 @@ newest log (write nothing, or look past it).
   fetches from the zip file streams". The reuse sweep today is exactly that
   hundreds-of-small-fetches pattern, plus a JSON parse, condense, re-serialize
   and recompress per sample.
-- **The #4933 hold already exists.** `TaskLogger.hold_destination_writes()`
-  defers every destination write until `reuse_sweep_settled()`; `log_finish`
-  is the only exempt write.
+- **The #4933 hold existed when this was designed.**
+  `TaskLogger.hold_destination_writes()` deferred every destination write
+  until `reuse_sweep_settled()`, with `log_finish` the only exempt write.
+  The implementation removed the hold, the reuse-sweep countdown and the
+  settle flush: seeding before `log_start` makes the invariant they enforced
+  hold by construction. `write_through` on `Recorder.log_sample` survives as
+  the path the seed's cross-format and in-memory fallback uses, and
+  `ZipLogFile.destination_written` still gates the eager config-update flush
+  so a retune before `log_start`'s flush cannot create an empty newest log.
 
 ## Goal
 
