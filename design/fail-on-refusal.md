@@ -104,8 +104,14 @@ loop, or in the provider, means:
 - Callers that `await model.generate()` directly are covered without
   changes: the `generate()` solver, `react()`, synchronous `deepagent`
   subagents, in-process `agent_bridge()` scaffolds, custom agents,
-  compaction, and model-graded scorers. Three paths need extra handling; see
-  "Known gaps" below.
+  compaction, and model-graded scorers. One caveat for `agent_bridge()`: the
+  error surfaces as a Python exception out of the patched SDK call inside the
+  scaffold's own code, so a scaffold that wraps its API calls in a broad
+  `except Exception` retry loop will swallow it and carry on, exactly as it
+  would swallow a `LimitExceededError` today. In-process coverage therefore
+  depends on the scaffold not catching broad exceptions around SDK calls, and
+  the docs should say so. Three paths need extra handling; see "Known gaps"
+  below.
 
 The trigger predicate is
 `not output.empty and output.stop_reason == "content_filter"`, the same
@@ -135,24 +141,57 @@ way that lets the error reach the sample runner:
   would surface to the parent as an errored subagent status rather than a
   sample failure. Proposed: add `ModelRefusalError` to the
   `(LimitExceededError, TerminateSampleError)` re-raise clause so it
-  propagates to the sample like other sample-level control flow. Whether a
-  background refusal should fail the parent sample is open question 4.
+  propagates to the sample like other sample-level control flow. The
+  `background()` wrapper it runs under (the `run()` closure in
+  `src/inspect_ai/util/_background.py`) re-raises every exception but logs
+  anything outside the same two-type allowlist as `Background worker error`,
+  so `ModelRefusalError` joins that `isinstance` check too; otherwise the
+  refusal would propagate correctly but also be double-reported as a worker
+  failure. Whether a background refusal should fail the parent sample is open
+  question 4.
 - Bridge filters. In `bridge_generate`, a `filter` that returns a
   `content_filter` `ModelOutput` bypasses `model.generate()` entirely, so
   nothing raises. Proposed: `bridge_generate` applies the same predicate to
   filter-produced outputs once refusal retries are exhausted, using the
   bridge model's resolved config. This is a small addition to the
   catch-and-re-raise change that `bridge_generate` needs anyway (section 5).
-- Sandbox bridge. `_forward_provider_errors` in
-  `src/inspect_ai/agent/_bridge/sandbox/service.py` wraps every bridge
-  generate method, catches `Exception` (re-raising only
-  `LimitExceededError`) and returns the failure to the sandboxed scaffold as
-  a provider-dialect error response so the model proxy stays up. A
-  `ModelRefusalError` raised inside `bridge_generate` would therefore reach a
-  `sandbox_agent_bridge()` scaffold as an API error, which SDK clients
-  typically retry or the scaffold exits on, and the sample would proceed to
-  scoring. Proposed: add `ModelRefusalError` to the re-raise clause beside
-  `LimitExceededError`, the same shape as the deepagent fix.
+- Sandbox bridge. Bridged generations for `sandbox_agent_bridge()` run
+  inside the sandbox service task, and nothing raised there reaches the
+  sample runner. Two layers stand in the way. `_forward_provider_errors` in
+  `src/inspect_ai/agent/_bridge/sandbox/service.py` catches `Exception`
+  (re-raising only `LimitExceededError`) and returns the failure to the
+  scaffold as a provider-dialect error response so the model proxy stays up.
+  Behind it, the service dispatcher (`_handle_request` in
+  `src/inspect_ai/util/_sandbox/service.py`) wraps every method call with a
+  dedicated `except LimitExceededError` branch that calls
+  `active.limit_exceeded(ex)` on the active sample, plus a generic
+  `except Exception` that logs and writes an RPC error response.
+  `LimitExceededError` ends the sample because of that `limit_exceeded()`
+  hook, not because it is re-raised. So simply re-raising `ModelRefusalError`
+  from `_forward_provider_errors` would land in the generic branch and reach
+  the scaffold as an RPC error, which SDK clients typically retry or the
+  scaffold exits on, and the sample would proceed to scoring.
+
+  `SandboxAgentBridge.request_terminate`
+  (`src/inspect_ai/agent/_bridge/sandbox/types.py`) already documents this
+  constraint and solves it with a signal: it stores a reason, sets an
+  `anyio.Event`, and raises so the current RPC unwinds with an error
+  response; `_monitor_terminate` in `sandbox/bridge.py`, a task in the
+  `sandbox_agent_bridge` task group, waits on the event and raises
+  `TerminateSampleError` on the agent's side, where the task group unwinds
+  the agent and the sample runner sees it. Proposed: generalize that signal
+  to carry an exception. `SandboxAgentBridge` gains a `request_fail(error)`
+  that stores the exception and sets the event (with `request_terminate`
+  becoming the `TerminateSampleError` case), and `_monitor_terminate`
+  becomes `_monitor_failure`, raising whatever was stored.
+  `_forward_provider_errors` then catches `ModelRefusalError`, calls
+  `bridge.request_fail(ex)`, and still returns the provider-dialect error
+  payload so the scaffold is not left waiting on a reply; the monitor task
+  tears the sample down regardless of what the scaffold does with that
+  response. The alternative is a service-level special case like the
+  `LimitExceededError` branch in `_handle_request`; rejected because it would
+  teach the generic sandbox service about a model-layer error type, whereas
+  the bridge already owns a mechanism built for exactly this.
 
 ### 4. Sample outcome
 
@@ -160,13 +199,29 @@ way that lets the error reach the sample runner:
 handler turns it into an `EvalError` (`src/inspect_ai/_eval/task/run.py`).
 Consequences, all intentional:
 
-- The sample is marked errored rather than scored. `fail_on_error` thresholds
-  count it, so the eval can be configured to abort on the first refusal.
+- The sample is marked errored rather than scored, and `fail_on_error`
+  accounting treats it like any other sample error. Note the default:
+  `fail_on_error` defaults to `True`, which fails the eval on the *first*
+  sample error (`eval()` in `src/inspect_ai/_eval/eval.py`). So
+  `--fail-on-refusal` on its own means one refusal in any sample aborts the
+  whole eval. That is the "stop and say why" behaviour the issue asks for,
+  but it is stricter than "this sample errored, the run continues". Users
+  who want the latter combine the flag with `--no-fail-on-error`, a
+  `--fail-on-error` threshold, or `--continue-on-fail`. The two flags read
+  as if they compose independently, so the CLI docs for `--fail-on-refusal`
+  must state this pairing plainly.
 - `score_on_error` still works for users who want a score alongside the
   error.
 - `retry_on_error` sample retries apply as to any other error. A fresh attempt
   is often what you want at a filter decision boundary. If that proves
   wasteful for deterministic refusals we can exclude the error type later.
+- `eval_set()` retries any task whose log status is `error` up to
+  `retry_attempts` times (default 10, `src/inspect_ai/_eval/evalset.py`).
+  Under default `fail_on_error`, a deterministic refusal therefore becomes up
+  to `retry_attempts` full re-runs of the task before the set gives up. The
+  design leaves this as ordinary error behaviour, since a refusal at a
+  filter boundary is not reliably deterministic and eval-set users already
+  tune `retry_attempts`; see open question 3.
 
 It is deliberately not a `LimitExceededError`. Limits mean "stopped early,
 still scored, counted as success", which is the opposite of what the issue
@@ -282,7 +337,10 @@ than silently reusing logs.
 `--fail-on-refusal` as a boolean flag on `inspect eval` and
 `inspect eval-set`, env var `INSPECT_EVAL_FAIL_ON_REFUSAL`, converted in
 `src/inspect_ai/_util/generate_config_args.py` the same way `logprobs` is (a
-`False` flag becomes `None` so it does not clobber file config).
+`False` flag becomes `None` so it does not clobber file config). The flag's
+help text and `docs/options.qmd` entry state that, with the default
+`fail_on_error`, the first refusal aborts the eval, and point at
+`--no-fail-on-error` and `--continue-on-fail` for per-sample failure.
 
 ## Alternatives considered
 
@@ -316,9 +374,14 @@ than silently reusing logs.
   catch while retries remain; `bridge_generate` also applies the predicate to
   filter-produced outputs.
 - `src/inspect_ai/agent/_deepagent/agent_tool.py`: re-raise
-  `ModelRefusalError` from `_run_background` (pending open question 4).
-- `src/inspect_ai/agent/_bridge/sandbox/service.py`: re-raise
-  `ModelRefusalError` from `_forward_provider_errors`.
+  `ModelRefusalError` from `_run_background`; `src/inspect_ai/util/_background.py`:
+  add it to the `background()` no-log allowlist (both pending open question 4).
+- `src/inspect_ai/agent/_bridge/sandbox/types.py`: `request_fail(error)` on
+  `SandboxAgentBridge`, generalizing the terminate signal;
+  `src/inspect_ai/agent/_bridge/sandbox/bridge.py`: `_monitor_failure` raises
+  the stored error; `src/inspect_ai/agent/_bridge/sandbox/service.py`:
+  `_forward_provider_errors` calls `request_fail` on `ModelRefusalError` and
+  still returns the provider error payload.
 - `src/inspect_ai/_cli/eval.py`, `src/inspect_ai/_util/generate_config_args.py`:
   flag and env var.
 - Docs: `docs/fallbacks.qmd` (the refusals page), `docs/react-agent.qmd`
@@ -351,10 +414,18 @@ than silently reusing logs.
   `content_filter` output.
 - `tests/agent/test_bridge_provider_errors.py` (already exercises
   `_forward_provider_errors`): a `ModelRefusalError` from the wrapped
-  generate propagates instead of being returned as a provider error payload.
+  generate still returns a provider error payload (the scaffold gets a reply)
+  and sets the bridge's failure signal.
+- Sandbox bridge end to end, alongside the `_monitor_terminate` tests in
+  `tests/agent/test_bridge_approval.py`: the monitor task raises the stored
+  `ModelRefusalError`, and a solver using `sandbox_agent_bridge()` with a
+  refusing model produces an errored sample, asserting on the sample, not
+  just on the wrapper.
 - Deepagent: a synchronous subagent refusal fails the sample; a background
-  subagent refusal behaves per the answer to open question 4.
-- `fail_on_error=False` records the sample error but the eval succeeds;
+  subagent refusal behaves per the answer to open question 4, and if it
+  propagates, no `Background worker error` line is logged for it.
+- Default `fail_on_error` aborts the eval on the first refusal;
+  `fail_on_error=False` records the sample error but the eval succeeds;
   `score_on_error=True` still scores.
 - CLI parsing of `--fail-on-refusal` and the env var.
 
@@ -368,8 +439,10 @@ than silently reusing logs.
    only into the active model and require roles to opt in.
 2. With `num_choices > 1`, should any refused choice trigger, or only the
    first? The design follows `report_refusal` (first choice) for consistency.
-3. Should `retry_on_error` skip `ModelRefusalError`? Left as ordinary error
-   behaviour for now.
+3. Should `retry_on_error` skip `ModelRefusalError`, and should `eval_set()`
+   stop retrying a task whose only errors are refusals? Both are left as
+   ordinary error behaviour for now; the eval-set case matters more because
+   the default `retry_attempts` of 10 re-runs the whole task each time.
 4. Should a refusal inside a background `deepagent` subagent fail the parent
    sample? The design says yes (re-raise from `_run_background`), since the
    goal is loud failure wherever a refusal occurs. The alternative is to keep
