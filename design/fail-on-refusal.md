@@ -27,8 +27,9 @@ model is not appropriate for this use case: the run should stop and say why.
 - `StopReason` already has `"content_filter"`
   (`src/inspect_ai/model/_model_output.py`). Every provider maps refusals and
   safety filters onto it, including the cases where a 4xx is converted into a
-  refusal output (`_providers/anthropic.py`, `_providers/_openai.py`,
-  `_providers/google.py`, `_providers/bedrock.py`). `stop_details` carries the
+  refusal output (`_providers/anthropic.py`, `_providers/google.py`,
+  `_providers/bedrock.py`, and the shared OpenAI helper
+  `src/inspect_ai/model/_openai.py`). `stop_details` carries the
   category when the provider reports one. This is the signal the Slack thread
   asked us to build on, and it is the only trigger this design uses.
 - `Model.generate()` notices the refusal only to count it and optionally log a
@@ -102,14 +103,20 @@ loop, or in the provider, means:
   Refusals are already never cached (`src/inspect_ai/model/_cache.py`).
 - Callers that `await model.generate()` directly are covered without
   changes: the `generate()` solver, `react()`, synchronous `deepagent`
-  subagents, bridged scaffolds, custom agents, compaction, and model-graded
-  scorers. Two paths need extra handling; see "Known gaps" below.
+  subagents, in-process `agent_bridge()` scaffolds, custom agents,
+  compaction, and model-graded scorers. Three paths need extra handling; see
+  "Known gaps" below.
 
 The trigger predicate is
-`not output.empty and output.stop_reason == "content_filter"`, identical to
-the one `report_refusal` and `retry_refusals` use (first choice). Keeping the
-three in lockstep avoids a state where the counter says "refusal" but the
-sample did not fail.
+`not output.empty and output.stop_reason == "content_filter"`, the same
+guard the refusal counter uses in `_generate()` (first choice). The
+`retry_refusals` checks in `_model_generate` (`_react.py`) and
+`bridge_generate` (`_bridge/util.py`) currently test `stop_reason` alone;
+that is safe today only because `ModelOutput.stop_reason` indexes
+`choices[0]` and so raises on an empty output anyway. The section 5 change
+to those loops adopts the full guard, so the counter, the retry loops and
+the raise stay in lockstep and there is no state where the counter says
+"refusal" but the sample did not fail.
 
 **Cache key.** `_cache_key_config` in `src/inspect_ai/model/_cache.py`
 hashes every `GenerateConfig` field except those in
@@ -119,7 +126,7 @@ The field never reaches the provider request, so it is added to
 `_CACHE_KEY_DROPPED_FIELDS`. Cached entries are never refusals, so a cache
 hit can never need to raise.
 
-**Known gaps.** Two paths do not go through `await model.generate()` in a
+**Known gaps.** Three paths do not go through `await model.generate()` in a
 way that lets the error reach the sample runner:
 
 - Background `deepagent` subagents. `_run_background` in
@@ -136,6 +143,16 @@ way that lets the error reach the sample runner:
   filter-produced outputs once refusal retries are exhausted, using the
   bridge model's resolved config. This is a small addition to the
   catch-and-re-raise change that `bridge_generate` needs anyway (section 5).
+- Sandbox bridge. `_forward_provider_errors` in
+  `src/inspect_ai/agent/_bridge/sandbox/service.py` wraps every bridge
+  generate method, catches `Exception` (re-raising only
+  `LimitExceededError`) and returns the failure to the sandboxed scaffold as
+  a provider-dialect error response so the model proxy stays up. A
+  `ModelRefusalError` raised inside `bridge_generate` would therefore reach a
+  `sandbox_agent_bridge()` scaffold as an API error, which SDK clients
+  typically retry or the scaffold exits on, and the sample would proceed to
+  scoring. Proposed: add `ModelRefusalError` to the re-raise clause beside
+  `LimitExceededError`, the same shape as the deepagent fix.
 
 ### 4. Sample outcome
 
@@ -213,16 +230,24 @@ Consequences of keeping the existing order:
 - This matches how every other `GenerateConfig` field behaves, so users get
   no surprises, and it needs no change to the active-model path.
 
-Role models are the exception, and one change is needed for the eval-wide
-case to reach them at all. Today non-active models inherit just a handful of
-operational fields from the eval-wide config (`max_connections`,
-`adaptive_connections`, `max_retries`, `timeout`, `cache`) in the `else`
-branch of `_resolve_config`. `fail_on_refusal` joins that inherited set, but
-with role-wins precedence: it is copied from the eval-wide config only when
-the role model's own config leaves it unset. The existing operational fields
-go the other way (eval-wide overrides the role), which would make it
-impossible to say "fail everywhere except the grader". The `merge()`
-semantics support this with a two-line conditional. A role's own config comes
+Role models are the exception, and one change is needed for the task and
+eval-wide layers to reach them at all. The config that `_resolve_config`
+consults for this is `active_generate_config()`, which is not the eval-wide
+config alone: `init_task_context` in `src/inspect_ai/_eval/task/run.py`
+receives `task.config.merge(GenerateConfigArgs(**kwargs))`, so it is the
+task config with eval-wide kwargs layered on top. Under this proposal
+`Task(config=GenerateConfig(fail_on_refusal=True))` therefore flows into
+grader and other role models exactly as `--fail-on-refusal` does. A task
+author who wants the option only on the agent must set it per role instead.
+Today non-active models inherit just a handful of operational fields from
+that active config (`max_connections`, `adaptive_connections`,
+`max_retries`, `timeout`, `cache`) in the `else` branch of `_resolve_config`.
+`fail_on_refusal` joins that inherited set, but with role-wins precedence: it
+is copied from the active config only when the role model's own config
+leaves it unset. The existing operational fields go the other way (active
+config overrides the role), which would make it impossible to say "fail
+everywhere except the grader". The `merge()` semantics support this with a
+two-line conditional. A role's own config comes
 from `--model-role grader="{model: ..., fail_on_refusal: false}"` or
 `get_model(..., config=GenerateConfig(fail_on_refusal=False))` in
 `model_roles`; when a caller passes a config to `get_model(role=...)`, the
@@ -292,6 +317,8 @@ than silently reusing logs.
   filter-produced outputs.
 - `src/inspect_ai/agent/_deepagent/agent_tool.py`: re-raise
   `ModelRefusalError` from `_run_background` (pending open question 4).
+- `src/inspect_ai/agent/_bridge/sandbox/service.py`: re-raise
+  `ModelRefusalError` from `_forward_provider_errors`.
 - `src/inspect_ai/_cli/eval.py`, `src/inspect_ai/_util/generate_config_args.py`:
   flag and env var.
 - Docs: `docs/fallbacks.qmd` (the refusals page), `docs/react-agent.qmd`
@@ -313,7 +340,8 @@ than silently reusing logs.
   (the existing merge order, asserted so a later change is deliberate).
 - Role precedence: eval-wide `True` with a role set to `False` leaves that
   role's generate working; eval-wide unset with a role set to `True` fails
-  only on that role.
+  only on that role; `Task(config=...)` `True` reaches a role the same way
+  eval-wide does.
 - `tests/model/test_cache.py`: the cache key is identical with the field on
   and off.
 - `tests/agent/test_agent_react.py`: `retry_refusals=2` with three refusals
@@ -321,6 +349,9 @@ than silently reusing logs.
   `react_no_submit()`.
 - Bridge equivalent in `tests/agent/`, including a `filter` that returns a
   `content_filter` output.
+- `tests/agent/test_bridge_provider_errors.py` (already exercises
+  `_forward_provider_errors`): a `ModelRefusalError` from the wrapped
+  generate propagates instead of being returned as a provider error payload.
 - Deepagent: a synchronous subagent refusal fails the sample; a background
   subagent refusal behaves per the answer to open question 4.
 - `fail_on_error=False` records the sample error but the eval succeeds;
@@ -329,10 +360,12 @@ than silently reusing logs.
 
 ## Open questions
 
-1. Should eval-wide `fail_on_refusal` reach grader roles by default? The
-   design says yes for uniform loudness, with per-role opt-out. The
-   alternative is to inherit only into the active model and require roles to
-   opt in.
+1. Should task-level and eval-wide `fail_on_refusal` reach grader roles by
+   default? Both arrive via `active_generate_config()`, so they cannot be
+   told apart in `_resolve_config`; whatever is decided applies to
+   `Task(config=...)` and `--fail-on-refusal` alike. The design says yes for
+   uniform loudness, with per-role opt-out. The alternative is to inherit
+   only into the active model and require roles to opt in.
 2. With `num_choices > 1`, should any refused choice trigger, or only the
    first? The design follows `report_refusal` (first choice) for consistency.
 3. Should `retry_on_error` skip `ModelRefusalError`? Left as ordinary error
