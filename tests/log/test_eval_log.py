@@ -2094,6 +2094,39 @@ async def test_copy_prior_log_does_not_retry_a_cancellation(monkeypatch) -> None
         assert dest.read() == b"partial"
 
 
+async def test_copy_prior_log_reads_a_non_s3_remote_in_chunks(monkeypatch) -> None:
+    # a non-S3 remote filesystem (gs://, az://; memory:// here) has no async
+    # client and cannot be read in a worker thread (the fsspec rule), so the
+    # copy reads it on the event loop one chunk at a time and yields between
+    # chunks: a large download stalls the loop for one chunk at most
+    import inspect_ai.log._recorders.eval as eval_module
+    from inspect_ai._util.file import file
+
+    chunk_size = 1024
+    monkeypatch.setattr(eval_module, "_SEED_COPY_CHUNK_SIZE", chunk_size)
+    payload = os.urandom(chunk_size * 3 + 100)
+    location = "memory://seed/prior.eval"
+    with file(location, "wb") as f:
+        f.write(payload)
+
+    yields = 0
+    original_checkpoint = anyio.lowlevel.checkpoint
+
+    async def counting_checkpoint() -> None:
+        nonlocal yields
+        yields += 1
+        await original_checkpoint()
+
+    monkeypatch.setattr(anyio.lowlevel, "checkpoint", counting_checkpoint)
+
+    with tempfile.TemporaryFile() as dest:
+        await eval_module._copy_prior_log(location, dest)
+        dest.seek(0)
+        assert dest.read() == payload
+    # one yield per chunk read (three full chunks and the partial last one)
+    assert yields == 4
+
+
 async def test_eval_recorder_seed_preserves_config_updates_and_discard(
     tmp_path,
 ) -> None:

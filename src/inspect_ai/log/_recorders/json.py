@@ -78,9 +78,13 @@ class JSONRecorder(FileRecorder):
         # `sample_summaries` is polled by the control channel — recomputing
         # over the whole in-memory log on every request stalls the event loop.
         summaries: list[EvalSampleSummary] = Field(default_factory=list)
-        # (id, epoch) keys logged so far, so the common append stays O(1) and
-        # only a re-log of an existing key pays for superseding it
-        keys: set[tuple[str | int, int]] = Field(default_factory=set)
+        # the latest record per (id, epoch), so the common append and the
+        # per-sample lookup (`buffered_sample`, called for every planned key
+        # by a seeded retry's reuse sweep) stay O(1) and only a re-log of an
+        # existing key pays for superseding it in the ordered lists
+        samples_by_key: dict[tuple[str | int, int], EvalSample] = Field(
+            default_factory=dict
+        )
 
     def __init__(
         self,
@@ -143,11 +147,10 @@ class JSONRecorder(FileRecorder):
         # errored sample that seeded this log — matching the .eval readers'
         # last-entry-wins rule rather than listing the sample twice
         key = (sample.id, sample.epoch)
-        if key in log.keys:
+        if key in log.samples_by_key:
             log.data.samples = [s for s in log.data.samples if (s.id, s.epoch) != key]
             log.summaries = [s for s in log.summaries if (s.id, s.epoch) != key]
-        else:
-            log.keys.add(key)
+        log.samples_by_key[key] = sample
         log.data.samples.append(sample)
         log.summaries.append(sample.summary())
 
@@ -166,12 +169,9 @@ class JSONRecorder(FileRecorder):
         # until log_finish, so this is gap-free and ahead of disk for the entire
         # run — the counterpart to sample_summaries for whole samples.
         log = self.data.get(self._log_file_key(eval))
-        if log is None or log.data.samples is None:
+        if log is None:
             return None
-        for sample in log.data.samples:
-            if sample.id == id and sample.epoch == epoch:
-                return sample
-        return None
+        return log.samples_by_key.get((id, epoch))
 
     @override
     async def log_config_update(self, eval: EvalSpec, update: ConfigUpdate) -> None:

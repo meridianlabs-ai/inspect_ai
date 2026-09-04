@@ -467,19 +467,20 @@ config update) — and the swap onward under it:
 
 1. **Copy bytes** into a fresh anonymous `tempfile.TemporaryFile()`. Being
    unlinked, it has no path `AsyncFilesystem.get_file(remote, local_path)`
-   could target; the seed instead pumps `AsyncFilesystem.read_file_bytes(
-   prior_log, 0, None)` — a `ByteReceiveStream` — into the open file object
-   (a local file copies in a worker thread). For S3 on asyncio (the body
-   stream) and for local files that is a constant-memory stream that never
-   blocks the loop. It is not unconditional: `read_file_bytes` returns the
-   whole object as an in-memory buffer for S3 under trio (`to_thread` over
-   `s3_read_file_bytes`) and for every other remote backend (GCS/Azure),
-   where the read itself is a synchronous fsspec read on the event loop.
-   The seed inherits those limits rather than working around them — they
-   are the ones `read_log`'s download already has today (`fs.get_file`,
-   sync, for non-S3 remotes) — so the multi-GB case in Trade-offs is
-   bounded only on S3/asyncio and local. No `to_thread` over fsspec's
-   remote API (the fsspec rule in AGENTS.md). Transient failures are
+   could target; the seed instead pumps the bytes into the open file object
+   (a local file copies in a worker thread). For S3 that is
+   `AsyncFilesystem.read_file_bytes(prior_log, 0, None)` — a
+   `ByteReceiveStream`: the body stream on asyncio (constant memory, never
+   blocks the loop), the whole object read in a worker thread under trio
+   (`to_thread` over `s3_read_file_bytes`; loop free, memory not bounded).
+   Every other remote backend (GCS/Azure) has no async client and cannot
+   be read in a worker thread either (the fsspec rule in AGENTS.md), so it
+   is read synchronously *on the event loop*, one `_SEED_COPY_CHUNK_SIZE`
+   chunk at a time with an `anyio.lowlevel.checkpoint()` between chunks:
+   each stall is bounded by one chunk's fetch rather than the whole
+   download (which is what `read_file_bytes` would do for those backends,
+   and what `read_log`'s `fs.get_file` download does today). Transient
+   failures are
    retried with the same `tenacity.AsyncRetrying` idiom the S3 put retry
    uses (`SEED_COPY_ATTEMPTS`, jittered exponential backoff); a missing
    prior raises `FileNotFoundError` at once. A failure closes the fresh
@@ -591,6 +592,12 @@ nothing is seeded, as nothing is re-logged today, and the sweep falls back
 to `lookup`), after the retry-abandoned check and before anything that
 needs unwinding — the paged sample store, the display row, `log_start` — so
 a seed failure escapes with nothing to clean up and no destination written.
+The abandoned check is repeated right after the seed: the copy can run for
+minutes on a large remote prior, and an abandon landing during it would
+otherwise be honoured only by the pre-`register_eval` backstop, after the
+checkpoint copy and the `log_start` flush had uploaded the whole seeded log
+for the dispatcher's discard to remove. Either path ends in that discard,
+which closes the seeded temp file.
 `keep` is the plan `task_run` has just sliced (`sample_ids × range(1,
 epochs+1)`; `None` for a dynamic-feed task). `TaskLogger.seed_from_prior`
 asks the recorder to `log_seed` and sets `prior_seeded`; a prior log that
@@ -797,16 +804,17 @@ warning names the prior log and the error.
    minutes of startup delay per attempt. If that matters in practice, A2
    restores the overlap at the cost of the seed-failure-after-live-work
    rule (discard and write nothing). The download streams in constant
-   memory only on S3 under asyncio and for local files; other remote
-   backends, and S3 under trio, buffer the whole prior log in memory, as
-   `read_log` does for them today (see step 1 of the mechanism). For the
-   non-S3 remote backends (GCS, Azure) that buffered read is also a
-   synchronous fsspec read *on the event loop*: for the whole download,
-   every sibling task's samples and the control server stall, where the
-   sweep's per-sample range reads blocked in small slices interleaved with
-   other work. No cheap mitigation exists — `to_thread` over a remote fsspec
-   filesystem is ruled out (AGENTS.md) and no async GCS/Azure path exists —
-   so this is a known limit of seeding from those backends.
+   memory on S3 under asyncio and for local files, and chunk by chunk for
+   the non-S3 remote backends (GCS, Azure); S3 under trio buffers the whole
+   prior log in memory (in a worker thread), as `read_log` does for it
+   today (see step 1 of the mechanism). For the non-S3 remote backends the
+   chunked read is synchronous fsspec I/O *on the event loop* — `to_thread`
+   over a remote fsspec filesystem is ruled out (AGENTS.md) and no async
+   GCS/Azure path exists — so every sibling task's samples and the control
+   server stall for each chunk's fetch, with a checkpoint between chunks
+   letting other work interleave; over a multi-GB download that is many
+   short stalls rather than one for the whole file, comparable to the
+   sweep's per-sample range reads this replaces.
 2. **Dead bytes between attempts.** A non-success attempt's log carries the
    prior's superseded metadata and, for re-run samples, their prior records,
    plus whatever dead bytes the prior log itself carried (its non-success

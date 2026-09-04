@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import BinaryIO, Callable, cast
 from unittest.mock import patch
 
+import anyio
 import pytest
 from test_helpers.buffer import simulate_crashed_buffer_db
 from test_helpers.utils import (
@@ -2337,6 +2338,163 @@ def test_retry_seed_failure_writes_no_log_and_next_attempt_reuses(
     for log in all_logs:
         assert log.samples is not None
         assert {s.id for s in log.samples} == {"s1", "s2", "s3", "s4"}
+
+
+def test_retry_abandoned_during_seed_never_starts_the_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A retry abandoned while its log is being seeded never flushes the seeded log.
+
+    A task drain/cancel landing during the seed (a large prior copied from
+    remote storage) is honoured right after it: the attempt bails before the
+    checkpoint copy and `log_start`, so the whole seeded log is not uploaded
+    only for the dispatcher's discard to remove it again.
+    """
+    from inspect_ai._control.eval_state import abandon_task_retry
+    from inspect_ai._eval.task.log import TaskLogger
+    from inspect_ai.log._log import EvalPlan, EvalSample
+
+    original_seed = TaskLogger.seed_from_prior
+
+    async def abandoning_seed(
+        self: TaskLogger,
+        prior: str | list[EvalSample],
+        keep: set[tuple[str | int, int]] | None,
+    ) -> None:
+        await original_seed(self, prior, keep)
+        abandon_task_retry(self.eval.task_id)
+
+    monkeypatch.setattr(TaskLogger, "seed_from_prior", abandoning_seed)
+
+    started: list[str] = []
+    original_start = TaskLogger.log_start
+
+    async def recording_start(self: TaskLogger, plan: EvalPlan) -> None:
+        started.append(self.eval.eval_id)
+        await original_start(self, plan)
+
+    monkeypatch.setattr(TaskLogger, "log_start", recording_start)
+
+    calls: list[str] = []
+    seeded_task = _seeded_retry_task(calls, fail_s4_times=1)
+
+    log_dir = str(tmp_path / "logs")
+    success, _ = eval_set(
+        tasks=[seeded_task],
+        log_dir=log_dir,
+        model="mockllm/model",
+        retry_attempts=1,
+        retry_wait=0.1,
+        retry_immediate=True,
+        retry_cleanup=False,
+        retry_on_error=0,
+        max_samples=1,
+    )
+    assert not success
+    # only attempt 1 started its log; the abandoned attempt ran no sample and
+    # left no `started` log behind attempt 1's error log
+    assert len(started) == 1
+    assert calls == ["s1", "s2", "s3", "s4"], calls
+    logs = list_eval_logs(log_dir)
+    assert len(logs) == 1
+    assert read_eval_log(logs[0].name, header_only=True).status == "error"
+
+
+def test_cancelled_retry_attempt_log_seeds_the_next_pass(tmp_path: Path) -> None:
+    """A retry attempt cancelled by Ctrl-C leaves a log the next eval-set pass reuses.
+
+    Attempt 1 completes s1–s3 and errors on s4. The in-process retry attempt
+    is seeded from that log and then interrupted (SIGINT) while re-running
+    s4, so it finishes as `cancelled` holding every sample. That log is the
+    task's newest, and a fresh eval_set pass seeds from it: s1–s3 are reused
+    (run exactly once overall) and s4's error history from attempt 1
+    survives the cancelled attempt in between, which itself adds nothing (a
+    cancellation is not a retry-worthy error).
+    """
+    calls: list[str] = []
+    s4_rerun_started = threading.Event()
+    solver_id = id(calls)
+
+    @solver(name=f"cancelled_seeded_solver_{solver_id}")
+    def cancelled_seeded_solver() -> Solver:
+        async def solve(state: TaskState, generate: Generate) -> TaskState:
+            calls.append(str(state.sample_id))
+            if state.sample_id == "s4":
+                run = calls.count("s4")
+                if run == 1:
+                    raise ValueError("s4 fails on its first run")
+                if run == 2:
+                    s4_rerun_started.set()
+                    await anyio.sleep(30)
+            return state
+
+        return solve
+
+    def make_task() -> Task:
+        return Task(
+            dataset=[Sample(id=f"s{i}", input="x", target="y") for i in (1, 2, 3, 4)],
+            solver=[cancelled_seeded_solver()],
+            name="cancelled_seeded_task",
+        )
+
+    log_dir = str(tmp_path / "logs")
+
+    def run_eval_set() -> tuple[bool, list[EvalLog]]:
+        return eval_set(
+            tasks=[make_task()],
+            log_dir=log_dir,
+            model="mockllm/model",
+            retry_attempts=2,
+            retry_wait=0.1,
+            retry_immediate=True,
+            retry_cleanup=False,
+            retry_on_error=0,
+            max_samples=1,
+        )
+
+    def send_sigint() -> None:
+        if s4_rerun_started.wait(timeout=60):
+            time.sleep(0.2)
+            os.kill(os.getpid(), signal.SIGINT)
+
+    sigint_thread = threading.Thread(target=send_sigint, daemon=True)
+    sigint_thread.start()
+    # how eval_set surfaces the interrupt (a KeyboardInterrupt, or a normal
+    # return without the cancelled log in its results) is not under test
+    # here: the contract is the cancelled attempt's log on disk
+    try:
+        run_eval_set()
+    except KeyboardInterrupt:
+        pass
+    sigint_thread.join(timeout=5)
+    assert calls == ["s1", "s2", "s3", "s4", "s4"], calls
+
+    def logs_by_created() -> list[EvalLog]:
+        return sorted(
+            (read_eval_log(info.name) for info in list_eval_logs(log_dir)),
+            key=lambda log: log.eval.created,
+        )
+
+    logs = logs_by_created()
+    assert [log.status for log in logs] == ["error", "cancelled"]
+    cancelled = logs[-1]
+    assert cancelled.samples is not None
+    assert {s.id for s in cancelled.samples} == {"s1", "s2", "s3", "s4"}
+
+    success, _ = run_eval_set()
+    assert success
+    assert calls == ["s1", "s2", "s3", "s4", "s4", "s4"], calls
+    logs = logs_by_created()
+    assert [log.status for log in logs] == ["error", "cancelled", "success"]
+    final = logs[-1]
+    assert final.samples is not None
+    assert {s.id for s in final.samples} == {"s1", "s2", "s3", "s4"}
+    assert all(s.error is None for s in final.samples)
+    s4 = next(s for s in final.samples if s.id == "s4")
+    assert s4.error_retries is not None
+    assert [e.message for e in s4.error_retries] == [
+        "ValueError('s4 fails on its first run')"
+    ]
 
 
 def test_carried_forward_samples_remain_condensed() -> None:

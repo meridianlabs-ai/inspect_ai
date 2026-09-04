@@ -925,6 +925,14 @@ async def task_run(options: TaskRunOptions, task_cancel: TaskCancel | None) -> E
                 for epoch in range(1, epochs + 1)
             },
         )
+        # the seed can run for minutes (a large prior copied from remote
+        # storage), so an abandon landing during it is re-checked here: the
+        # pre-register backstop below would still catch it, but only after
+        # the checkpoint copy and the log_start flush had uploaded the whole
+        # seeded log for the dispatcher's discard to remove. The seeded temp
+        # file itself is closed by that discard on either path.
+        if task_retry_abandoned(logger.eval.task_id):
+            raise TaskRetryAbandonedError()
 
     # this attempt's own eval checkpoints dir (None when checkpointing is
     # off or vetoed): the startup copy's destination, and where a retried
