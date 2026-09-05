@@ -871,17 +871,27 @@ async def run_task_retry_attempts(
 
                         # build sample_source from the failed log so completed
                         # samples are reused on retry (mirrors legacy eval_set
-                        # retry). An attempt that died before anything reached
-                        # its destination log (e.g. its checkpoint startup copy
-                        # failed pre-log_start) left no file — chain the retry
-                        # from whatever *it* was retrying instead, so reuse and
-                        # checkpoints fall back a hop rather than sourcing an
-                        # attempt that holds nothing. The logger knows whether
-                        # it wrote anything; no storage probe is needed.
+                        # retry). An attempt whose log never finished — its
+                        # prior-log seed failed, or a log write did — has
+                        # left either no destination file or a partial one
+                        # that reinit() below discards, so the retry keeps
+                        # the source this attempt ran with (the same prior
+                        # log). Accepted cost: a partial file (log_finish
+                        # failed after earlier flushes) also held this
+                        # attempt's flushed live completions, which are
+                        # re-run rather than reused. Preferring it means
+                        # keeping it, and a kept `started` destination is
+                        # the stray log discard exists to remove: the
+                        # retry-cleanup sweep never deletes `started` logs,
+                        # so it would outlive the run, and by mtime it
+                        # would stand as the task's latest log should every
+                        # later attempt fail. The work is only re-run, never
+                        # lost (the prior log survives until retry cleanup).
+                        failed_location = options.logger.location
                         sample_source: EvalSampleSource | None
-                        if options.logger.destination_written:
+                        if options.logger.finished:
                             failed_log_info = EvalLogInfo(
-                                name=options.logger.location,
+                                name=failed_location,
                                 type="file",
                                 size=0,
                                 mtime=None,
@@ -894,12 +904,17 @@ async def run_task_retry_attempts(
                                 failed_log_info,
                                 options.task.dataset,
                                 eval_checkpoints_dir_from_config(
-                                    options.logger.location,
+                                    failed_location,
                                     options.checkpoint,
                                     options.eval_checkpoint,
                                 ),
                             )
                         else:
+                            log.info(
+                                f"Task '{options.task.name}' did not finish its log "
+                                "for this attempt; retrying with the prior attempt's "
+                                "sample source"
+                            )
                             sample_source = options.sample_source
 
                         # reinit logger for a fresh eval entry

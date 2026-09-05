@@ -798,190 +798,95 @@ def _retry_source_log_info(location: str) -> Any:
         type="file",
         size=0,
         mtime=None,
-        task="retry_probe_task",
+        task="retry_seed_task",
         task_id="task-id",
         suffix=None,
     )
 
 
-def _write_prior_eval_log(log_dir: Path) -> tuple[Any, bytes]:
-    """Run a one-sample eval and return its log plus the .eval file bytes."""
+def _write_prior_eval_log(log_dir: Path) -> Any:
+    """Run a one-sample eval and return its log."""
     task = Task(
         dataset=[Sample(id=1, input="Say hello", target="hello")], scorer=match()
     )
     log = eval(task, model="mockllm/model", log_dir=str(log_dir))[0]
     assert log.status == "success" and log.location
-    from inspect_ai._util.file import local_path
-
-    return log, Path(local_path(log.location)).read_bytes()
+    return log
 
 
-def test_retry_presence_probe_retries_transient_failure(tmp_path: Path) -> None:
-    """A failed central-directory fetch is retried on the next probe.
+def test_retry_sample_source_seed_set_only_when_eligible(tmp_path: Path) -> None:
+    """The seed a retry attempt's log is filled from follows the reuse eligibility checks.
 
-    A transient failure must not be cached as "no presence" — that would
-    silently disable the reuse read throttle for the whole sweep.
+    A prior log file that passes them seeds by location; an in-memory prior
+    log seeds from its samples; a prior that fails a check (dataset size
+    changed, shuffled without ids) yields no seed at all — the attempt then
+    runs everything fresh, as it reuses nothing.
     """
     from inspect_ai._eval.task.run import eval_log_sample_source
-    from inspect_ai._util.asyncfiles import AsyncFilesystem
     from inspect_ai.dataset import MemoryDataset
 
-    prior_log, real_bytes = _write_prior_eval_log(tmp_path / "logs")
-    probe_path = tmp_path / "prior.eval"
-    probe_path.write_bytes(b"not a zip")
+    prior_log = _write_prior_eval_log(tmp_path / "logs")
+    log_info = _retry_source_log_info(prior_log.location)
+    dataset = MemoryDataset([Sample(id=1, input="x", target="y")])
 
+    file_source = eval_log_sample_source(prior_log, log_info, dataset)
+    assert file_source.seed is not None
+    assert file_source.seed.source == prior_log.location
+
+    memory_source = eval_log_sample_source(prior_log, None, dataset)
+    assert memory_source.seed is not None
+    assert isinstance(memory_source.seed.source, list)
+    assert [s.id for s in memory_source.seed.source] == [1]
+
+    bigger = MemoryDataset(
+        [Sample(id=1, input="x", target="y"), Sample(id=2, input="x", target="y")]
+    )
+    assert eval_log_sample_source(prior_log, log_info, bigger).seed is None
+
+    shuffled = MemoryDataset([Sample(input="x", target="y")], shuffled=True)
+    assert eval_log_sample_source(prior_log, log_info, shuffled).seed is None
+
+
+def test_retry_sample_source_classify_resolves_seeded_records(tmp_path: Path) -> None:
+    """`seed.classify` resolves a record read back from the seeded log like `lookup` does."""
+    from inspect_ai._eval.task.run import (
+        InvalidatedPrior,
+        PreviousError,
+        eval_log_sample_source,
+    )
+    from inspect_ai.dataset import MemoryDataset
+    from inspect_ai.log import EvalError, EvalSample
+    from inspect_ai.log._edit import ProvenanceData
+
+    prior_log = _write_prior_eval_log(tmp_path / "logs")
     source = eval_log_sample_source(
         prior_log,
-        _retry_source_log_info(str(probe_path)),
+        _retry_source_log_info(prior_log.location),
         MemoryDataset([Sample(id=1, input="x", target="y")]),
+    )
+    seed = source.seed
+    assert seed is not None
+
+    clean = EvalSample(id=1, epoch=1, input="x", target="y")
+    errored = clean.model_copy(
+        update={
+            "error": EvalError(
+                message="RuntimeError('boom')", traceback="", traceback_ansi=""
+            )
+        }
+    )
+    invalidated = clean.model_copy(
+        update={"invalidation": ProvenanceData(author="test", reason="bad")}
     )
 
     async def check() -> None:
-        async with AsyncFilesystem():
-            assert await source.prior_exists(1, 1) is False
-            probe_path.write_bytes(real_bytes)
-            assert await source.prior_exists(1, 1) is True
-            assert await source.prior_exists(2, 1) is False
+        assert await seed.classify(1, 1, clean) is clean
+        resolution = await seed.classify(1, 1, errored)
+        assert isinstance(resolution, PreviousError) and resolution.sample is errored
+        assert isinstance(await seed.classify(1, 1, invalidated), InvalidatedPrior)
+        assert await seed.classify(1, 1, None) is None
 
     anyio.run(check)
-
-
-def test_retry_presence_probe_gives_up_after_max_failures(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """Persistent fetch failures stop being retried after the cap, with a warning."""
-    from inspect_ai._eval.task.run import (
-        PRIOR_PROBE_MAX_FAILURES,
-        eval_log_sample_source,
-    )
-    from inspect_ai._util.asyncfiles import AsyncFilesystem
-    from inspect_ai.dataset import MemoryDataset
-
-    prior_log, real_bytes = _write_prior_eval_log(tmp_path / "logs")
-    probe_path = tmp_path / "prior.eval"
-    probe_path.write_bytes(b"not a zip")
-
-    source = eval_log_sample_source(
-        prior_log,
-        _retry_source_log_info(str(probe_path)),
-        MemoryDataset([Sample(id=1, input="x", target="y")]),
-    )
-
-    async def check() -> None:
-        async with AsyncFilesystem():
-            for _ in range(PRIOR_PROBE_MAX_FAILURES + 2):
-                assert await source.prior_exists(1, 1) is False
-            # gave up: even a now-valid log is no longer probed
-            probe_path.write_bytes(real_bytes)
-            assert await source.prior_exists(1, 1) is False
-
-    with caplog.at_level(logging.WARNING, logger="inspect_ai._eval.task.run"):
-        anyio.run(check)
-
-    warnings = [r for r in caplog.records if "central directory" in r.message]
-    assert len(warnings) == 1
-
-
-def test_retry_presence_probe_concurrent_failures_respect_cap(
-    tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Concurrent probes share the failure cap: fetch attempts and the warning stay bounded.
-
-    All run_sample coroutines probe at eval start; each must not get its own
-    fetch attempt (and warning) just because it passed the cap check while the
-    failure count was still 0.
-    """
-    from inspect_ai._eval.task.run import (
-        PRIOR_PROBE_MAX_FAILURES,
-        eval_log_sample_source,
-    )
-    from inspect_ai._util import async_zip
-    from inspect_ai._util._async import tg_collect
-    from inspect_ai._util.asyncfiles import AsyncFilesystem
-    from inspect_ai.dataset import MemoryDataset
-
-    prior_log, _ = _write_prior_eval_log(tmp_path / "logs")
-    probe_path = tmp_path / "prior.eval"
-    probe_path.write_bytes(b"not a zip")
-
-    source = eval_log_sample_source(
-        prior_log,
-        _retry_source_log_info(str(probe_path)),
-        MemoryDataset([Sample(id=1, input="x", target="y")]),
-    )
-
-    fetches = 0
-    parse_central_directory = async_zip._parse_central_directory
-
-    async def counting_parse(*args: Any, **kwargs: Any) -> Any:
-        nonlocal fetches
-        fetches += 1
-        return await parse_central_directory(*args, **kwargs)
-
-    monkeypatch.setattr(async_zip, "_parse_central_directory", counting_parse)
-
-    async def check() -> None:
-        async with AsyncFilesystem():
-            results = await tg_collect(
-                [
-                    functools.partial(source.prior_exists, 1, 1)
-                    for _ in range(PRIOR_PROBE_MAX_FAILURES + 7)
-                ]
-            )
-            assert all(result is False for result in results)
-
-    with caplog.at_level(logging.WARNING, logger="inspect_ai._eval.task.run"):
-        anyio.run(check)
-
-    assert fetches == PRIOR_PROBE_MAX_FAILURES
-    warnings = [r for r in caplog.records if "central directory" in r.message]
-    assert len(warnings) == 1
-
-
-def test_retry_presence_probe_missing_log_cached_without_warning(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """A missing prior log caches no-presence on the first probe, silently."""
-    from inspect_ai._eval.task.run import eval_log_sample_source
-    from inspect_ai._util.asyncfiles import AsyncFilesystem
-    from inspect_ai.dataset import MemoryDataset
-
-    prior_log, real_bytes = _write_prior_eval_log(tmp_path / "logs")
-    probe_path = tmp_path / "never-written.eval"
-
-    source = eval_log_sample_source(
-        prior_log,
-        _retry_source_log_info(str(probe_path)),
-        MemoryDataset([Sample(id=1, input="x", target="y")]),
-    )
-
-    async def check() -> None:
-        async with AsyncFilesystem():
-            assert await source.prior_exists(1, 1) is False
-            # cached as definitively absent — not re-fetched even if written
-            probe_path.write_bytes(real_bytes)
-            assert await source.prior_exists(1, 1) is False
-
-    with caplog.at_level(logging.WARNING, logger="inspect_ai._eval.task.run"):
-        anyio.run(check)
-
-    assert not [r for r in caplog.records if "central directory" in r.message]
-
-
-def test_retry_presence_probe_not_used_for_json_logs(tmp_path: Path) -> None:
-    """A .json prior log keeps the default never-probe (no zip index to read)."""
-    from inspect_ai._eval.task.run import _never_prior_exists, eval_log_sample_source
-    from inspect_ai.dataset import MemoryDataset
-
-    prior_log, _ = _write_prior_eval_log(tmp_path / "logs")
-    source = eval_log_sample_source(
-        prior_log,
-        _retry_source_log_info(str(tmp_path / "prior.json")),
-        MemoryDataset([Sample(id=1, input="x", target="y")]),
-    )
-    assert source.prior_exists is _never_prior_exists
 
 
 def test_eval_raising_early_stopping_hook_keeps_sample_counted() -> None:

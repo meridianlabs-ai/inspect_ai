@@ -1,4 +1,5 @@
 import abc
+from collections.abc import Sequence
 from typing import IO, TYPE_CHECKING
 
 from inspect_ai._util.async_zip import AsyncZipReader
@@ -39,6 +40,40 @@ class Recorder(abc.ABC):
 
     @abc.abstractmethod
     async def log_init(self, eval: EvalSpec, location: str | None = None) -> str: ...
+
+    async def log_seed(
+        self,
+        eval: EvalSpec,
+        prior: "str | Sequence[EvalSample]",
+        keep: set[tuple[str | int, int]] | None,
+    ) -> None:
+        """Seed an initialized (not yet started) log with a prior attempt's samples.
+
+        A retry attempt's log starts out holding every sample record the
+        prior attempt's log holds (restricted to the planned ``keep`` keys
+        when given), so the attempt's log is a superset of the prior log from
+        its first flush no matter how the attempt ends (see
+        ``design/retry-seeded-attempt-log.md``). ``prior`` is the prior log's
+        location or, for an in-memory prior log, its samples.
+
+        The base implementation re-logs each kept sample through
+        :meth:`log_sample` with ``write_through`` set; a recorder with a
+        cheaper same-format path (``EvalRecorder`` copies a prior ``.eval``
+        as bytes) overrides and falls back to this for anything else. Images
+        are kept as the prior recorded them, matching the byte copy. Raises
+        ``FileNotFoundError`` when a prior log location does not exist.
+        """
+        from inspect_ai.log._condense import condense_sample
+        from inspect_ai.log._file import read_eval_log_async
+
+        samples = (
+            (await read_eval_log_async(prior)).samples or []
+            if isinstance(prior, str)
+            else prior
+        )
+        for sample in samples:
+            if keep is None or (sample.id, sample.epoch) in keep:
+                await self.log_sample(eval, condense_sample(sample), write_through=True)
 
     @abc.abstractmethod
     async def log_start(self, eval: EvalSpec, plan: EvalPlan) -> None: ...

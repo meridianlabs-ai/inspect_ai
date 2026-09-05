@@ -72,6 +72,10 @@ logger = logging.getLogger(__name__)
 
 _STALE_FLUSH_INTERVAL: float = 60
 
+# how many seeded prior records the reuse sweep reads back from the recorder
+# at once (see TaskLogger.read_prior_sample)
+_PRIOR_READ_CONCURRENCY = 4
+
 if TYPE_CHECKING:
     from inspect_ai._control.eval_state import BufferConfig
     from inspect_ai.log._config_update import ConfigUpdate
@@ -291,18 +295,6 @@ class TaskLogger:
         if high_throughput and eval_config.log_buffer is None:
             eval_config.log_buffer = self.flush_buffer
         self.flush_pending: list[tuple[str | int, int]] = []
-        # completed samples re-logged with flush=False (a retry's reused
-        # samples): tracked so every flush path drains them, but not counted
-        # toward the flush_buffer threshold and never arming the stale-flush
-        # timer on their own (one deterministic flush is scheduled when the
-        # reuse sweep settles — see reuse_sweep_settled)
-        self.flush_quiet: list[tuple[str | int, int]] = []
-        # sticky permit for the stale-flush timer to arm with only quiet
-        # samples pending: set when a flush fails with flush_quiet non-empty,
-        # cleared when flush_quiet fully drains. Sticky state rather than a
-        # one-shot argument so the timer's own failure re-arm (and
-        # flush_samples()'s except re-arm) keep retrying a quiet-only flush.
-        self.flush_quiet_retry = False
         self._init_stale_flush_state()
 
         # set once log_finish() has finalized and torn down the recorder. The
@@ -312,9 +304,16 @@ class TaskLogger:
         # torn-down recorder.
         self._finished = False
 
-        # set for a retry attempt until its reuse sweep settles (see
-        # hold_destination_writes); while set, no destination write happens
-        self._destination_hold = False
+        # set once a retry attempt's log has been seeded with the prior
+        # attempt's sample records (see seed_from_prior); the limit bounds the
+        # sweep's read-back of those records (see read_prior_sample)
+        self._prior_seeded = False
+        self._prior_read_limit = anyio.Semaphore(_PRIOR_READ_CONCURRENCY)
+        # seeded (id, epoch) keys the reuse sweep has not yet resolved: the
+        # records sample_summaries withholds from the control channel (see
+        # its docstring). A key leaves when the sweep accepts its record
+        # (note_reused_sample) or a completion for it lands.
+        self._seeded_pending: set[tuple[str | int, int]] = set()
 
         # sample buffer db
         self._buffer_db: SampleBufferDatabase | None = None
@@ -367,26 +366,30 @@ class TaskLogger:
         # logger, which is about to be re-pointed at the new attempt
         detach_eval_live(self.eval.eval_id)
 
-        await self._stop_stale_flush_timer()
+        if self._finished:
+            await self._stop_stale_flush_timer()
+        else:
+            # the attempt failed before finishing its log (its prior-log seed
+            # or a log write failed): log_finish never released its recorder
+            # entry (open temp zip) or buffer db, and a destination its
+            # log_start flushed would stand as a stray `started` log — drop
+            # them as for an abandoned attempt, before the eval_id moves on
+            await self.discard()
         self.eval = self.eval.model_copy(update=dict(eval_id=uuid(), created=iso_now()))
         self._samples_completed = 0
         self._logged_sample_keys = set()
         self._cancelled_sample_keys = set()
         self.flush_pending = []
-        self.flush_quiet = []
-        self.flush_quiet_retry = False
         self._finished = False
-        # the retry attempt re-enters task_run, which re-sets the hold for
-        # its own reuse sweep when applicable
-        self._destination_hold = False
+        # the retry attempt re-enters task_run, which seeds its fresh log
+        self._prior_seeded = False
+        self._seeded_pending = set()
         # the retry attempt gets a fresh log, which must re-record the run's
         # full accumulated process-scoped updates in init() below
         self._process_updates_recorded = 0
-        # normally log_finish() has already cleaned up the buffer db, but if
-        # the attempt failed before finishing its log (e.g. the log_start()
-        # write failed) it is still live — clean it up so the new attempt
-        # can't collide with it (the location repeats if `created` lands on
-        # the same second)
+        # log_finish() (or discard() above) has cleaned up the buffer db; a
+        # stale one would collide with the new attempt's (the location repeats
+        # if `created` lands on the same second)
         if self._buffer_db is not None:
             self._buffer_db.cleanup()
             self._buffer_db = None
@@ -456,6 +459,11 @@ class TaskLogger:
         return self._buffer_db
 
     @property
+    def prior_seeded(self) -> bool:
+        """Whether this attempt's log was seeded from a prior attempt's samples."""
+        return self._prior_seeded
+
+    @property
     def destination_written(self) -> bool:
         """Whether anything has reached this attempt's destination log file.
 
@@ -468,32 +476,82 @@ class TaskLogger:
             return True
         return self.recorder.destination_written(self.eval)
 
-    def hold_destination_writes(self) -> None:
-        """Defer every destination write until the reuse sweep settles.
+    @property
+    def finished(self) -> bool:
+        """Whether :meth:`log_finish` completed for this attempt (its log is written)."""
+        return self._finished
 
-        Called by ``task_run`` immediately before ``log_start`` when this
-        attempt is a retry with a non-empty seed (an ``options.sample_source``
-        and at least one planned run). While held, ``log_start`` skips its
-        immediate flush and ``_flush_pending_samples`` is a no-op, so the
-        attempt's first destination write is the reuse-sweep settle flush —
-        which by construction contains ``start.json`` plus the complete
-        re-logged reused set. A hard kill before that write therefore leaves
-        no destination file at all: the next retry chains to the prior
-        attempt's log (reuse intact) rather than to an empty newest log that
-        would silently re-run every completed sample (and, with
-        ``retry_cleanup=True``, lose them permanently once the prior log is
-        cleaned up). Released by :meth:`reuse_sweep_settled` when the sweep
-        settles, with ``log_finish`` as the backstop for attempts that end
-        before settling.
+    async def seed_from_prior(
+        self,
+        prior: "str | list[EvalSample]",
+        keep: set[tuple[str | int, int]] | None,
+    ) -> None:
+        """Seed this retry attempt's log with the prior attempt's sample records.
+
+        Called by ``task_run`` after ``init`` and before ``log_start`` when the
+        attempt has an eligible sample source (see ``EvalSampleSource.seed``).
+        ``prior`` is the prior log's location or an in-memory prior log's
+        samples; the recorder copies a same-format prior log file whole and
+        re-logs samples otherwise (see ``Recorder.log_seed``). Restricted to
+        the planned ``keep`` keys (``None`` for a dynamically fed task keeps
+        everything).
+
+        Afterwards the log holds every prior record the attempt could reuse,
+        so whatever ends the attempt, ``log_finish`` writes a complete log —
+        the next attempt never re-runs a sample this one already carried.
+        Seeded records are *not* counted as this attempt's resolutions here:
+        :attr:`samples_logged` and :attr:`samples_completed` count a reused
+        record when the reuse sweep accepts it (:meth:`note_reused_sample`)
+        and a re-run when it completes, so a graceful drain that abandons a
+        seeded errored sample's re-run still reads that sample as unresolved
+        (its only record is the prior attempt's error) and a later eval-set
+        pass re-runs it.
+
+        A prior log that no longer exists leaves the attempt unseeded with a
+        warning (every planned sample runs fresh, as the reuse sweep's own
+        lookup degrades for a missing log). Any other read failure — after
+        the recorder's own retries — raises; the caller fails the attempt
+        without writing a log.
         """
-        self._destination_hold = True
+        try:
+            await self.recorder.log_seed(self.eval, prior, keep)
+        except FileNotFoundError:
+            logger.warning(
+                f"Prior log {prior} not found: retry attempt will re-run every "
+                "sample rather than reusing the prior attempt's."
+            )
+            return
+        self._prior_seeded = True
+        seeded = await self.recorder.sample_summaries(self.eval)
+        self._seeded_pending = {(s.id, s.epoch) for s in seeded or []}
+
+    async def read_prior_sample(self, id: str | int, epoch: int) -> EvalSample | None:
+        """The seeded prior record for ``(id, epoch)``, read from the recorder, or None.
+
+        The reuse sweep's lookup once the log is seeded: served from the
+        recorder's local copy (no destination read, so an absent key costs
+        nothing remote). Every planned sample's ``run_sample`` calls this at
+        attempt start, so the reads are bounded by ``_prior_read_limit``:
+        the recorder serializes them on its own lock, and without the bound
+        every other lock user (a control-channel listing, a live completion)
+        would queue behind the whole sweep.
+        """
+        async with self._prior_read_limit:
+            return await self.recorder.buffered_sample(self.eval, id, epoch)
+
+    def note_reused_sample(self, sample: EvalSample) -> None:
+        """Record that the reuse sweep accepted a seeded prior sample as this attempt's result.
+
+        The bookkeeping half of :meth:`complete_sample` for a record the
+        seed already put in the log: nothing is written or flushed.
+        """
+        self._record_sample_outcome(sample)
 
     async def log_start(self, plan: EvalPlan) -> None:
         await self.recorder.log_start(self.eval, plan)
-        # while destination writes are held the start record stays journaled
-        # in the recorder's temp zip and rides out with the settle flush
-        if not self._destination_hold:
-            await self.recorder.flush(self.eval)
+        # the first destination write: for a seeded retry attempt it already
+        # carries the complete prior sample set
+        await self.recorder.flush(self.eval)
 
     async def start_sample(self, sample: EvalSampleSummary) -> None:
         if self._buffer_db is not None:
@@ -509,8 +567,20 @@ class TaskLogger:
             self._buffer_db.remove_samples([(id, epoch)])
 
     async def sample_summaries(self) -> list[EvalSampleSummary] | None:
-        """Live completed-sample summaries (handed to the control channel via ``register_eval``)."""
-        return await self.recorder.sample_summaries(self.eval)
+        """Live completed-sample summaries (handed to the control channel via ``register_eval``).
+
+        Withholds the seeded prior records the reuse sweep has not yet
+        resolved (``_seeded_pending``). Until the sweep accepts one as this
+        attempt's result or its re-run completes, it is the prior attempt's
+        record rather than an outcome of this attempt: listed, it would hide
+        the re-run's running row or render a sample still awaiting its
+        re-run as the prior's error. Withheld, the sample reads running or
+        pending exactly as it did before logs were seeded.
+        """
+        summaries = await self.recorder.sample_summaries(self.eval)
+        if summaries is None or not self._seeded_pending:
+            return summaries
+        return [s for s in summaries if (s.id, s.epoch) not in self._seeded_pending]
 
     async def read_sample(
         self,
@@ -519,7 +589,16 @@ class TaskLogger:
         *,
         exclude_fields: set[str] | None = None,
     ) -> EvalSample | None:
-        """Read one full sample (recorder buffer, then on-disk log), or None."""
+        """Read one full sample (recorder buffer, then on-disk log), or None.
+
+        Withholds an unresolved seeded prior record exactly as
+        :meth:`sample_summaries` does: the per-sample directives (requeue,
+        cancel, error detail) resolve a sample's state from this read, and a
+        seeded record served here would make a sample that has not yet run
+        look terminal — accepting a requeue that then runs it twice, or
+        answering a cancel with "already finished". The reuse sweep reads
+        seeded records through :meth:`read_prior_sample` instead.
+        """
         # The whole-sample counterpart to `sample_summaries`, handed to the
         # control channel via `register_eval` so per-sample reads (error detail,
         # event pages) source from the *same* place the samples listing does.
@@ -527,22 +606,36 @@ class TaskLogger:
         # to the finalized on-disk log once it's flushed / the recorder is torn
         # down — otherwise those reads see only the on-disk log and miss a
         # just-completed (or reused-on-retry) sample the listing already shows.
+        if (id, epoch) in self._seeded_pending:
+            return None
         buffered = await self.recorder.buffered_sample(self.eval, id, epoch)
         if buffered is not None:
+            # the recorder's copy is whole (resident, or a local zip member
+            # read in full); honour the exclusion by resetting the fields to
+            # their defaults rather than parsing them selectively as the disk
+            # read does. A required field (id, epoch, input, target) has no
+            # default to reset to — `get_default` would plant PydanticUndefined
+            # in the unvalidated copy and fail at serialization — so it stays
+            if exclude_fields:
+                fields = EvalSample.model_fields
+                buffered = buffered.model_copy(
+                    update={
+                        field: fields[field].get_default(call_default_factory=True)
+                        for field in exclude_fields
+                        if field in fields and not fields[field].is_required()
+                    }
+                )
             return buffered
 
         from inspect_ai.log._file import read_eval_log_sample_async
 
-        # `exclude_fields` applies only here: the in-memory sample above is
-        # already resident, so returning it whole costs nothing.
         try:
             return await read_eval_log_sample_async(
                 self.location, id, epoch, exclude_fields=exclude_fields
             )
         except (IndexError, FileNotFoundError):
             # IndexError: no such sample in the log. FileNotFoundError: the
-            # destination log doesn't exist yet (a held retry attempt before
-            # its reuse-sweep settle flush).
+            # destination log doesn't exist yet (before log_start's flush).
             return None
 
     def sample_events_provider(
@@ -569,10 +662,8 @@ class TaskLogger:
 
         return BufferTranscriptHistoryProvider(self._buffer_db, id, epoch)
 
-    async def complete_sample(
-        self, sample: EvalSample, *, flush: bool, write_through: bool = False
-    ) -> None:
-        await self.recorder.log_sample(self.eval, sample, write_through=write_through)
+    async def complete_sample(self, sample: EvalSample, *, flush: bool) -> None:
+        await self.recorder.log_sample(self.eval, sample)
         await self._finalize_sample(sample, flush=flush)
 
     async def complete_sample_streaming(
@@ -587,6 +678,9 @@ class TaskLogger:
                 sample.summary(), sample_metadata=sample.metadata
             )
 
+        # flush=False leaves the sample in the recorder's buffer for whichever
+        # flush comes next (a later threshold flush or the finish) rather than
+        # counting it toward the threshold or arming the stale-flush timer
         if flush:
             async with self._flush_pending_lock:
                 was_empty = not self.flush_pending
@@ -598,12 +692,15 @@ class TaskLogger:
                 await self._flush_pending_samples()
             elif was_empty:
                 await self._start_stale_flush_timer_if_needed()
-        else:
-            async with self._flush_pending_lock:
-                self.flush_quiet.append((sample.id, sample.epoch))
 
+        self._record_sample_outcome(sample)
+
+    def _record_sample_outcome(self, sample: EvalSample) -> None:
         key = (sample.id, sample.epoch)
         self._logged_sample_keys.add(key)
+        # a seeded record is resolved: accepted by the sweep as-is, or
+        # superseded by its re-run's completion
+        self._seeded_pending.discard(key)
         # same classifier the read/requeue/retry surfaces use to tell a
         # cancelled sample from an errored one; discard on re-log so a
         # requeued cancelled sample's re-run counts again
@@ -615,64 +712,36 @@ class TaskLogger:
             self._samples_completed += 1
 
     async def _flush_pending_samples(
-        self, *, stale_flush_generation: int | None = None, even_if_empty: bool = False
+        self, *, stale_flush_generation: int | None = None
     ) -> int:
         """Flush buffered completed samples to the log; return the count written.
 
-        Shared by every flush path — the buffer-full flush, the stale-flush
-        timer, and the reuse-sweep settle flush (which ignore the return) and
-        the on-demand ``flush_samples()``. Drains ``flush_pending`` and
-        ``flush_quiet`` alike, proceeding when *either* is non-empty (so
-        ``inspect ctl task log-flush`` works when only reused samples are
-        buffered), and the returned count covers samples drained from both
-        lists. Serialized via :attr:`_flush_lock`; a no-op returning 0 once
-        the eval has finished (``log_finish`` has written everything and torn
-        the recorder down, so reaching into it would raise) or while
-        destination writes are held (see :meth:`hold_destination_writes`) —
-        nothing is drained, so the pending lists and buffer-db rows stay
-        intact for the settle flush. ``even_if_empty`` proceeds even with both lists
-        empty: the settle flush uses it to create the destination (the temp
-        zip already holds ``start.json`` plus any write-throughs) when a held
-        attempt reused nothing.
+        Shared by every flush path — the buffer-full flush and the stale-flush
+        timer (which ignore the return) and the on-demand ``flush_samples()``.
+        Serialized via :attr:`_flush_lock`; a no-op returning 0 once the eval
+        has finished (``log_finish`` has written everything and torn the
+        recorder down, so reaching into it would raise) or when nothing is
+        pending.
         """
         reschedule_stale_flush = False
         flushed = 0
         async with self._flush_lock:
             if self._finished:
                 return 0
-            # checked under _flush_lock so a caller already awaiting the lock
-            # when reuse_sweep_settled releases the hold proceeds normally
-            if self._destination_hold:
-                return 0
             async with self._flush_pending_lock:
                 pending = list(self.flush_pending)
-                quiet = list(self.flush_quiet)
-                if not even_if_empty and not pending and not quiet:
+                if not pending:
                     return 0
 
-            try:
-                await self.recorder.flush(self.eval)
-            except BaseException:
-                # quiet samples never arm the stale timer on their own, so a
-                # failed write would otherwise leave a quiet-only state with
-                # no automatic retry: permit the timer to arm for them
-                if self.flush_quiet:
-                    self.flush_quiet_retry = True
-                raise
-            flushed = len(pending) + len(quiet)
+            await self.recorder.flush(self.eval)
+            flushed = len(pending)
 
             async with self._flush_pending_lock:
                 if self._buffer_db is not None:
-                    # quiet (reused) samples never had a buffer-db row (the
-                    # reuse path doesn't call start_sample), so only live
-                    # pending samples need removal
                     self._buffer_db.remove_samples(pending)
 
                 # Items appended during the flush are at the tail; drop the flushed prefix.
                 del self.flush_pending[: len(pending)]
-                del self.flush_quiet[: len(quiet)]
-                if not self.flush_quiet:
-                    self.flush_quiet_retry = False
                 current_generation = self._stale_flush_generation
                 reschedule_stale_flush = bool(self.flush_pending) and (
                     stale_flush_generation is None
@@ -689,20 +758,11 @@ class TaskLogger:
         Completed samples normally accumulate until ``log_buffer`` of them queue
         up (or the stale-flush timer fires) before a (possibly remote) write.
         This forces that write now — so the samples become readable in the log
-        without waiting — and returns the number written, counting quiet
-        (retry-reused) samples as well as live completions (0 if none were
-        pending, the eval has finished, or destination writes are held while a
-        retry's reuse sweep runs — the settle flush is already scheduled and
-        will write everything shortly). Handed to the control channel via
-        ``register_eval`` so ``inspect ctl task log-flush`` can push a long-running
-        eval's results out to S3 on demand.
+        without waiting — and returns the number written (0 if none were
+        pending or the eval has finished). Handed to the control channel via
+        ``register_eval`` so ``inspect ctl task log-flush`` can push a
+        long-running eval's results out to S3 on demand.
         """
-        # while held this can only no-op, so return before stopping the timer:
-        # stopping it here would disarm the retry for live samples already
-        # pending without the flush that normally replaces it
-        if self._destination_hold:
-            return 0
-
         # an on-demand flush writes everything pending, so quiesce the stale
         # timer first (it would otherwise wake to find nothing left to do)
         await self._stop_stale_flush_timer()
@@ -715,59 +775,6 @@ class TaskLogger:
             # own on-failure re-arm). The error still propagates to the caller.
             await self._arm_stale_flush_timer()
             raise
-
-    def reuse_sweep_settled(self) -> None:
-        """The reuse sweep settled: release any destination-write hold and schedule one settle flush.
-
-        Called by ``task_run`` when every planned sample has resolved its
-        prior-attempt lookup (a no-op on runs with nothing held and nothing
-        reused — most runs). Reused samples
-        are re-logged with ``flush=False`` and neither count toward the
-        ``flush_buffer`` threshold nor arm the stale-flush timer, so without
-        this one deterministic write they would stay unflushed until an
-        unrelated trigger — on a retry whose remaining samples are
-        long-running, possibly hours or never. The settled sweep also means
-        the temp zip holds the complete reused set, so the destination-write
-        hold (see :meth:`hold_destination_writes`) is cleared here —
-        synchronously, before the background flush runs, so any flush caller
-        already awaiting ``_flush_lock`` proceeds once it gets the lock. When
-        the hold was set the flush runs even with nothing quiet pending
-        (prior log empty or unreadable, ``log_samples=False``): the forced
-        write creates the destination, restoring the "running log exists on
-        disk" property as early as possible. Without a hold it stays a no-op
-        when nothing quiet is pending (fresh eval, later dynamic-feed settle
-        cycles) or the eval has finished.
-
-        May fire during teardown (cancelled ``run_sample``s still settle the
-        sweep countdown): benign — the flush serializes with ``log_finish``
-        on ``_flush_lock`` and no-ops once ``_finished`` is set.
-        """
-        if self._finished:
-            return
-        held = self._destination_hold
-        self._destination_hold = False
-        if not held and not self.flush_quiet:
-            return
-        try:
-            run_in_background(self._quiet_settle_flush, held)
-        except Exception as ex:
-            # background spawn unavailable (e.g. torn-down task group during
-            # teardown): log_finish's own final write drains the samples
-            logger.warning(
-                "Unable to schedule reused-sample flush: %s", ex, exc_info=ex
-            )
-
-    async def _quiet_settle_flush(self, even_if_empty: bool = False) -> None:
-        try:
-            # shield the write like the stale-timer path: a teardown that
-            # cancels the background group must not abandon a half-written log
-            with anyio.CancelScope(shield=True):
-                await self._flush_pending_samples(even_if_empty=even_if_empty)
-        except Exception as ex:
-            logger.warning("Reused-sample settle flush failed: %s", ex, exc_info=ex)
-            # retry fallback: the failed flush set flush_quiet_retry, which
-            # extends the arming predicate to quiet-only pending state
-            await self._arm_stale_flush_timer()
 
     def buffer_config(
         self, log_buffer: int | None = None, log_shared: int | None = None
@@ -805,7 +812,7 @@ class TaskLogger:
             self._buffer_db.set_sync_interval(log_shared)
         return BufferConfig(
             log_buffer=self.flush_buffer,
-            pending=len(self.flush_pending) + len(self.flush_quiet),
+            pending=len(self.flush_pending),
             log_shared=self._buffer_db.shared_sync_interval
             if self._buffer_db is not None
             else None,
@@ -895,11 +902,7 @@ class TaskLogger:
             if generation is not None and generation != self._stale_flush_generation:
                 return
 
-            # quiet (reused) samples arm the timer only after a failed flush
-            # set the retry permit — the settle flush is their primary drain
-            should_start = (0 < len(self.flush_pending) < self.flush_buffer) or (
-                self.flush_quiet_retry and len(self.flush_quiet) > 0
-            )
+            should_start = 0 < len(self.flush_pending) < self.flush_buffer
             already_started = self._stale_flush_cancel_scope is not None
             if not should_start or already_started:
                 return
@@ -954,8 +957,7 @@ class TaskLogger:
         drops the recorder's in-memory entry for this eval — ``log_finish``
         never runs for an abandoned attempt, so the entry would otherwise
         live for the rest of the run — and removes a destination file the
-        attempt already flushed (``log_start`` flushes a header when no
-        destination hold is active, i.e. a zero-seed retry): a stray
+        attempt already flushed (``log_start`` flushes the header): a stray
         ``started`` log would otherwise win the end-of-run retry-cleanup
         sweep by mtime, deleting the errored attempt's log that must stand
         as the task's final state.
@@ -1004,13 +1006,6 @@ class TaskLogger:
                         await self._flush_pending_samples(
                             stale_flush_generation=generation
                         )
-                    if self._destination_hold:
-                        # the flush no-oped under the hold, and clearing the
-                        # timer above dropped this fire's arming: re-arm so
-                        # pending samples still have a retry if the sweep never
-                        # settles (a cancelled task group can leave the
-                        # countdown short of its last settle)
-                        await self._arm_stale_flush_timer(generation=generation)
                 except Exception as ex:
                     logger.warning("Stale eval log flush failed: %s", ex, exc_info=ex)
                     await self._arm_stale_flush_timer(generation=generation)
@@ -1054,10 +1049,9 @@ class TaskLogger:
             # visible under --ctl-server=keep) report a finished no-op / accurate
             # empty pending rather than reporting stale pending.
             self._finished = True
+            self._seeded_pending.clear()
             async with self._flush_pending_lock:
                 self.flush_pending.clear()
-                self.flush_quiet.clear()
-                self.flush_quiet_retry = False
 
             # cleanup the events db
             if self._buffer_db is not None:
