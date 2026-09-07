@@ -184,12 +184,20 @@ jobs:
           path: .docs-render-ok
           key: docs-render-${{ hashFiles('docs/**', 'requirements-doc.txt', '.docs-src-delta') }}
 
+      # Own cache scope: setup-uv's default key is shared by every 3.11 job
+      # here, so the first to finish saves its dev cache and this job only ever
+      # logs "cache hit ... not saving cache" — leaving the sdist-built
+      # quarto-cli wheel, 43s of the install step below, uncacheable. Note the
+      # key hashes requirements-doc.txt, not the resolution it produces, so a
+      # quarto release above its `>=` floor still re-pays that build until some
+      # hashed file rotates the key.
       - name: Install uv
         if: steps.render-cache.outputs.cache-hit != 'true'
         uses: astral-sh/setup-uv@v10.0.1
         with:
           version: ${{ env.UV_VERSION }}
           python-version: "3.11"
+          cache-suffix: docs
 
       # The package itself is installed because reference docs are
       # generated from the inspect_ai module (griffe).
