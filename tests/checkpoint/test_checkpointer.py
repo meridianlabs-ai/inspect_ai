@@ -67,8 +67,10 @@ from inspect_ai.util._checkpoint.config import (
 )
 from inspect_ai.util._checkpoint.hydrate import HydrationResult, _HostHydrationResult
 from inspect_ai.util._checkpoint.report import ResumeReport
+from inspect_ai.util._checkpoint.sandbox_paths import SandboxBackupPaths
 from inspect_ai.util._restic import ResticBackupSummary
 from inspect_ai.util._store import Store
+from inspect_ai.util._subprocess import ExecResult
 
 
 def _write_transcript_files(store: TranscriptEventStore, work_dir: Path) -> None:
@@ -2891,7 +2893,9 @@ class _StubStrategy:
             )
         )
 
-    async def restore(self, env: object, ref: object, ctx: object) -> None:
+    async def restore(
+        self, env: object, paths: object, ref: object, ctx: object
+    ) -> None:
         pass
 
     async def discard_orphans(self, committed: object, ctx: object) -> None:
@@ -2956,3 +2960,140 @@ async def test_fire_routes_sandbox_snapshot_through_strategy(
     )
     details = checkpoint.sandboxes["default"]
     assert (details.model_extra or {}).get("strategy") == "archive"
+
+
+# --- sandbox hydration: restore gating and home ownership ---------------
+
+
+class _RecordingStrategy(_StubStrategy):
+    """Records the resume-side calls in order, with what ``restore`` received."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[str] = []
+        self.restored: list[tuple[object, object]] = []
+
+    async def setup(self, env: object, ctx: object) -> None:
+        self.calls.append("setup")
+
+    async def discard_orphans(self, committed: object, ctx: object) -> None:
+        self.calls.append("discard_orphans")
+
+    async def restore(
+        self, env: object, paths: object, ref: object, ctx: object
+    ) -> None:
+        self.calls.append("restore")
+        self.restored.append((paths, ref))
+
+
+class _RecordingSandbox:
+    """Sandbox fake that records ``exec`` commands and answers ``stat -c %u``."""
+
+    def __init__(self) -> None:
+        self.commands: list[list[str]] = []
+
+    async def exec(self, cmd: list[str], **kwargs: object) -> ExecResult[str]:
+        self.commands.append(cmd)
+        stdout = "1001\n" if cmd[:3] == ["stat", "-c", "%u"] else ""
+        return ExecResult(success=True, returncode=0, stdout=stdout, stderr="")
+
+
+def _sandbox_checkpoint(checkpoint_id: int, sandboxes: dict[str, str]) -> Checkpoint:
+    return Checkpoint(
+        checkpoint_id=checkpoint_id,
+        trigger="turn",
+        turn=checkpoint_id,
+        created_at=datetime.now(timezone.utc),
+        duration_ms=0,
+        size_bytes=0,
+        host=SnapshotDetails(snapshot_id="host", size_bytes=0, duration_ms=0),
+        sandboxes={
+            name: SnapshotDetails(snapshot_id=sid, size_bytes=0, duration_ms=0)
+            for name, sid in sandboxes.items()
+        },
+    )
+
+
+async def _hydrate_one_sandbox(
+    strategy: _RecordingStrategy,
+    env: _RecordingSandbox,
+    paths: SandboxBackupPaths,
+    committed: list[Checkpoint],
+) -> None:
+    from inspect_ai.util._checkpoint._snapshot import (
+        SandboxSnapshotSession,
+        SnapshotContext,
+    )
+    from inspect_ai.util._checkpoint.checkpointer import ResumeCheckpoint
+    from inspect_ai.util._checkpoint.hydrate import _hydrate_sandbox
+
+    session = SandboxSnapshotSession(
+        strategy=strategy,
+        context=SnapshotContext(
+            sandbox_name="default",
+            storage_dir="/nowhere/sandboxes/default/archive",
+            storage_subpath="sandboxes/default/archive",
+            secret="test-pwd",
+            resuming=True,
+        ),
+        paths=paths,
+    )
+    with patch("inspect_ai.util._checkpoint.hydrate.sandbox", return_value=env):
+        await _hydrate_sandbox(
+            name="default",
+            session=session,
+            resume=ResumeCheckpoint(attempt="resume"),
+            committed_checkpoints=committed,
+            action="Checkpoint Hydrate",
+        )
+
+
+async def test_hydrate_sandbox_refuses_resume_without_committed_record() -> None:
+    """No committed checkpoint records this sandbox: nothing is restored or discarded."""
+    strategy = _RecordingStrategy()
+    env = _RecordingSandbox()
+    with pytest.raises(
+        RuntimeError, match="no committed checkpoint records a snapshot"
+    ):
+        await _hydrate_one_sandbox(
+            strategy,
+            env,
+            SandboxBackupPaths(include=["/root"], home="/root"),
+            [_sandbox_checkpoint(1, {"other": "o1"})],
+        )
+    assert strategy.calls == ["setup"]
+    assert env.commands == []
+
+
+async def test_hydrate_sandbox_reowns_auto_home_around_restore() -> None:
+    """Auto-home: read the owner before the restore, re-own under it after."""
+    strategy = _RecordingStrategy()
+    env = _RecordingSandbox()
+    paths = SandboxBackupPaths(include=["/home/agent"], home="/home/agent")
+    committed = [
+        _sandbox_checkpoint(1, {"default": "d1"}),
+        _sandbox_checkpoint(2, {"default": "d2"}),
+    ]
+    await _hydrate_one_sandbox(strategy, env, paths, committed)
+
+    assert strategy.calls == ["setup", "discard_orphans", "restore"]
+    [(restored_paths, ref)] = strategy.restored
+    assert restored_paths is paths
+    assert isinstance(ref, SnapshotDetails) and ref.snapshot_id == "d2"
+    assert env.commands == [
+        ["stat", "-c", "%u", "/home/agent"],
+        ["sh", "-c", "find /home/agent ! -user 1001 -exec chown -h 1001 {} +"],
+    ]
+
+
+async def test_hydrate_sandbox_keeps_recorded_ownership_for_configured_paths() -> None:
+    strategy = _RecordingStrategy()
+    env = _RecordingSandbox()
+    await _hydrate_one_sandbox(
+        strategy,
+        env,
+        SandboxBackupPaths(include=["/data"]),
+        [_sandbox_checkpoint(1, {"default": "d1"})],
+    )
+    assert strategy.calls == ["setup", "discard_orphans", "restore"]
+    assert env.commands == []

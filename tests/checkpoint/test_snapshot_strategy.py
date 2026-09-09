@@ -2,30 +2,38 @@
 
 Covers the §4.7 strategy pin semantics, the shared chunked copy-out
 primitive, and the ``archive`` strategy's mechanics (snapshot → restore
-roundtrip, hash verification, orphan discard) against a *local shell*
-sandbox fake: ``exec`` runs the scripts with the host's ``sh`` and file
-APIs map to host paths, so the strategy's real shell pipelines (tar |
-compress, dd chunking, sha256 verify-then-extract) execute for real — no
-Docker required. The strategy's in-sandbox root-only area is pointed at
-a temp dir via its ``sandbox_dir`` parameter; ``user="root"`` is ignored
-by the fake.
+roundtrip, hash verification, restore scoping, orphan discard) against a
+*local shell* sandbox fake: ``exec`` runs the scripts with the host's
+``sh`` and file APIs map to host paths, so the strategy's real shell
+pipelines (tar | compress, dd chunking, sha256 verify-then-extract)
+execute for real — no Docker required. The strategy's in-sandbox
+root-only area is pointed at a temp dir via its ``sandbox_dir``
+parameter; ``user="root"`` is ignored by the fake.
 """
 
 from __future__ import annotations
 
+import gzip
 import hashlib
+import io
 import os
+import re
 import shutil
+import tarfile
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
+from unittest.mock import patch
 
 import anyio
 import pytest
+import zstandard
 from test_helpers.local_shell_sandbox import LocalShellSandbox
 
 from inspect_ai.util._checkpoint._copy import copy_out, copy_out_partial_path
 from inspect_ai.util._checkpoint._layout.schemas import Checkpoint, SnapshotDetails
+from inspect_ai.util._checkpoint._restore_scope import RestoreScopeError
 from inspect_ai.util._checkpoint._snapshot import (
     committed_snapshots_for,
     snapshot_strategy_name,
@@ -98,7 +106,7 @@ async def _strategy(env: LocalShellSandbox, tmp_path: Path) -> ArchiveStrategy:
 
 
 def _write_data(data_dir: Path) -> dict[str, bytes]:
-    """Populate a capture tree: text, multi-chunk binary, and a cache dir."""
+    """Populate a capture tree: text, multi-chunk binary, a symlink, a cache dir."""
     data_dir.mkdir(parents=True, exist_ok=True)
     (data_dir / "nested").mkdir(exist_ok=True)
     files = {
@@ -110,6 +118,9 @@ def _write_data(data_dir: Path) -> dict[str, bytes]:
     }
     for rel, content in files.items():
         (data_dir / rel).write_bytes(content)
+    link = data_dir / "link.txt"
+    if not link.is_symlink():
+        link.symlink_to("notes.txt")
     cache = data_dir / ".cache"
     cache.mkdir(exist_ok=True)
     (cache / "junk").write_bytes(b"never captured")
@@ -126,12 +137,17 @@ async def test_archive_snapshot_restore_roundtrip(tmp_path: Path) -> None:
     data_dir = tmp_path / "capture" / "data"
     files = _write_data(data_dir)
     paths = SandboxBackupPaths(include=[str(data_dir)], exclude=["**/.cache"])
+    # Sibling of the capture root: must be untouched by the restore.
+    sibling = tmp_path / "capture" / "sibling.txt"
+    sibling.write_bytes(b"not captured")
+    parent_mode = (tmp_path / "capture").stat().st_mode
 
     details = await strategy.snapshot(env, paths, 1, ctx)
 
     assert details.snapshot_id == "ckpt-00001"
     assert snapshot_strategy_name(details) == STRATEGY_ARCHIVE
     extra = details.model_extra or {}
+    assert extra["roots"] == [str(data_dir)]
     archives = list(Path(ctx.storage_dir).iterdir())
     assert [a.name for a in archives] == [extra["archive"]]
     assert details.size_bytes == archives[0].stat().st_size
@@ -142,17 +158,24 @@ async def test_archive_snapshot_restore_roundtrip(tmp_path: Path) -> None:
     # "fresh sandbox".
     for rel in files:
         (data_dir / rel).unlink()
+    (data_dir / "link.txt").unlink()
     (data_dir / ".cache" / "junk").unlink()
     (data_dir / "extra-not-in-snapshot.txt").write_bytes(b"post-capture")
+    sibling.write_bytes(b"changed after capture")
 
-    await strategy.restore(env, details, ctx)
+    await strategy.restore(env, paths, details, ctx)
 
     for rel, content in files.items():
         assert (data_dir / rel).read_bytes() == content
+    assert (data_dir / "link.txt").is_symlink()
+    assert os.readlink(data_dir / "link.txt") == "notes.txt"
     # Excluded at capture: the cache dir's contents are not in the
     # archive, so restore does not recreate them.
     assert not (data_dir / ".cache" / "junk").exists()
     assert not (Path(strategy._staging_root)).exists()
+    # Nothing outside the capture root was written or re-moded.
+    assert sibling.read_bytes() == b"changed after capture"
+    assert (tmp_path / "capture").stat().st_mode == parent_mode
 
 
 async def test_archive_snapshot_handles_paths_with_spaces(tmp_path: Path) -> None:
@@ -169,7 +192,7 @@ async def test_archive_snapshot_handles_paths_with_spaces(tmp_path: Path) -> Non
 
     for rel in files:
         (data_dir / rel).unlink()
-    await strategy.restore(env, details, ctx)
+    await strategy.restore(env, paths, details, ctx)
     for rel, content in files.items():
         assert (data_dir / rel).read_bytes() == content
 
@@ -205,7 +228,7 @@ async def test_archive_snapshot_tolerates_tar_exit_1(tmp_path: Path) -> None:
     # capture-time "file changed as we read it" warning.
     for rel in files:
         (data_dir / rel).unlink()
-    await strategy.restore(LocalShellSandbox(), details, ctx)
+    await strategy.restore(LocalShellSandbox(), paths, details, ctx)
     for rel, content in files.items():
         assert (data_dir / rel).read_bytes() == content
 
@@ -258,13 +281,37 @@ async def test_archive_snapshot_tolerates_staging_cleanup_exception(
     assert details.snapshot_id == "ckpt-00001"
     for rel in files:
         (data_dir / rel).unlink()
-    await strategy.restore(LocalShellSandbox(), details, ctx)
+    await strategy.restore(LocalShellSandbox(), paths, details, ctx)
     for rel, content in files.items():
         assert (data_dir / rel).read_bytes() == content
 
 
+class _CountingSandbox(LocalShellSandbox):
+    """Counts ``exec`` calls: a refused restore must run none."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.execs = 0
+
+    async def exec(
+        self,
+        cmd: list[str],
+        input: str | bytes | None = None,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        user: str | None = None,
+        timeout: int | None = None,
+        timeout_retry: bool = True,
+        concurrency: bool = True,
+    ) -> ExecResult[str]:
+        self.execs += 1
+        return await super().exec(
+            cmd, input, cwd, env, user, timeout, timeout_retry, concurrency
+        )
+
+
 async def test_archive_restore_rejects_corrupt_archive(tmp_path: Path) -> None:
-    env = LocalShellSandbox()
+    env = _CountingSandbox()
     strategy = await _strategy(env, tmp_path)
     ctx = _context(tmp_path / "sample")
     data_dir = tmp_path / "capture" / "data"
@@ -275,52 +322,263 @@ async def test_archive_restore_rejects_corrupt_archive(tmp_path: Path) -> None:
     extra = details.model_extra or {}
     archive = Path(ctx.storage_dir) / str(extra["archive"])
 
-    # Flip bytes in the stored archive; the recorded digest no longer
-    # matches, so restore must fail *before* extracting anything.
+    # Flip bytes in the stored archive; the host-side walk fails (an
+    # unreadable stream, or a digest that no longer matches the record)
+    # before any byte is copied into the sandbox.
     corrupted = bytearray(archive.read_bytes())
     corrupted[10] ^= 0xFF
     archive.write_bytes(bytes(corrupted))
 
     marker = data_dir / "notes.txt"
     marker.write_bytes(b"post-capture content")
-    with pytest.raises(RuntimeError, match="digest mismatch"):
-        await strategy.restore(env, details, ctx)
+    execs_before = env.execs
+    with pytest.raises(RestoreScopeError, match="unreadable|digest mismatch"):
+        await strategy.restore(env, paths, details, ctx)
+    assert env.execs == execs_before
     # Nothing was extracted over the live tree.
     assert marker.read_bytes() == b"post-capture content"
 
 
-async def test_archive_restore_without_ref_uses_latest_archive(tmp_path: Path) -> None:
-    """Restore with no committed record falls back to the newest archive.
+async def test_archive_restore_rejects_digest_mismatch_before_copy_in(
+    tmp_path: Path,
+) -> None:
+    """A well-formed archive whose bytes are not the recorded ones is refused on the host."""
+    env = _CountingSandbox()
+    strategy = await _strategy(env, tmp_path)
+    ctx = _context(tmp_path / "sample")
+    data_dir = tmp_path / "capture" / "data"
+    _write_data(data_dir)
+    paths = SandboxBackupPaths(include=[str(data_dir)])
 
-    E.g. the kill tore the only checkpoint file mid-write; restic-parity
-    degenerate-case semantics.
+    details = await strategy.snapshot(env, paths, 1, ctx)
+    forged = details.model_copy(update={"content_sha256": "0" * 64})
+    execs_before = env.execs
+    with pytest.raises(RestoreScopeError, match="digest mismatch"):
+        await strategy.restore(env, paths, forged, ctx)
+    assert env.execs == execs_before
+
+
+def _crafted_archive(
+    path: Path, members: list[tarfile.TarInfo], contents: dict[str, bytes]
+) -> str:
+    """Write ``members`` as a ``.tar.gz``/``.tar.zst`` at ``path``; return its sha256."""
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w") as tar:
+        for info in members:
+            data = contents.get(info.name)
+            if data is not None:
+                info.size = len(data)
+            tar.addfile(info, io.BytesIO(data) if data is not None else None)
+    if path.name.endswith(".tar.zst"):
+        payload = zstandard.ZstdCompressor().compress(raw.getvalue())
+    else:
+        payload = gzip.compress(raw.getvalue())
+    path.write_bytes(payload)
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _member(
+    name: str, type: bytes = tarfile.REGTYPE, **attrs: object
+) -> tarfile.TarInfo:
+    info = tarfile.TarInfo(name)
+    info.type = type
+    info.mode = 0o755 if type == tarfile.DIRTYPE else 0o644
+    for key, value in attrs.items():
+        setattr(info, key, value)
+    return info
+
+
+def _rel(path: Path) -> str:
+    """A host path as the tar member name ``tar -c`` would write for it."""
+    return str(path).lstrip("/")
+
+
+_HOSTILE_MEMBERS: dict[str, Callable[[Path, Path], tuple[tarfile.TarInfo, str]]] = {
+    # (member, substring the error must name)
+    "outside_root": lambda root, outside: (
+        _member(_rel(outside / "planted.txt")),
+        f"{outside}/planted.txt lies outside",
+    ),
+    "etc_passwd": lambda root, outside: (
+        _member("etc/passwd"),
+        "/etc/passwd lies outside",
+    ),
+    "setuid_under_root": lambda root, outside: (
+        _member(_rel(root / "sh"), mode=0o4755),
+        f"{root}/sh has mode 4755",
+    ),
+    "sticky_dir_under_root": lambda root, outside: (
+        _member(_rel(root / "d"), tarfile.DIRTYPE, mode=0o1777),
+        f"{root}/d has mode 1777",
+    ),
+    "fifo_under_root": lambda root, outside: (
+        _member(_rel(root / "pipe"), tarfile.FIFOTYPE),
+        f"{root}/pipe is a tar type",
+    ),
+    "chardev_under_root": lambda root, outside: (
+        _member(_rel(root / "null"), tarfile.CHRTYPE),
+        f"{root}/null is a tar type",
+    ),
+    "hardlink_outside": lambda root, outside: (
+        _member(_rel(root / "pw"), tarfile.LNKTYPE, linkname="etc/passwd"),
+        f"{root}/pw is a hard link to /etc/passwd",
+    ),
+    "absolute_member": lambda root, outside: (
+        _member(str(root / "abs.txt")),
+        "archive member is empty or absolute",
+    ),
+    "dotdot_member": lambda root, outside: (
+        _member(f"{_rel(root)}/../escape.txt"),
+        "'..' component",
+    ),
+}
+
+
+@pytest.mark.parametrize("compression", ["gz", "zst"])
+@pytest.mark.parametrize("violation", sorted(_HOSTILE_MEMBERS))
+async def test_archive_restore_refuses_hostile_archive(
+    tmp_path: Path, violation: str, compression: str
+) -> None:
+    """A crafted archive is refused on the host, naming the offending member.
+
+    The archive otherwise looks legitimate — a valid ``ckpt-NNNNN`` name,
+    the recorded digest matches its bytes, and it carries the root — so
+    only the structural check stands between it and a root ``tar -x``.
+    Nothing is sent to the sandbox: no ``exec`` runs at all.
+    """
+    env = _CountingSandbox()
+    strategy = await _strategy(env, tmp_path)
+    ctx = _context(tmp_path / "sample")
+    root = tmp_path / "capture" / "data"
+    root.mkdir(parents=True)
+    outside = tmp_path / "capture" / "outside"
+    paths = SandboxBackupPaths(include=[str(root)])
+    hostile, expected = _HOSTILE_MEMBERS[violation](root, outside)
+
+    storage = Path(ctx.storage_dir)
+    storage.mkdir(parents=True)
+    archive_name = f"ckpt-00001.tar.{compression}"
+    digest = _crafted_archive(
+        storage / archive_name,
+        [
+            _member(_rel(root), tarfile.DIRTYPE),
+            _member(_rel(root / "notes.txt")),
+            hostile,
+        ],
+        {_rel(root / "notes.txt"): b"legit\n"},
+    )
+    details = SnapshotDetails.model_validate(
+        dict(
+            snapshot_id="ckpt-00001",
+            size_bytes=1,
+            duration_ms=1,
+            strategy=STRATEGY_ARCHIVE,
+            archive=archive_name,
+            content_sha256=digest,
+            roots=[str(root)],
+        )
+    )
+
+    execs_before = env.execs
+    with pytest.raises(RestoreScopeError, match=re.escape(expected)):
+        await strategy.restore(env, paths, details, ctx)
+    assert env.execs == execs_before
+    assert not (root / "notes.txt").exists()
+    assert not outside.exists()
+
+
+async def test_archive_restore_refuses_snapshot_missing_a_root(tmp_path: Path) -> None:
+    env = _CountingSandbox()
+    strategy = await _strategy(env, tmp_path)
+    ctx = _context(tmp_path / "sample")
+    root = tmp_path / "capture" / "data"
+    other = tmp_path / "capture" / "other"
+    root.mkdir(parents=True)
+    storage = Path(ctx.storage_dir)
+    storage.mkdir(parents=True)
+    digest = _crafted_archive(
+        storage / "ckpt-00001.tar.gz",
+        [_member(_rel(root), tarfile.DIRTYPE), _member(_rel(root / "a"))],
+        {_rel(root / "a"): b"a"},
+    )
+    details = SnapshotDetails.model_validate(
+        dict(
+            snapshot_id="ckpt-00001",
+            size_bytes=1,
+            duration_ms=1,
+            archive="ckpt-00001.tar.gz",
+            content_sha256=digest,
+        )
+    )
+    execs_before = env.execs
+    with pytest.raises(RestoreScopeError, match=rf"no node at capture root.*{other}"):
+        await strategy.restore(
+            env, SandboxBackupPaths(include=[str(root), str(other)]), details, ctx
+        )
+    assert env.execs == execs_before
+
+
+async def test_archive_restore_rejects_recorded_roots_mismatch(tmp_path: Path) -> None:
+    """A snapshot recorded from other roots is an error naming both, not widened."""
+    env = _CountingSandbox()
+    strategy = await _strategy(env, tmp_path)
+    ctx = _context(tmp_path / "sample")
+    data_dir = tmp_path / "capture" / "data"
+    _write_data(data_dir)
+    details = await strategy.snapshot(
+        env, SandboxBackupPaths(include=[str(data_dir)]), 1, ctx
+    )
+    current = SandboxBackupPaths(include=[str(tmp_path / "capture" / "elsewhere")])
+    execs_before = env.execs
+    with pytest.raises(RestoreScopeError, match="captured from .* but this attempt"):
+        await strategy.restore(env, current, details, ctx)
+    assert env.execs == execs_before
+
+
+async def test_archive_extraction_is_scoped_to_roots(tmp_path: Path) -> None:
+    """Second layer: even past the listing check, tar writes only the roots.
+
+    The host-side check is bypassed for this test so an archive with a
+    member outside the root reaches extraction; the member arguments
+    keep tar from writing it.
     """
     env = LocalShellSandbox()
     strategy = await _strategy(env, tmp_path)
     ctx = _context(tmp_path / "sample")
-    data_dir = tmp_path / "capture" / "data"
-    files = _write_data(data_dir)
-    paths = SandboxBackupPaths(include=[str(data_dir)])
+    root = tmp_path / "capture" / "data"
+    outside = tmp_path / "capture" / "outside"
+    root.mkdir(parents=True)
+    storage = Path(ctx.storage_dir)
+    storage.mkdir(parents=True)
+    digest = _crafted_archive(
+        storage / "ckpt-00001.tar.gz",
+        [
+            _member(_rel(root), tarfile.DIRTYPE),
+            _member(_rel(root / "notes.txt")),
+            _member(_rel(outside), tarfile.DIRTYPE),
+            _member(_rel(outside / "planted.txt")),
+        ],
+        {_rel(root / "notes.txt"): b"legit\n", _rel(outside / "planted.txt"): b"evil"},
+    )
+    details = SnapshotDetails.model_validate(
+        dict(
+            snapshot_id="ckpt-00001",
+            size_bytes=1,
+            duration_ms=1,
+            archive="ckpt-00001.tar.gz",
+            content_sha256=digest,
+        )
+    )
+    with patch(
+        "inspect_ai.util._checkpoint._snapshot.archive._check_archive",
+        return_value=None,
+    ):
+        await strategy.restore(
+            env, SandboxBackupPaths(include=[str(root)]), details, ctx
+        )
 
-    await strategy.snapshot(env, paths, 1, ctx)
-    marker = data_dir / "notes.txt"
-    marker.write_bytes(b"second capture\n")
-    await strategy.snapshot(env, paths, 2, ctx)
-
-    for rel in files:
-        (data_dir / rel).unlink()
-    await strategy.restore(env, None, ctx)
-    assert marker.read_bytes() == b"second capture\n"
-    assert (data_dir / "nested/blob.bin").read_bytes() == files["nested/blob.bin"]
-
-
-async def test_archive_restore_without_ref_and_no_archives_errors(
-    tmp_path: Path,
-) -> None:
-    env = LocalShellSandbox()
-    strategy = await _strategy(env, tmp_path)
-    with pytest.raises(RuntimeError, match="no inherited archives"):
-        await strategy.restore(env, None, _context(tmp_path / "sample"))
+    assert (root / "notes.txt").read_bytes() == b"legit\n"
+    assert not outside.exists()
 
 
 @pytest.mark.parametrize(
@@ -346,8 +604,9 @@ async def test_archive_restore_rejects_malformed_record(
         field: value,
     }
     details = SnapshotDetails.model_validate(record)
+    paths = SandboxBackupPaths(include=[str(tmp_path / "capture")])
     with pytest.raises(RuntimeError, match=match):
-        await strategy.restore(env, details, _context(tmp_path / "sample"))
+        await strategy.restore(env, paths, details, _context(tmp_path / "sample"))
 
 
 async def test_archive_discard_orphans(tmp_path: Path) -> None:

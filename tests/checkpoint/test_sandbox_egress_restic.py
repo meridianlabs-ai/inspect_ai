@@ -10,16 +10,21 @@ a replayed id, an unshipped reported id, or a foreign tag is rejected
 and leaves the destination unchanged, an unrecorded extra snapshot (a
 failed fire's leftover or a planted one) ships as an orphan, the
 transfer cap binds, and resume-side orphan discard keeps exactly the
-recorded snapshots and restores the recorded id.
+recorded snapshots and restores the recorded id. The ingress tests also
+cover the host-side scope check: a snapshot reaching outside the
+capture roots, or carrying a fifo or a setuid/sticky mode, is refused
+before any exec, and a normal home-dir snapshot (symlinks included)
+round-trips without touching anything above its root.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
-from typing import IO, Any
+from typing import IO, Any, Callable
 from unittest.mock import patch
 
 import anyio
@@ -27,9 +32,14 @@ import pytest
 from test_helpers.local_shell_sandbox import LocalShellSandbox
 
 from inspect_ai.util._checkpoint._copy import copy_out, copy_out_partial_path
+from inspect_ai.util._checkpoint._layout.schemas import SnapshotDetails
 from inspect_ai.util._checkpoint._repo_ops import (
     forget_unrecorded_snapshots,
     list_snapshots,
+)
+from inspect_ai.util._checkpoint._restore_scope import (
+    RestoreRoots,
+    RestoreScopeError,
 )
 from inspect_ai.util._checkpoint._sandbox_restic.egress import (
     EgressVerificationError,
@@ -40,6 +50,7 @@ from inspect_ai.util._checkpoint._sandbox_restic.egress import (
     ingress_sandbox,
 )
 from inspect_ai.util._restic import ResticBackupSummary, resolve_restic
+from inspect_ai.util._subprocess import ExecResult
 
 PASSWORD = "test-password"
 CHUNK = 64 * 1024
@@ -604,46 +615,234 @@ async def test_forget_unrecorded_snapshots_rejects_malformed_ids(
     assert len(await list_snapshots(repos.restic, str(repos.repo), PASSWORD)) == 1
 
 
+class _FreshSandbox:
+    """The resume side: an adopted host repo and a fresh in-sandbox tool dir."""
+
+    def __init__(self, repos: _Repos, tmp_path: Path) -> None:
+        self.repos = repos
+        self.host_repo = tmp_path / "adopted"
+        shutil.copytree(repos.repo, self.host_repo)
+        self.sandbox_dir = tmp_path / "fresh-sandbox"
+        self.sandbox_dir.mkdir()
+        (self.sandbox_dir / "restic").symlink_to(repos.restic)
+        self.env = _CountingSandbox()
+
+    async def ingress(self, snapshot_id: str, *roots: Path) -> None:
+        await ingress_sandbox(
+            self.env,
+            str(self.host_repo),
+            PASSWORD,
+            snapshot_id=snapshot_id,
+            roots=RestoreRoots.from_include(
+                [str(r) for r in (roots or (self.repos.src,))], label="test"
+            ),
+            host_restic=self.repos.restic,
+            sandbox_dir=str(self.sandbox_dir),
+        )
+
+
+class _CountingSandbox(LocalShellSandbox):
+    """Counts ``exec`` calls: a refused ingress must run none."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.execs = 0
+
+    async def exec(
+        self,
+        cmd: list[str],
+        input: str | bytes | None = None,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        user: str | None = None,
+        timeout: int | None = None,
+        timeout_retry: bool = True,
+        concurrency: bool = True,
+    ) -> ExecResult[str]:
+        self.execs += 1
+        return await super().exec(
+            cmd, input, cwd, env, user, timeout, timeout_retry, concurrency
+        )
+
+
 async def test_ingress_restores_recorded_snapshot_not_latest(
     repos: _Repos, tmp_path: Path
 ) -> None:
     id1 = repos.backup("ckpt-00001")
     (repos.src / "notes.txt").write_text("v2\n")
     repos.backup("ckpt-00002")
-    # Adopt the sandbox repo as the host-side copy a resume would ingress.
-    host_repo = tmp_path / "adopted"
-    shutil.copytree(repos.repo, host_repo)
-    fresh_sandbox = tmp_path / "fresh-sandbox"
-    fresh_sandbox.mkdir()
-    (fresh_sandbox / "restic").symlink_to(repos.restic)
+    fresh = _FreshSandbox(repos, tmp_path)
 
-    await ingress_sandbox(
-        repos.env,
-        str(host_repo),
-        PASSWORD,
-        snapshot_id=id1,
-        sandbox_dir=str(fresh_sandbox),
-    )
+    await fresh.ingress(id1)
 
-    # `restic restore --target /` puts the file back at its absolute path.
+    # The recorded snapshot's file is back at its absolute path.
     assert (repos.src / "notes.txt").read_text() == "v1\n"
     # The manifest is reseeded with every inherited repo file.
-    seeded = set((fresh_sandbox / "egress-manifest.txt").read_text().split())
+    seeded = set((fresh.sandbox_dir / "egress-manifest.txt").read_text().split())
     assert seeded == {
-        p.relative_to(host_repo).as_posix()
-        for p in host_repo.rglob("*")
-        if p.is_file() and p.relative_to(host_repo).parts[0] != "locks"
+        p.relative_to(fresh.host_repo).as_posix()
+        for p in fresh.host_repo.rglob("*")
+        if p.is_file() and p.relative_to(fresh.host_repo).parts[0] != "locks"
     }
 
 
 async def test_ingress_rejects_malformed_recorded_id(
     repos: _Repos, tmp_path: Path
 ) -> None:
+    fresh = _FreshSandbox(repos, tmp_path)
     with pytest.raises(RuntimeError, match="malformed"):
-        await ingress_sandbox(
-            repos.env,
-            str(repos.repo),
-            PASSWORD,
-            snapshot_id="latest; rm -rf /",
-            sandbox_dir=str(tmp_path / "fresh"),
+        await fresh.ingress("latest; rm -rf /")
+    assert fresh.env.execs == 0
+
+
+@pytest.mark.slow
+async def test_ingress_restores_symlinks_and_leaves_ancestors_alone(
+    repos: _Repos, tmp_path: Path
+) -> None:
+    """A normal home-dir snapshot round-trips: nested dirs, symlinks, modes.
+
+    The capture root's parent is an ancestor node in the snapshot; the
+    per-root restore form never writes it, so a mode change made after
+    capture survives the restore (``--target /`` would have reset it to
+    the recorded mode).
+    """
+    src = repos.src
+    (src / "sub").mkdir()
+    (src / "sub" / "deep.txt").write_text("deep\n")
+    (src / "link").symlink_to("notes.txt")
+    (src / "abs-link").symlink_to("/etc/hostname")
+    (src / "script.sh").write_text("#!/bin/sh\n")
+    (src / "script.sh").chmod(0o755)
+    (src / "private").mkdir()
+    (src / "private").chmod(0o700)
+    parent = src.parent
+    parent.chmod(0o750)
+    id1 = repos.backup("ckpt-00001")
+    fresh = _FreshSandbox(repos, tmp_path)
+    shutil.rmtree(src)
+    src.mkdir()
+    (src / "post-capture.txt").write_text("fresh sandbox file\n")
+    parent.chmod(0o755)
+
+    await fresh.ingress(id1)
+
+    assert (src / "notes.txt").read_text() == "v1\n"
+    assert (src / "sub" / "deep.txt").read_text() == "deep\n"
+    assert os.readlink(src / "link") == "notes.txt"
+    assert os.readlink(src / "abs-link") == "/etc/hostname"
+    assert (src / "script.sh").stat().st_mode & 0o777 == 0o755
+    assert (src / "private").stat().st_mode & 0o777 == 0o700
+    # Files the fresh sandbox had are left alone, as before.
+    assert (src / "post-capture.txt").exists()
+    # The ancestor keeps its post-capture mode: nothing above the root was written.
+    assert parent.stat().st_mode & 0o777 == 0o755
+
+
+def _hostile_snapshots() -> dict[str, tuple[Callable[[_Repos, Path], list[str]], str]]:
+    """Name → (prepare capture, substring the refusal must contain).
+
+    ``prepare`` mutates the capture tree and returns the paths to back
+    up; the second element is the offending path (or its diagnostic) the
+    error must name.
+    """
+
+    def outside(repos: _Repos, other: Path) -> list[str]:
+        other.mkdir()
+        (other / "planted.txt").write_text("planted\n")
+        return [str(repos.src), str(other)]
+
+    def etc(repos: _Repos, other: Path) -> list[str]:
+        return [str(repos.src), "/etc/hostname"]
+
+    def setuid(repos: _Repos, other: Path) -> list[str]:
+        (repos.src / "sh").write_text("#!/bin/sh\n")
+        (repos.src / "sh").chmod(0o4755)
+        return [str(repos.src)]
+
+    def sticky(repos: _Repos, other: Path) -> list[str]:
+        (repos.src / "drop").mkdir()
+        (repos.src / "drop").chmod(0o1777)
+        return [str(repos.src)]
+
+    def fifo(repos: _Repos, other: Path) -> list[str]:
+        os.mkfifo(repos.src / "pipe")
+        return [str(repos.src)]
+
+    # Restic lists a source's ancestors first, so the node named is the
+    # first one outside the scope: the planted dir / `/etc` itself.
+    return {
+        "outside_root": (outside, "/other lies outside"),
+        "etc_hostname": (etc, "/etc lies outside"),
+        "setuid_under_root": (setuid, "sh has mode 4755"),
+        "sticky_dir_under_root": (sticky, "drop has mode 1777"),
+        "fifo_under_root": (fifo, "pipe is a fifo"),
+    }
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("violation", sorted(_hostile_snapshots()))
+async def test_ingress_refuses_snapshot_reaching_outside_scope(
+    repos: _Repos, tmp_path: Path, violation: str
+) -> None:
+    """A crafted snapshot is refused on the host before any exec, naming the path.
+
+    The repo is otherwise valid and the snapshot id is the recorded one;
+    only the listing check stands between it and a root ``restic
+    restore`` in the sandbox.
+    """
+    prepare, expected = _hostile_snapshots()[violation]
+    other = tmp_path / "default" / "other"
+    sources = prepare(repos, other)
+    proc = subprocess.run(
+        [str(repos.restic), "-r", str(repos.repo), "backup", *sources, "--json", "-q"],
+        env={"RESTIC_PASSWORD": PASSWORD, "PATH": os.environ["PATH"]},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    snapshot_id = ResticBackupSummary.from_stdout(proc.stdout).snapshot_id
+    fresh = _FreshSandbox(repos, tmp_path)
+    (repos.src / "notes.txt").write_text("fresh sandbox\n")
+
+    with pytest.raises(RestoreScopeError, match=re.escape(expected)):
+        await fresh.ingress(snapshot_id)
+
+    assert fresh.env.execs == 0
+    assert (repos.src / "notes.txt").read_text() == "fresh sandbox\n"
+    assert not (fresh.sandbox_dir / "repo").exists()
+
+
+@pytest.mark.slow
+async def test_ingress_refuses_snapshot_missing_a_root(
+    repos: _Repos, tmp_path: Path
+) -> None:
+    id1 = repos.backup("ckpt-00001")
+    fresh = _FreshSandbox(repos, tmp_path)
+    other = tmp_path / "default" / "other"
+    with pytest.raises(RestoreScopeError, match=rf"no node at capture root.*{other}"):
+        await fresh.ingress(id1, repos.src, other)
+    assert fresh.env.execs == 0
+
+
+async def test_restic_strategy_rejects_recorded_roots_mismatch(tmp_path: Path) -> None:
+    """The strategy refuses a record captured from other roots before touching anything."""
+    from inspect_ai.util._checkpoint._snapshot import ResticIncrementalStrategy
+    from inspect_ai.util._checkpoint._snapshot.types import SnapshotContext
+    from inspect_ai.util._checkpoint.sandbox_paths import SandboxBackupPaths
+
+    env = _CountingSandbox()
+    ctx = SnapshotContext(
+        sandbox_name="default",
+        storage_dir=str(tmp_path / "nowhere"),
+        storage_subpath="restic/sandboxes/default",
+        secret=PASSWORD,
+        resuming=True,
+    )
+    details = SnapshotDetails.model_validate(
+        dict(snapshot_id="a" * 64, size_bytes=1, duration_ms=1, roots=["/data"])
+    )
+    with pytest.raises(RestoreScopeError, match=r"\['/data'\].*\['/home/agent'\]"):
+        await ResticIncrementalStrategy().restore(
+            env, SandboxBackupPaths(include=["/home/agent"]), details, ctx
         )
+    assert env.execs == 0

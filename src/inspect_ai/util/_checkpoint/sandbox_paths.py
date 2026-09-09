@@ -32,7 +32,14 @@ class SandboxBackupPaths:
     """Absolute source paths passed to ``restic backup``."""
 
     exclude: list[str] = field(default_factory=list)
-    """Absolute paths passed as ``restic backup --exclude`` (auto-home only)."""
+    """Absolute paths passed as ``restic backup --exclude`` (the default
+    user's XDG cache dir and ``**/.cache``)."""
+
+    home: str | None = None
+    """The default user's home dir when it *is* the include set (no
+    ``sandbox_paths`` entry for this sandbox); ``None`` when ``include``
+    was configured explicitly. On resume the core re-owns everything
+    restored under an auto-included home to the home dir's owner."""
 
 
 async def resolve_sandbox_backup_paths(
@@ -75,7 +82,9 @@ async def resolve_sandbox_backup_paths(
             continue
 
         exclude = ([cache] if cache else []) + [_CACHE_GLOB]
-        resolved[name] = SandboxBackupPaths(include=include, exclude=exclude)
+        resolved[name] = SandboxBackupPaths(
+            include=include, exclude=exclude, home=None if configured else home
+        )
     return resolved
 
 

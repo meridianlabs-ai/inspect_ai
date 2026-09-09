@@ -89,9 +89,11 @@ async def test_no_entry_defaults_to_home() -> None:
     with _sandboxes({"default": FakeSandbox("/root")}):
         resolved = await resolve_sandbox_backup_paths({})
     # Auto-home: capture home; exclude the XDG cache dir + all .cache dirs.
+    # `home` marks the include set as the auto-included home dir, so
+    # resume re-owns what it restores under it.
     assert resolved == {
         "default": SandboxBackupPaths(
-            include=["/root"], exclude=["/root/.cache", "**/.cache"]
+            include=["/root"], exclude=["/root/.cache", "**/.cache"], home="/root"
         )
     }
 
@@ -101,7 +103,7 @@ async def test_no_entry_honors_xdg_cache_home() -> None:
         resolved = await resolve_sandbox_backup_paths({})
     assert resolved == {
         "default": SandboxBackupPaths(
-            include=["/root"], exclude=["/var/cache/agent", "**/.cache"]
+            include=["/root"], exclude=["/var/cache/agent", "**/.cache"], home="/root"
         )
     }
 
@@ -111,11 +113,14 @@ async def test_entry_still_excludes_caches() -> None:
         resolved = await resolve_sandbox_backup_paths(
             {"default": ["/workspace", "/opt/state"]}
         )
-    # Configured includes win, but caches are excluded even so.
+    # Configured includes win, but caches are excluded even so. The home
+    # dir is not the include set, so `home` is unset: configured paths
+    # keep their recorded ownership on resume.
     assert resolved == {
         "default": SandboxBackupPaths(
             include=["/workspace", "/opt/state"],
             exclude=["/root/.cache", "**/.cache"],
+            home=None,
         )
     }
 
@@ -151,7 +156,7 @@ async def test_mixed_sandboxes() -> None:
         )
     assert resolved == {
         "default": SandboxBackupPaths(
-            include=["/root"], exclude=["/root/.cache", "**/.cache"]
+            include=["/root"], exclude=["/root/.cache", "**/.cache"], home="/root"
         ),
         "tools": SandboxBackupPaths(
             include=["/opt/agent-state"], exclude=["/home/agent/.cache", "**/.cache"]
