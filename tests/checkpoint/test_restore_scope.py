@@ -15,6 +15,7 @@ import pytest
 
 from inspect_ai.util._checkpoint._layout.schemas import SnapshotDetails
 from inspect_ai.util._checkpoint._restore_scope import (
+    MAX_RESTORE_NODES,
     RestoreNode,
     RestoreRoots,
     RestoreScopeError,
@@ -42,6 +43,25 @@ def test_roots_normalize_and_dedupe() -> None:
         ["/data/", "/home//user", "/data", "/opt/./x"], label=LABEL
     )
     assert roots.roots == ("/data", "/home/user", "/opt/x")
+
+
+def test_nested_roots_collapse_to_the_outermost() -> None:
+    """``/data`` covers ``/data/sub``; every node under it is credited to ``/data``."""
+    roots = RestoreRoots.from_include(["/data/sub", "/data", "/datax"], label=LABEL)
+    assert roots.roots == ("/data", "/datax")
+    seen = {
+        root
+        for p in ("/data", "/data/sub/x", "/datax/y")
+        if (root := roots.check_node(_node(p), label=LABEL)) is not None
+    }
+    assert seen == {"/data", "/datax"}
+    roots.require_all_present(seen, label=LABEL)
+
+
+def test_node_count_is_bounded() -> None:
+    HOME.check_node_count(MAX_RESTORE_NODES, label=LABEL)
+    with pytest.raises(RestoreScopeError, match="more than"):
+        HOME.check_node_count(MAX_RESTORE_NODES + 1, label=LABEL)
 
 
 @pytest.mark.parametrize(

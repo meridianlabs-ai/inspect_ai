@@ -8,6 +8,7 @@ strategies — a cycle). ``hydrate`` still uses it for the host repo.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import subprocess
@@ -24,6 +25,9 @@ from inspect_ai.util._restic.ops import restic_env
 _MAX_LS_LINE_BYTES = 1024 * 1024
 """Longest ``restic ls --json`` record accepted: a node record is its
 path (at most a few KiB) plus a dozen short fields."""
+
+_MAX_STDERR_BYTES = 64 * 1024
+"""Most of restic's stderr kept for an error message."""
 
 
 def checkpoint_tag(checkpoint_id: int) -> str:
@@ -160,7 +164,8 @@ async def walk_snapshot_nodes(
 
         async def drain_stderr() -> None:
             async for chunk in stderr_stream:
-                stderr.extend(chunk)
+                if len(stderr) < _MAX_STDERR_BYTES:
+                    stderr.extend(chunk)
 
         try:
             async with anyio.create_task_group() as tg:
@@ -171,10 +176,10 @@ async def walk_snapshot_nodes(
                     # Held and re-raised below rather than propagated out
                     # of the group, which would wrap it in an ExceptionGroup.
                     failure = exc
-                    proc.kill()
+                    _kill(proc)
                     tg.cancel_scope.cancel()
         except BaseException:
-            proc.kill()
+            _kill(proc)
             raise
         returncode = await proc.wait()
     if failure is not None:
@@ -182,13 +187,26 @@ async def walk_snapshot_nodes(
     if returncode != 0:
         raise RuntimeError(
             f"restic ls failed (exit {returncode}) on {repo}: "
-            f"{stderr.decode(errors='replace').strip()}"
+            f"{stderr[:_MAX_STDERR_BYTES].decode(errors='replace').strip()}"
         )
-    if not isinstance(full_id, str):
+    if not isinstance(full_id, str) or not re.fullmatch(r"[0-9a-f]{64}", full_id):
         raise RuntimeError(
-            f"restic ls on {repo} produced no snapshot record for {snapshot_id}"
+            f"restic ls on {repo} produced no well-formed snapshot record for "
+            f"{snapshot_id}"
         )
     return full_id
+
+
+def _kill(proc: anyio.abc.Process) -> None:
+    """Kill ``proc`` if it is still running.
+
+    On asyncio, ``kill()`` on a child that has already exited (and whose
+    transport is torn down) raises ``ProcessLookupError``; that must not
+    replace the error being propagated.
+    """
+    if proc.returncode is None:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
 
 
 async def _consume_ls_records(

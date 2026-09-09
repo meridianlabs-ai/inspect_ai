@@ -347,9 +347,9 @@ class ArchiveStrategy(SandboxSnapshotStrategy):
             shlex.quote(tar_member_argument(root)) for root in roots.roots
         )
         extract = (
-            f"zstd -dc {staged} | tar -xf - -C / {members}"
+            f"zstd -dc {staged} | tar -xf - -C / -- {members}"
             if archive_name.endswith(".tar.zst")
-            else f"tar -xzf {staged} -C / {members}"
+            else f"tar -xzf {staged} -C / -- {members}"
         )
         script = (
             "set -e\n"
@@ -455,14 +455,21 @@ def _check_archive(
         stream: IO[bytes]
         mode: Literal["r|", "r|gz"]
         if path.name.endswith(".tar.zst"):
-            stream = zstandard.ZstdDecompressor().stream_reader(hashed)
+            # Across frames: the sandbox's zstd may write several (pzstd,
+            # or a concatenated stream); tar's view is the whole payload.
+            stream = zstandard.ZstdDecompressor().stream_reader(
+                hashed, read_across_frames=True
+            )
             mode = "r|"
         else:
             stream = hashed
             mode = "r|gz"
+        count = 0
         try:
             with tarfile.open(fileobj=stream, mode=mode) as tar:
                 for member in tar:
+                    count += 1
+                    roots.check_node_count(count, label=label)
                     root = roots.check_node(
                         tar_member_node(member, label=label), label=label
                     )

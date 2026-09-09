@@ -2987,15 +2987,31 @@ class _RecordingStrategy(_StubStrategy):
 
 
 class _RecordingSandbox:
-    """Sandbox fake that records ``exec`` commands and answers ``stat -c %u``."""
+    """Sandbox fake that records ``exec`` commands and answers the owner probes.
 
-    def __init__(self) -> None:
+    With ``home_exists`` the home dir stats as uid 1001; without it,
+    ``stat`` and ``test -e`` fail and ``id -u`` (as the default user)
+    answers 1000.
+    """
+
+    def __init__(self, home_exists: bool = True) -> None:
         self.commands: list[list[str]] = []
+        self.home_exists = home_exists
 
-    async def exec(self, cmd: list[str], **kwargs: object) -> ExecResult[str]:
+    async def exec(
+        self, cmd: list[str], user: str | None = None, **kwargs: object
+    ) -> ExecResult[str]:
         self.commands.append(cmd)
-        stdout = "1001\n" if cmd[:3] == ["stat", "-c", "%u"] else ""
-        return ExecResult(success=True, returncode=0, stdout=stdout, stderr="")
+        if cmd[:3] == ["stat", "-c", "%u"] or cmd[:2] == ["test", "-e"]:
+            if not self.home_exists:
+                return ExecResult(
+                    success=False, returncode=1, stdout="", stderr="No such file"
+                )
+            return ExecResult(success=True, returncode=0, stdout="1001\n", stderr="")
+        if cmd == ["id", "-u"]:
+            assert user is None, "the default user's uid is read as the default user"
+            return ExecResult(success=True, returncode=0, stdout="1000\n", stderr="")
+        return ExecResult(success=True, returncode=0, stdout="", stderr="")
 
 
 def _sandbox_checkpoint(checkpoint_id: int, sandboxes: dict[str, str]) -> Checkpoint:
@@ -3082,7 +3098,32 @@ async def test_hydrate_sandbox_reowns_auto_home_around_restore() -> None:
     assert isinstance(ref, SnapshotDetails) and ref.snapshot_id == "d2"
     assert env.commands == [
         ["stat", "-c", "%u", "/home/agent"],
-        ["sh", "-c", "find /home/agent ! -user 1001 -exec chown -h 1001 {} +"],
+        [
+            "sh",
+            "-c",
+            "find /home/agent -xdev ! -user 1001 -exec chown -h 1001 {} +",
+        ],
+    ]
+
+
+async def test_hydrate_sandbox_reowns_missing_home_to_default_user() -> None:
+    """A home dir the image never created is owned by the default user after restore."""
+    strategy = _RecordingStrategy()
+    env = _RecordingSandbox(home_exists=False)
+    paths = SandboxBackupPaths(include=["/home/agent"], home="/home/agent")
+    await _hydrate_one_sandbox(
+        strategy, env, paths, [_sandbox_checkpoint(1, {"default": "d1"})]
+    )
+    assert strategy.calls == ["setup", "discard_orphans", "restore"]
+    assert env.commands == [
+        ["stat", "-c", "%u", "/home/agent"],
+        ["test", "-e", "/home/agent"],
+        ["id", "-u"],
+        [
+            "sh",
+            "-c",
+            "find /home/agent -xdev ! -user 1000 -exec chown -h 1000 {} +",
+        ],
     ]
 
 

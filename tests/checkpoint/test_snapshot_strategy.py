@@ -487,6 +487,45 @@ async def test_archive_restore_refuses_hostile_archive(
     assert not outside.exists()
 
 
+@pytest.mark.parametrize("compression", ["gz", "zst"])
+def test_check_archive_hashes_bytes_past_the_tar_end_marker(
+    tmp_path: Path, compression: str
+) -> None:
+    """The recorded digest covers the whole stored file, not just what tar reads.
+
+    tar stops at the end-of-archive marker; the walk must keep hashing
+    to EOF so a file with trailing bytes matches (or fails) on its true
+    digest, and a multi-frame zstd payload is read across frames.
+    """
+    from inspect_ai.util._checkpoint._restore_scope import RestoreRoots
+    from inspect_ai.util._checkpoint._snapshot.archive import _check_archive
+
+    root = tmp_path / "data"
+    archive = tmp_path / f"ckpt-00001.tar.{compression}"
+    _crafted_archive(
+        archive,
+        [_member(_rel(root), tarfile.DIRTYPE), _member(_rel(root / "a"))],
+        {_rel(root / "a"): b"a"},
+    )
+    trailer = (
+        zstandard.ZstdCompressor().compress(b"\0" * 1024)
+        if compression == "zst"
+        else gzip.compress(b"\0" * 1024)
+    )
+    payload = archive.read_bytes() + trailer
+    archive.write_bytes(payload)
+    roots = RestoreRoots.from_include([str(root)], label="test")
+
+    _check_archive(archive, roots, hashlib.sha256(payload).hexdigest(), label="test")
+    with pytest.raises(RestoreScopeError, match="digest mismatch"):
+        _check_archive(
+            archive,
+            roots,
+            hashlib.sha256(payload[: -len(trailer)]).hexdigest(),
+            label="test",
+        )
+
+
 async def test_archive_restore_refuses_snapshot_missing_a_root(tmp_path: Path) -> None:
     env = _CountingSandbox()
     strategy = await _strategy(env, tmp_path)

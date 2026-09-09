@@ -58,8 +58,10 @@
 >    socket, is a hard link out of scope, or carries a setuid, setgid
 >    or sticky bit (`_checkpoint/_restore_scope.py`); each root is then
 >    restored individually (`restic restore <id>:<parent> --target
->    <parent> --include /<name>`; `tar -x <root>`) so nothing above a
->    root is written or has its metadata restored. `snapshot()` records
+>    <parent> --include /<name> --include-xattr user.*`; `tar -x --
+>    <root>`) so nothing above a root is written or has its metadata
+>    restored, and no `security.*`/`system.*` extended attribute (file
+>    capabilities, ACLs) is reapplied. `snapshot()` records
 >    `paths.include` as a `roots` extra on `SnapshotDetails`; a recorded
 >    set that differs from this attempt's is an error naming both. For
 >    an auto-included home dir the core re-owns everything restored

@@ -104,7 +104,12 @@ from .._repo_ops import (
     match_snapshot_id,
     walk_snapshot_nodes,
 )
-from .._restore_scope import RestoreRoots, restic_node, restic_restore_args
+from .._restore_scope import (
+    RESTORED_XATTRS,
+    RestoreRoots,
+    restic_node,
+    restic_restore_args,
+)
 from .repo import _SANDBOX_RESTIC_DIR
 
 _HEX64 = r"[0-9a-f]{64}"
@@ -168,10 +173,14 @@ async def ingress_sandbox(
        never sees the bytes in flight, extracting into the standard
        in-sandbox repo location (``/root/.cache/inspect/repo``).
     4. For each root, ``restic restore <id>:<parent> --target <parent>
-       --include /<name>`` inside the sandbox, so the root lands at its
-       original absolute path and nothing above it is written (restic
-       would otherwise restore the recorded metadata of every ancestor
-       directory on the way to a selected node).
+       --include /<name> --include-xattr user.*`` inside the sandbox, so
+       the root lands at its original absolute path and nothing above
+       it is written (restic would otherwise restore the recorded
+       metadata of every ancestor directory on the way to a selected
+       node). Only ``user.*`` extended attributes are restored: the
+       listing cannot see xattrs, and restic running as root would
+       otherwise reapply a recorded ``security.capability`` — a setuid
+       bit by another name — or a ``system.posix_acl_*`` grant.
 
     ``snapshot_id`` is the latest committed checkpoint's recorded id;
     the caller resolves it, there is no ``latest`` fallback.
@@ -232,6 +241,8 @@ async def ingress_sandbox(
                 args.target,
                 "--include",
                 args.include,
+                "--include-xattr",
+                RESTORED_XATTRS,
             ],
             env={"RESTIC_PASSWORD": password},
             user="root",
@@ -259,8 +270,12 @@ async def _check_snapshot_scope(
     sandbox when this runs, so a refused snapshot leaves it untouched.
     """
     seen: set[str] = set()
+    count = 0
 
     def visit(record: dict[str, Any]) -> None:
+        nonlocal count
+        count += 1
+        roots.check_node_count(count, label=label)
         root = roots.check_node(restic_node(record, label=label), label=label)
         if root is not None:
             seen.add(root)

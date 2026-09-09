@@ -25,11 +25,17 @@ over the stored archive) and passes every node through
 - a node under a root carries no setuid, setgid, or sticky bit.
 
 Symlink targets are not constrained: an agent legitimately keeps
-symlinks in ``$HOME``, and both tools write a symlink as a symlink
-without following it. Ancestors are exempt from the mode check (``/tmp``
-is sticky) because the strategies restore each root individually —
-``restic restore <id>:<parent> --include /<name>`` and ``tar -x <root>``
-— so nothing above a root is written or has its metadata restored.
+symlinks in ``$HOME``. Neither tool follows a restored symlink while
+writing later members (restic writes each node at its own tree path;
+GNU tar defers absolute and ``..`` symlinks with a placeholder and
+busybox tar defers all symlinks to the end, so ``l -> /etc`` followed
+by ``l/x`` fails rather than writing ``/etc/x``). Ancestors are exempt
+from the mode check (``/tmp`` is sticky) because the strategies restore
+each root individually — ``restic restore <id>:<parent> --include
+/<name>`` and ``tar -x <root>`` — so nothing above a root is written or
+has its metadata restored. Extended attributes are outside both
+listings; the restic restore reapplies only ``user.*``
+(:data:`RESTORED_XATTRS`) and the archive never carries any.
 
 Ownership is the residual: restic and tar restore recorded uid/gid when
 running as root. For the auto-home case the core snapshots the home
@@ -63,7 +69,25 @@ for ``mode`` (the permission bits are the low 9 bits as usual)."""
 
 _RESTORABLE_KINDS = frozenset({"file", "dir", "symlink", "hardlink"})
 
+MAX_RESTORE_NODES = 5_000_000
+"""Most nodes a snapshot listing may hold before the restore is refused.
+
+The listing is untrusted: restic trees form a DAG, so a small crafted
+repo can reuse subtrees into an effectively unbounded listing, and a
+tar stream can be padded with members indefinitely. A generous ceiling
+(a large home dir with a couple of ``node_modules`` trees is a few
+hundred thousand nodes) bounds the host work to a deterministic
+failure instead of an open-ended walk."""
+
 _RESTIC_GLOB_CHARS = "\\*?["
+
+RESTORED_XATTRS = "user.*"
+"""The only extended-attribute namespace a restic restore reapplies
+(``restic restore --include-xattr``). Neither listing shows xattrs, and
+restic as root would otherwise reapply a recorded ``security.capability``
+(file capabilities: a setuid bit by another name) or a
+``system.posix_acl_*`` grant. tar never stores xattrs without
+``--xattrs``, which the capture does not pass."""
 
 
 class RestoreScopeError(RuntimeError):
@@ -111,15 +135,18 @@ class RestoreRoots:
     """The absolute paths a restore may write at or under."""
 
     roots: tuple[str, ...]
-    """Canonical absolute roots, sorted, deduplicated. Never contains ``/``."""
+    """Canonical absolute roots, sorted, deduplicated, none nested under
+    another. Never contains ``/``."""
 
     @classmethod
     def from_include(cls, include: Sequence[str], *, label: str) -> RestoreRoots:
         """Roots from a capture include set (``SandboxBackupPaths.include``).
 
-        ``/`` is refused: a capture of the whole filesystem has no
-        scope to enforce, and the per-root restore forms have no parent
-        to anchor at.
+        A root nested under another (``/data`` and ``/data/sub``) is
+        dropped: the outer root already covers it, and restoring both
+        would write the nested tree twice. ``/`` is refused: a capture
+        of the whole filesystem has no scope to enforce, and the
+        per-root restore forms have no parent to anchor at.
         """
         roots: set[str] = set()
         for raw in include:
@@ -136,7 +163,12 @@ class RestoreRoots:
             roots.add(root)
         if not roots:
             raise RestoreScopeError(f"{label}: the capture include set is empty")
-        return cls(tuple(sorted(roots)))
+        outermost = [
+            root
+            for root in roots
+            if not any(root.startswith(other + "/") for other in roots)
+        ]
+        return cls(tuple(sorted(outermost)))
 
     def containing_root(self, path: str) -> str | None:
         """The root ``path`` sits at or under, else ``None``."""
@@ -191,6 +223,13 @@ class RestoreRoots:
                 f"setuid, setgid or sticky bit set"
             )
         return root
+
+    def check_node_count(self, count: int, *, label: str) -> None:
+        """Refuse a listing longer than :data:`MAX_RESTORE_NODES`."""
+        if count > MAX_RESTORE_NODES:
+            raise RestoreScopeError(
+                f"{label}: snapshot lists more than {MAX_RESTORE_NODES} nodes"
+            )
 
     def require_all_present(self, seen: Iterable[str], *, label: str) -> None:
         """Every root must have had at least one node checked under it.
@@ -268,6 +307,12 @@ def tar_member_argument(root: str) -> str:
 
     tar strips the leading ``/`` from member names at creation, so the
     root ``/home/user`` selects the members ``home/user`` and below.
+    Callers put ``--`` before the member arguments so a root name
+    starting with ``-`` is never read as an option. GNU tar matches
+    member arguments literally; busybox tar globs them, so a root name
+    holding ``*``, ``?`` or ``[`` selects more than itself there — this
+    is the second layer only, behind the host-side member walk that has
+    already rejected every out-of-scope member.
     """
     return root.lstrip("/")
 
@@ -344,18 +389,30 @@ def check_recorded_roots(
 
 
 async def home_owner_uid(env: SandboxEnvironment, home: str, *, label: str) -> int:
-    """The uid owning ``home`` in the fresh sandbox, read before any restore.
+    """The uid that owns ``home`` in the fresh sandbox, read before any restore.
 
     Read beforehand because a restore that includes the home dir node
     itself (tar does; restic's per-root form does not) would otherwise
-    hand back whatever owner the snapshot recorded.
+    hand back whatever owner the snapshot recorded. A home dir the image
+    never created (the agent made it during the captured attempt) has no
+    owner to read; the default user's own uid stands in for it.
     """
     result = await env.exec(["stat", "-c", "%u", home], user="root")
     text = result.stdout.strip()
-    if not result.success or not text.isdigit():
+    if result.success and text.isdigit():
+        return int(text)
+    exists = await env.exec(["test", "-e", home], user="root")
+    if exists.success:
         raise RuntimeError(
             f"{label}: could not read the owner of home dir {home}: "
             f"{result.stderr.strip() or result.stdout.strip()}"
+        )
+    whoami = await env.exec(["id", "-u"])
+    text = whoami.stdout.strip()
+    if not whoami.success or not text.isdigit():
+        raise RuntimeError(
+            f"{label}: home dir {home} does not exist in the fresh sandbox and the "
+            f"default user's uid could not be read: {whoami.stderr.strip()}"
         )
     return int(text)
 
@@ -365,11 +422,15 @@ async def enforce_home_owner(
 ) -> None:
     """Re-own every node under ``home`` (and ``home`` itself) not owned by ``uid``.
 
-    Symlinks are re-owned themselves, never followed. Files the capture
-    excluded (the XDG cache dir) are traversed too; they are the fresh
-    sandbox's own and already the user's.
+    Symlinks are re-owned themselves, never followed; ``-xdev`` keeps
+    the pass off anything mounted under the home dir (a compose volume
+    is shared state, not restored state). Files the capture excluded
+    (the XDG cache dir) are traversed too; they are the fresh sandbox's
+    own and already the user's. The predicate is ownership, not
+    provenance: an image-provided root-owned file under the home dir is
+    handed to the user as well. Group ownership is left as recorded.
     """
-    script = f"find {shlex.quote(home)} ! -user {uid} -exec chown -h {uid} {{}} +"
+    script = f"find {shlex.quote(home)} -xdev ! -user {uid} -exec chown -h {uid} {{}} +"
     result = await env.exec(["sh", "-c", script], user="root")
     if not result.success:
         raise RuntimeError(

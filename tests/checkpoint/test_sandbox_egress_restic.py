@@ -813,6 +813,70 @@ async def test_ingress_refuses_snapshot_reaching_outside_scope(
 
 
 @pytest.mark.slow
+async def test_ingress_restores_root_with_glob_characters_literally(
+    repos: _Repos, tmp_path: Path
+) -> None:
+    """A root name holding glob metacharacters selects exactly itself."""
+    parent = repos.src.parent
+    root = parent / "da[t]a*?"
+    decoy = parent / "data"
+    root.mkdir()
+    decoy.mkdir()
+    (root / "keep.txt").write_text("keep\n")
+    (decoy / "decoy.txt").write_text("decoy\n")
+    proc = subprocess.run(
+        [str(repos.restic), "-r", str(repos.repo), "backup", str(root), "--json", "-q"],
+        env={"RESTIC_PASSWORD": PASSWORD, "PATH": os.environ["PATH"]},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    snapshot_id = ResticBackupSummary.from_stdout(proc.stdout).snapshot_id
+    fresh = _FreshSandbox(repos, tmp_path)
+    shutil.rmtree(root)
+    shutil.rmtree(decoy)
+
+    await fresh.ingress(snapshot_id, root)
+
+    assert (root / "keep.txt").read_text() == "keep\n"
+    assert not decoy.exists()
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(shutil.which("setfacl") is None, reason="needs setfacl")
+async def test_ingress_restores_only_user_xattrs(repos: _Repos, tmp_path: Path) -> None:
+    """A recorded ACL (``system.posix_acl_access``) is not reapplied; ``user.*`` is.
+
+    The listing cannot see extended attributes, and restic as root would
+    otherwise reapply a recorded ``security.capability`` the same way it
+    reapplies this ACL.
+    """
+    target = repos.src / "notes.txt"
+    subprocess.run(["setfacl", "-m", "u:nobody:r", str(target)], check=True)
+    os.setxattr(target, "user.note", b"kept")
+    assert "system.posix_acl_access" in os.listxattr(target)
+    id1 = repos.backup("ckpt-00001")
+    fresh = _FreshSandbox(repos, tmp_path)
+    target.unlink()
+
+    await fresh.ingress(id1)
+
+    assert target.read_text() == "v1\n"
+    assert os.listxattr(target) == ["user.note"]
+
+
+@pytest.mark.slow
+async def test_ingress_reports_unknown_snapshot_with_restic_error(
+    repos: _Repos, tmp_path: Path
+) -> None:
+    repos.backup("ckpt-00001")
+    fresh = _FreshSandbox(repos, tmp_path)
+    with pytest.raises(RuntimeError, match="restic ls failed"):
+        await fresh.ingress("f" * 64)
+    assert fresh.env.execs == 0
+
+
+@pytest.mark.slow
 async def test_ingress_refuses_snapshot_missing_a_root(
     repos: _Repos, tmp_path: Path
 ) -> None:
