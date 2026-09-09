@@ -81,8 +81,10 @@ jobs:
   # No project install: every hook in .pre-commit-config.yaml comes from a
   # remote repo and runs in an environment pre-commit builds itself (the
   # uv-lock hook brings its own uv), so nothing here reads the inspect_ai
-  # package. That also means no setuptools_scm version to compute, hence the
-  # shallow checkout.
+  # package. The checkout is shallow because nothing here consumes a
+  # setuptools_scm version either: the uv-lock hook does build root metadata,
+  # but uv.lock records this project as a versionless editable root, so the
+  # tagless fallback version a shallow clone yields never reaches the file.
   pre-commit:
     runs-on: ubuntu-latest
     env:
