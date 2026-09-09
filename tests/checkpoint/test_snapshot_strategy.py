@@ -393,18 +393,30 @@ def _compressed_archive(path: Path, raw_tar: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _ustar(name: str, type: bytes = tarfile.REGTYPE, mode: int = 0o644) -> bytes:
+def _ustar(
+    name: str, type: bytes = tarfile.REGTYPE, mode: int = 0o644, linkname: str = ""
+) -> bytes:
     """One raw 512-byte ustar header for an empty member."""
-    return _member(name, type, mode=mode).tobuf(tarfile.USTAR_FORMAT)
+    return _member(name, type, mode=mode, linkname=linkname).tobuf(tarfile.USTAR_FORMAT)
+
+
+def _data_header(name: str, type: bytes, data: bytes) -> bytes:
+    """A raw header of ``type`` whose data block(s) hold ``data``."""
+    info = tarfile.TarInfo(name)
+    info.type = type
+    info.size = len(data)
+    padding = b"\0" * (-len(data) % tarfile.BLOCKSIZE)
+    return info.tobuf(tarfile.USTAR_FORMAT) + data + padding
 
 
 def _pax_header(records: bytes, type: bytes = tarfile.XHDTYPE) -> bytes:
     """A raw PAX extended (``x``) or global (``g``) header with ``records``."""
-    info = tarfile.TarInfo("././@PaxHeader")
-    info.type = type
-    info.size = len(records)
-    padding = b"\0" * (-len(records) % tarfile.BLOCKSIZE)
-    return info.tobuf(tarfile.USTAR_FORMAT) + records + padding
+    return _data_header("././@PaxHeader", type, records)
+
+
+def _long_header(type: bytes, value: str) -> bytes:
+    """A raw GNU long-name (``L``) or long-link (``K``) header carrying ``value``."""
+    return _data_header("././@LongLink", type, value.encode() + b"\0")
 
 
 def _bad_checksum(name: str) -> bytes:
@@ -420,16 +432,36 @@ def _boundary_tricks(root: str) -> dict[str, tuple[bytes, str]]:
     """Name → (raw tar bytes, substring the refusal must name).
 
     Archives on which ``tarfile`` and an extracting tar disagree about
-    where members start or what they are called, each hiding a setuid
-    ``sh`` under the root. busybox tar ignores PAX, so a ``size`` record
-    that makes ``tarfile`` skip a block leaves busybox reading that block
-    as a header; and ``tarfile`` ends its listing quietly at a header it
-    cannot parse, where busybox and GNU tar skip it and continue.
+    where members start, what they are called or where a hard link
+    points, each hiding a setuid ``sh`` or an out-of-scope hard link
+    under the root. busybox tar ignores PAX, so a ``size`` record that
+    makes ``tarfile`` skip a block leaves busybox reading that block as
+    a header; ``tarfile`` ends its listing quietly at a header it cannot
+    parse, where busybox and GNU tar skip it and continue; and of two
+    chained GNU long headers ``tarfile`` applies the first where busybox
+    and GNU tar apply the last.
     """
     dir_ = _ustar(root, tarfile.DIRTYPE, 0o755)
     ok = _ustar(f"{root}/ok")
     hidden = _ustar(f"{root}/sh", mode=0o4755)
     return {
+        "second_long_link_retargets_a_hard_link": (
+            dir_
+            + ok
+            + _long_header(tarfile.GNUTYPE_LONGLINK, f"{root}/ok")
+            + _long_header(tarfile.GNUTYPE_LONGLINK, "etc/passwd")
+            + _ustar(f"{root}/pw", tarfile.LNKTYPE)
+            + _TAR_END,
+            "preceded by two GNU long-link (K) headers",
+        ),
+        "second_long_name_renames_a_member": (
+            dir_
+            + _long_header(tarfile.GNUTYPE_LONGNAME, f"{root}/ok")
+            + _long_header(tarfile.GNUTYPE_LONGNAME, f"{root}/sh")
+            + hidden
+            + _TAR_END,
+            "preceded by two GNU long-name (L) headers",
+        ),
         "pax_size_hides_a_member": (
             dir_ + _pax_header(b"12 size=512\n") + ok + hidden + _TAR_END,
             "carries PAX extended-header records ['size']",
@@ -615,6 +647,62 @@ async def test_archive_restore_refuses_member_boundary_tricks(
     assert not (root / "sh").exists()
 
 
+def _split_gzip_archive(clean: bytes, hidden: bytes) -> bytes:
+    """``gzip(clean) + gzip(hidden)``: one tar stream to ``gzip -d``, two gzip members."""
+    return gzip.compress(clean) + gzip.compress(hidden)
+
+
+@pytest.mark.parametrize(
+    "layout", ["hidden_in_second_member", "member_behind_end_marker", "trailing_bytes"]
+)
+async def test_archive_restore_decodes_gzip_like_the_sandbox_does(
+    tmp_path: Path, layout: str
+) -> None:
+    """Members in a second gzip member reach the host walk, as they reach the sandbox's tar.
+
+    ``gzip -d`` and busybox gunzip decode concatenated gzip members, so
+    ``gzip(clean members without an end marker) + gzip(hidden members)``
+    is one archive to the extracting tar; ``tarfile``'s own ``r|gz``
+    would list only the clean members. A second member behind an
+    end-of-archive marker is trailing data, and bytes that are not gzip
+    at all (busybox gunzip ignores them) make the archive unreadable.
+    """
+    env = _CountingSandbox()
+    strategy = await _strategy(env, tmp_path)
+    ctx = _context(tmp_path / "sample")
+    root = tmp_path / "capture" / "data"
+    root.mkdir(parents=True)
+    rel = _rel(root)
+    clean = _ustar(rel, tarfile.DIRTYPE, 0o755) + _ustar(f"{rel}/ok")
+    hidden = _ustar(f"{rel}/pw", tarfile.LNKTYPE, linkname="etc/passwd") + _TAR_END
+    if layout == "hidden_in_second_member":
+        payload = _split_gzip_archive(clean, hidden)
+        expected = f"{root}/pw is a hard link to /etc/passwd"
+    elif layout == "member_behind_end_marker":
+        payload = _split_gzip_archive(clean + _TAR_END, hidden)
+        expected = "holds data after the last member"
+    else:
+        payload = gzip.compress(clean + _TAR_END) + b"not gzip"
+        expected = "is unreadable"
+    storage = Path(ctx.storage_dir)
+    storage.mkdir(parents=True)
+    archive_name = "ckpt-00001.tar.gz"
+    (storage / archive_name).write_bytes(payload)
+    digest = hashlib.sha256(payload).hexdigest()
+
+    execs_before = env.execs
+    with pytest.raises(RestoreScopeError, match=re.escape(expected)):
+        await strategy.restore(
+            env,
+            SandboxBackupPaths(include=[str(root)]),
+            _hostile_details(archive_name, digest, root),
+            ctx,
+        )
+    assert env.execs == execs_before
+    assert not (root / "ok").exists()
+    assert not (root / "pw").exists()
+
+
 def _tar_shim(tmp_path: Path, implementation: str) -> dict[str, str] | None:
     """``extra_env`` putting ``implementation``'s tar first on ``PATH`` (``None`` = host tar)."""
     if implementation == "host":
@@ -627,19 +715,21 @@ def _tar_shim(tmp_path: Path, implementation: str) -> dict[str, str] | None:
     return {"PATH": f"{shim}:{os.environ['PATH']}"}
 
 
+@pytest.mark.parametrize("hiding", ["tar_parser", "second_gzip_member"])
 @pytest.mark.parametrize("implementation", ["host", "busybox"])
 async def test_archive_extraction_guard_fails_on_a_planted_special_file(
-    tmp_path: Path, implementation: str
+    tmp_path: Path, implementation: str, hiding: str
 ) -> None:
     """Third layer: a special node the sandbox's tar wrote under a root fails the restore.
 
     The host-side check is bypassed so the archive reaches extraction.
-    With busybox tar the archive is the PAX ``size`` trick: the setuid
-    ``sh`` it hides is extracted by busybox (which ignores PAX and, unlike
-    GNU tar as non-root, keeps the mode bits) and was never seen by
-    ``tarfile``. With the host's tar it is a plain archive carrying a
-    fifo, since GNU tar honors the PAX record and would hide the member
-    as ``tarfile`` did.
+    ``second_gzip_member`` hides a fifo behind the first gzip member,
+    which both tars' gunzip decode. ``tar_parser`` is a member only the
+    extracting tar reads: with busybox tar the PAX ``size`` trick, whose
+    setuid ``sh`` busybox extracts (it ignores PAX and, unlike GNU tar
+    as non-root, keeps the mode bits) and ``tarfile`` never saw; with
+    the host's tar a plain archive carrying a fifo, since GNU tar honors
+    the PAX record and would hide the member as ``tarfile`` did.
     """
     env = LocalShellSandbox(extra_env=_tar_shim(tmp_path, implementation))
     strategy = await _strategy(env, tmp_path)
@@ -649,8 +739,17 @@ async def test_archive_extraction_guard_fails_on_a_planted_special_file(
     storage = Path(ctx.storage_dir)
     storage.mkdir(parents=True)
     archive_name = "ckpt-00001.tar.gz"
-    if implementation == "busybox":
-        raw, _ = _boundary_tricks(_rel(root))["pax_size_hides_a_member"]
+    rel = _rel(root)
+    if hiding == "second_gzip_member":
+        payload = _split_gzip_archive(
+            _ustar(rel, tarfile.DIRTYPE, 0o755) + _ustar(f"{rel}/ok"),
+            _ustar(f"{rel}/pipe", tarfile.FIFOTYPE) + _TAR_END,
+        )
+        (storage / archive_name).write_bytes(payload)
+        digest = hashlib.sha256(payload).hexdigest()
+        planted = root / "pipe"
+    elif implementation == "busybox":
+        raw, _ = _boundary_tricks(rel)["pax_size_hides_a_member"]
         digest = _compressed_archive(storage / archive_name, raw)
         planted = root / "sh"
     else:

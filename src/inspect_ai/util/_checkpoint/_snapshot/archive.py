@@ -33,12 +33,15 @@ Capture mechanics (design §7.2/§8, first implementation):
   archive. On restore the host walks the archive's member headers
   first (``_check_archive``): every member must lie at or under one of
   this attempt's capture roots, be a regular file, directory, symlink
-  or in-scope hard link, carry no PAX records, and (a regular file) no
-  setuid/setgid/sticky bit; nothing but zero padding may follow the
-  last member ``tarfile`` parsed; and the bytes must hash to the
-  recorded digest — all before any of it is copied in. Extraction then
-  names the roots as tar member arguments so only they are written, and
-  a ``find`` over the roots afterwards fails the restore if the
+  or in-scope hard link, carry no PAX records, be preceded by at most
+  one GNU long-name and one long-link header, and (a regular file) no
+  setuid/setgid/sticky bit; the compressed payload is decoded the way
+  the sandbox decodes it (every gzip member, every zstd frame); nothing
+  but zero padding may follow the last member ``tarfile`` parsed; and
+  the bytes must hash to the recorded digest — all before any of it is
+  copied in. Extraction then names the roots as tar member arguments so
+  only they are written, and a ``find`` over the roots afterwards fails
+  the restore if the
   sandbox's tar nonetheless produced a special file or device node
   (``_restore_scope.find_special_nodes_command``) — the layer that does
   not depend on ``tarfile`` and the image's tar agreeing on member
@@ -54,17 +57,19 @@ Capture mechanics (design §7.2/§8, first implementation):
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import io
 import re
 import shlex
 import tarfile
 import time
-from collections.abc import Sequence
+import zlib
+from collections.abc import Callable, Sequence
 from functools import partial
 from logging import getLogger
 from pathlib import Path
-from typing import IO, BinaryIO, Literal
+from typing import Protocol
 
 import anyio
 import zstandard
@@ -78,6 +83,7 @@ from .._repo_ops import checkpoint_tag
 from .._restore_scope import (
     RestoreRoots,
     RestoreScopeError,
+    TarHeaderScan,
     check_recorded_roots,
     find_special_nodes_command,
     tar_member_argument,
@@ -431,13 +437,17 @@ class ArchiveStrategy(SandboxSnapshotStrategy):
             )
 
 
-class _HashingRaw(io.RawIOBase):
-    """Raw binary reader that feeds every byte read through a digest."""
+class _Readable(Protocol):
+    def read(self, size: int, /) -> bytes: ...
 
-    def __init__(self, raw: BinaryIO, digest: hashlib._Hash) -> None:
+
+class _TeeRaw(io.RawIOBase):
+    """Raw binary reader that passes every byte read to ``sink``, in order."""
+
+    def __init__(self, raw: _Readable, sink: Callable[[bytes], object]) -> None:
         super().__init__()
         self._raw = raw
-        self._digest = digest
+        self._sink = sink
 
     def readable(self) -> bool:
         return True
@@ -446,7 +456,7 @@ class _HashingRaw(io.RawIOBase):
         view = memoryview(buffer).cast("B")
         data = self._raw.read(len(view))
         view[: len(data)] = data
-        self._digest.update(data)
+        self._sink(data)
         return len(data)
 
 
@@ -455,14 +465,24 @@ def _check_archive(
 ) -> None:
     """Host-side check of a stored archive before any of it enters the sandbox.
 
-    Walks the member headers in stream mode (gzip via the stdlib, zstd
-    via ``zstandard``) so nothing is extracted on the host and memory
-    stays bounded by one header; every member must pass the
-    :class:`RestoreWalk` and every root must be present. The bytes are
-    hashed as they stream by and compared with the recorded
+    Walks the member headers in stream mode so nothing is extracted on
+    the host and memory stays bounded by one header; every member must
+    pass the :class:`RestoreWalk` and every root must be present. The
+    bytes are hashed as they stream by and compared with the recorded
     digest, so a corrupt or substituted archive is refused here, before
     the copy-in (the in-sandbox digest check before extraction remains
     as the guard against corruption in transit).
+
+    The decompressor must see the payload the way the sandbox's will:
+    ``gzip -d`` and busybox gunzip decode every concatenated gzip member
+    and ``zstd -d`` every frame, so gzip goes through ``GzipFile`` (which
+    reads across members; ``tarfile``'s own ``r|gz`` stops at the first)
+    and zstd is read across frames. Members hidden in a second gzip
+    member thereby reach the walk instead of only the extracting tar.
+
+    The decompressed bytes also pass through a :class:`TarHeaderScan`
+    on their way into ``tarfile``, for the header-chain structure the
+    yielded members cannot show.
 
     ``tarfile`` ends its listing quietly at the first header it cannot
     parse past offset 0 (a bad checksum, a malformed PAX record), where
@@ -474,22 +494,19 @@ def _check_archive(
     """
     digest = hashlib.sha256()
     walk = roots.walker(label=label)
+    scan = TarHeaderScan(label=label)
     with open(path, "rb") as raw:
-        hashed = io.BufferedReader(_HashingRaw(raw, digest))
-        stream: IO[bytes]
-        mode: Literal["r|", "r|gz"]
+        hashed = io.BufferedReader(_TeeRaw(raw, digest.update))
+        decompressed: zstandard.ZstdDecompressionReader | gzip.GzipFile
         if path.name.endswith(".tar.zst"):
-            # Across frames: the sandbox's zstd may write several (pzstd,
-            # or a concatenated stream); tar's view is the whole payload.
-            stream = zstandard.ZstdDecompressor().stream_reader(
+            decompressed = zstandard.ZstdDecompressor().stream_reader(
                 hashed, read_across_frames=True
             )
-            mode = "r|"
         else:
-            stream = hashed
-            mode = "r|gz"
+            decompressed = gzip.GzipFile(fileobj=hashed, mode="rb")
+        stream = io.BufferedReader(_TeeRaw(decompressed, scan.feed))
         try:
-            with tarfile.open(fileobj=stream, mode=mode) as tar:
+            with tarfile.open(fileobj=stream, mode="r|") as tar:
                 for member in tar:
                     walk.visit(tar_member_node(member, label=label))
                 if tar.fileobj is None:
@@ -501,7 +518,16 @@ def _check_archive(
                             f"member the host could parse; the extracting tar could "
                             f"read it as further members, so the archive is refused"
                         )
-        except (tarfile.TarError, zstandard.ZstdError) as exc:
+        except (
+            tarfile.TarError,
+            zstandard.ZstdError,
+            gzip.BadGzipFile,
+            EOFError,
+            zlib.error,
+        ) as exc:
+            # GzipFile reports a bad header or trailing non-gzip bytes as
+            # BadGzipFile, a truncated member as EOFError and a corrupt
+            # deflate body as zlib.error; none is a TarError.
             raise RestoreScopeError(
                 f"{label}: archive {path.name} is unreadable (corrupt or "
                 f"truncated): {exc}"

@@ -31,15 +31,21 @@ root to have appeared:
 
 The tar listing has a second concern: the host parses it with
 ``tarfile`` but the sandbox extracts it with whatever ``tar`` the image
-ships, and the two must agree on where every member starts. A PAX
-extended header (``x``/``g``) can move the boundary (``size``) or rename
-a member (``path``), and busybox tar ignores PAX; a GNU sparse member
-(``S``) carries out-of-band sparse maps. An honest capture (``tar -c``
-in the default gnu format, or busybox) writes neither, so
-:func:`tar_member_node` refuses both, and the archive strategy also
-requires the stream to hold only zero padding after the last member
-``tarfile`` could parse and runs :func:`find_special_nodes_command` in
-the sandbox after extraction.
+ships, and the two must agree on where every member starts and what it
+says. A PAX extended header (``x``/``g``) can move the boundary
+(``size``) or rename a member (``path``), and busybox tar ignores PAX; a
+GNU sparse member (``S``) carries out-of-band sparse maps; two chained
+GNU long-link headers (``K``) give a hard link one target for
+``tarfile`` (which keeps the first) and another for busybox and GNU tar
+(which keep the last). An honest capture (``tar -c`` in the default gnu
+format, or busybox) writes none of these, so :func:`tar_member_node`
+refuses PAX and sparse members and a directory, symlink or hard link
+recorded with data, :class:`TarHeaderScan` refuses a repeated long
+header on the raw stream, and the archive strategy also decodes the
+compressed stream the way the sandbox does (every gzip member), requires
+it to hold only zero padding after the last member ``tarfile`` could
+parse, and runs :func:`find_special_nodes_command` in the sandbox after
+extraction.
 
 Symlink targets are not constrained: an agent legitimately keeps
 symlinks in ``$HOME``. Neither tool follows a restored symlink while
@@ -65,6 +71,7 @@ files under a configured ``/data`` may be legitimate).
 from __future__ import annotations
 
 import posixpath
+import re
 import shlex
 import tarfile
 from collections.abc import Sequence
@@ -98,6 +105,28 @@ _TAR_MEMBER_KINDS: dict[bytes, str] = {
 Deliberately not ``TarInfo.isreg()``: that also accepts GNU sparse
 members (``S``), whose sparse maps ``tarfile`` and the extracting tar
 may size differently, and contiguous files (``7``)."""
+
+_LONG_HEADER_TYPES: dict[bytes, str] = {
+    tarfile.GNUTYPE_LONGNAME: "long-name (L)",
+    tarfile.GNUTYPE_LONGLINK: "long-link (K)",
+}
+"""The GNU headers that precede a member to carry its over-long name or
+link target; an honest capture writes at most one of each per member."""
+
+_TAR_DATA_TYPES = frozenset({tarfile.REGTYPE, tarfile.AREGTYPE, *_LONG_HEADER_TYPES})
+"""Header types followed by ``size`` bytes of data (rounded up to blocks),
+in ``tarfile``, busybox and GNU tar alike."""
+
+_TAR_NO_DATA_TYPES = frozenset({tarfile.DIRTYPE, tarfile.SYMTYPE, tarfile.LNKTYPE})
+"""Header types ``tarfile`` never reads data for. :func:`tar_member_node`
+refuses them when ``size`` is non-zero, so every tar agrees the next
+header follows immediately."""
+
+_TAR_OCTAL_RE = re.compile(rb" *([0-7]*)[ \0]*")
+"""The octal number forms ``tarfile`` parses that an honest header can
+hold: digits, optionally space-led, then space or NUL padding. A strict
+subset of ``tarfile``'s parser (which also takes signs, underscores and
+other whitespace), so a field this refuses is refused, never re-read."""
 
 MAX_RESTORE_NODES = 5_000_000
 """Most nodes a snapshot listing may hold before the restore is refused.
@@ -343,7 +372,11 @@ def tar_member_node(member: tarfile.TarInfo, *, label: str) -> RestoreNode:
     ``size`` record moved the next member's boundary, a ``path`` record
     renamed this one — and the extracting tar may not (busybox ignores
     PAX), so the two would disagree on what the archive holds. Neither
-    gnu-format GNU tar nor busybox writes PAX headers.
+    gnu-format GNU tar nor busybox writes PAX headers. A directory,
+    symlink or hard link recorded with a non-zero size is refused for the
+    same reason: ``tarfile`` reads no data for them whatever the size
+    says, an honest capture writes zero, and a tar that skipped the
+    recorded size would start the next header elsewhere.
     """
     path = _tar_member_path(member.name, label=label, what="archive member")
     if member.pax_headers:
@@ -354,6 +387,12 @@ def tar_member_node(member: tarfile.TarInfo, *, label: str) -> RestoreNode:
         )
     link_target: str | None = None
     kind = _TAR_MEMBER_KINDS.get(member.type, f"tar type {member.type!r} entry")
+    if member.type in _TAR_NO_DATA_TYPES and member.size:
+        raise RestoreScopeError(
+            f"{label}: archive member {path} is a {kind} recorded with "
+            f"{member.size} bytes of data; the extracting tar may skip them and "
+            f"read the following members differently from the host"
+        )
     if kind == "hardlink":
         link_target = _tar_member_path(
             member.linkname, label=label, what=f"hard link target of {path}"
@@ -367,6 +406,115 @@ def _tar_member_path(name: str, *, label: str, what: str) -> str:
     if not name or name.startswith("/"):
         raise RestoreScopeError(f"{label}: {what} is empty or absolute: {name!r}")
     return normalize_absolute("/" + name.rstrip("/"), label=label, what=what)
+
+
+class TarHeaderScan:
+    """Checks the raw header sequence of a tar stream for what ``tarfile`` does not expose.
+
+    ``tarfile`` yields members, not headers. Of two chained GNU long-name
+    (``L``) or long-link (``K``) headers it applies the first where
+    busybox and GNU tar apply the last, so a hard link the walk saw
+    pointing inside a root would be created pointing wherever the second
+    ``K`` says — and nothing on the yielded member shows the second
+    header. Fed every byte ``tarfile`` reads (:meth:`feed`, from a tee on
+    the decompressed stream), the scan walks the 512-byte headers itself,
+    skipping member data by the rule ``tarfile`` uses, and raises
+    :class:`RestoreScopeError` at a repeated long header before the
+    member it describes; ``L`` then ``K`` (a long-named hard link with a
+    long target) stays accepted.
+
+    The scan stays aligned with ``tarfile`` on every archive that is
+    accepted: sizes are parsed as a strict subset of ``tarfile``'s forms
+    (anything else is refused outright); the only members with data are
+    regular files and long headers, which every tar skips identically;
+    directories, symlinks and hard links carry none (a non-zero size on
+    them is refused by :func:`tar_member_node`); and a header of any
+    other type ends the scan, because :func:`tar_member_node` refuses
+    that member — PAX, sparse, device, fifo, unknown — when ``tarfile``
+    yields it. A zero block or a bad checksum ends the scan as well:
+    ``tarfile`` ends its listing there too, and the archive strategy
+    refuses anything but zero padding after the last member it parsed.
+    """
+
+    def __init__(self, *, label: str) -> None:
+        self._label = label
+        self._partial = bytearray()
+        self._skip = 0
+        self._long_seen: set[bytes] = set()
+        self._done = False
+
+    def feed(self, data: bytes) -> None:
+        """Consume the next ``data`` of the decompressed tar stream, in order."""
+        view = memoryview(data)
+        while view and not self._done:
+            if self._skip:
+                taken = min(self._skip, len(view))
+                self._skip -= taken
+                view = view[taken:]
+                continue
+            take = view[: tarfile.BLOCKSIZE - len(self._partial)]
+            self._partial += take
+            view = view[len(take) :]
+            if len(self._partial) == tarfile.BLOCKSIZE:
+                header = bytes(self._partial)
+                self._partial.clear()
+                self._header(header)
+
+    def _header(self, header: bytes) -> None:
+        if header.count(0) == tarfile.BLOCKSIZE or not _tar_checksum_ok(header):
+            self._done = True
+            return
+        typeflag = header[156:157]
+        long_kind = _LONG_HEADER_TYPES.get(typeflag)
+        if long_kind is None:
+            self._long_seen.clear()
+        elif typeflag in self._long_seen:
+            raise RestoreScopeError(
+                f"{self._label}: an archive member is preceded by two GNU "
+                f"{long_kind} headers; the host would apply the first and the "
+                f"extracting tar the last, so the archive is refused"
+            )
+        else:
+            self._long_seen.add(typeflag)
+        if typeflag in _TAR_DATA_TYPES:
+            size = _tar_octal(header[124:136], label=self._label, what="size")
+            self._skip = -(-size // tarfile.BLOCKSIZE) * tarfile.BLOCKSIZE
+        elif typeflag not in _TAR_NO_DATA_TYPES:
+            self._done = True
+
+
+def _tar_octal(field: bytes, *, label: str, what: str) -> int:
+    """A tar header number: GNU base-256 (``0x80`` lead byte) or canonical octal."""
+    if field[0] == 0o200:
+        return int.from_bytes(field[1:], "big")
+    match = _TAR_OCTAL_RE.fullmatch(field)
+    if match is None:
+        raise RestoreScopeError(
+            f"{label}: archive header holds a {what} field that is not octal: "
+            f"{field!r}; the extracting tar may read it differently from the host"
+        )
+    return int(match.group(1) or b"0", 8)
+
+
+def _tar_checksum_ok(header: bytes) -> bool:
+    """Whether ``header`` carries a valid checksum, by ``tarfile``'s rule.
+
+    The stored value may match the unsigned or the signed byte sum (with
+    the checksum field itself counted as spaces), as ``tarfile`` accepts
+    either. An unparseable checksum field counts as invalid, which is
+    also where ``tarfile`` stops.
+    """
+    match = _TAR_OCTAL_RE.fullmatch(header[148:156])
+    if match is None:
+        return False
+    stored = int(match.group(1) or b"0", 8)
+    unsigned = 256 + sum(header[:148]) + sum(header[156:])
+    signed = (
+        256
+        + sum(b - 256 if b > 127 else b for b in header[:148])
+        + sum(b - 256 if b > 127 else b for b in header[156:])
+    )
+    return stored in (unsigned, signed)
 
 
 def tar_member_argument(root: str) -> str:

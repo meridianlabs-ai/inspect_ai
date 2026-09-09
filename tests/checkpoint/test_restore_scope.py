@@ -24,6 +24,7 @@ from inspect_ai.util._checkpoint._restore_scope import (
     RestoreNode,
     RestoreRoots,
     RestoreScopeError,
+    TarHeaderScan,
     check_recorded_roots,
     find_special_nodes_command,
     recorded_roots,
@@ -289,6 +290,142 @@ def test_tar_member_node_refuses_pax_records(records: dict[str, str]) -> None:
     member = _member("home/user/f", pax_headers=records)
     with pytest.raises(RestoreScopeError, match="carries PAX extended-header"):
         tar_member_node(member, label=LABEL)
+
+
+def _long_header(type: bytes, value: str) -> bytes:
+    """A raw GNU long-name (``L``) or long-link (``K``) header carrying ``value``."""
+    info = tarfile.TarInfo("././@LongLink")
+    info.type = type
+    data = value.encode() + b"\0"
+    info.size = len(data)
+    return (
+        info.tobuf(tarfile.USTAR_FORMAT)
+        + data
+        + b"\0" * (-len(data) % tarfile.BLOCKSIZE)
+    )
+
+
+_LONG_NAME = "home/user/" + "n" * 120
+_LONG_LINK = "home/user/" + "t" * 120
+
+
+@pytest.mark.parametrize(
+    "chain, refused",
+    [
+        pytest.param([tarfile.GNUTYPE_LONGLINK], False, id="K"),
+        pytest.param([tarfile.GNUTYPE_LONGNAME], False, id="L"),
+        pytest.param(
+            [tarfile.GNUTYPE_LONGNAME, tarfile.GNUTYPE_LONGLINK], False, id="LK"
+        ),
+        pytest.param(
+            [tarfile.GNUTYPE_LONGLINK, tarfile.GNUTYPE_LONGLINK], True, id="KK"
+        ),
+        pytest.param(
+            [tarfile.GNUTYPE_LONGNAME, tarfile.GNUTYPE_LONGNAME], True, id="LL"
+        ),
+    ],
+)
+@pytest.mark.parametrize("chunk", [1, 511, 512, 700, 1 << 20])
+def test_tar_header_scan_refuses_a_repeated_long_header(
+    chain: list[bytes], refused: bool, chunk: int
+) -> None:
+    """Of two chained ``K`` (or ``L``) headers ``tarfile`` applies the first, busybox and GNU tar the last.
+
+    One header of each kind per member is what an honest capture writes
+    and stays accepted; the tracking resets at each real member, so two
+    members each preceded by the same chain scan cleanly. The stream is
+    fed in every chunk size from single bytes to one read, since headers
+    arrive split however the decompressor delivers them; a regular file
+    with data sits between the two members so its blocks are skipped.
+    """
+    values = {
+        tarfile.GNUTYPE_LONGNAME: _LONG_NAME,
+        tarfile.GNUTYPE_LONGLINK: _LONG_LINK,
+    }
+    member = b"".join(_long_header(t, values[t]) for t in chain) + _member(
+        "home/user/short", tarfile.LNKTYPE, linkname="home/user/x"
+    ).tobuf(tarfile.USTAR_FORMAT)
+    data = b"\1" * 700
+    with_data = _member("home/user/f", size=len(data)).tobuf(tarfile.USTAR_FORMAT)
+    with_data += data + b"\0" * (-len(data) % tarfile.BLOCKSIZE)
+    raw = member + with_data + member + b"\0" * (2 * tarfile.BLOCKSIZE)
+
+    def scan() -> None:
+        scanner = TarHeaderScan(label=LABEL)
+        for start in range(0, len(raw), chunk):
+            scanner.feed(raw[start : start + chunk])
+
+    if refused:
+        with pytest.raises(RestoreScopeError, match="two GNU long-(name|link)"):
+            scan()
+    else:
+        scan()
+        # And tarfile, given the same bytes, lists what the scan accepted.
+        with tarfile.open(fileobj=io.BytesIO(raw), mode="r|") as tar:
+            names = [m.name for m in tar]
+        name = _LONG_NAME if tarfile.GNUTYPE_LONGNAME in chain else "home/user/short"
+        assert names == [name, "home/user/f", name]
+
+
+def test_tar_header_scan_ends_where_tarfile_does() -> None:
+    """A zero block, a bad checksum or a header type the walk refuses ends the scan.
+
+    Anything after those points is either zero padding (checked by the
+    archive strategy) or a member ``tarfile`` refuses, so a chain there
+    is not the scan's to judge: two ``K`` headers behind an end-of-archive
+    marker or a PAX header raise nothing here.
+    """
+    two_k = _long_header(tarfile.GNUTYPE_LONGLINK, _LONG_LINK) * 2
+    hardlink = _member("home/user/pw", tarfile.LNKTYPE).tobuf(tarfile.USTAR_FORMAT)
+    pax = _member("././@PaxHeader", tarfile.XHDTYPE).tobuf(tarfile.USTAR_FORMAT)
+    bad = bytearray(_member("home/user/x").tobuf(tarfile.USTAR_FORMAT))
+    bad[148:156] = b"0000000\0"
+    for prefix in (b"\0" * tarfile.BLOCKSIZE, pax, bytes(bad)):
+        TarHeaderScan(label=LABEL).feed(prefix + two_k + hardlink)
+    with pytest.raises(RestoreScopeError, match="two GNU long-link"):
+        TarHeaderScan(label=LABEL).feed(two_k + hardlink)
+
+
+@pytest.mark.parametrize("field", [b"1_000\0      ", b"+12\0        ", b"\xff" * 12])
+def test_tar_header_scan_refuses_size_fields_tarfile_would_reinterpret(
+    field: bytes,
+) -> None:
+    """Only canonical octal (or GNU base-256) sizes are scanned; ``int()`` forms are not."""
+    with pytest.raises(RestoreScopeError, match="size field that is not octal"):
+        TarHeaderScan(label=LABEL).feed(_header_with_size_field("home/user/f", field))
+
+
+def _header_with_size_field(name: str, field: bytes) -> bytes:
+    """A regular-file header with a raw ``size`` field and a recomputed checksum."""
+    header = bytearray(_member(name).tobuf(tarfile.USTAR_FORMAT))
+    header[124:136] = field
+    header[148:156] = b"        "
+    header[148:156] = f"{sum(header):06o}\0 ".encode()
+    return bytes(header)
+
+
+def test_tar_header_scan_reads_base256_sizes_like_tarfile() -> None:
+    """A GNU base-256 size skips exactly the data ``tarfile`` skips, then judges the next header."""
+    header = _header_with_size_field(
+        "home/user/big", b"\x80" + (1024).to_bytes(11, "big")
+    )
+    two_k = _long_header(tarfile.GNUTYPE_LONGLINK, _LONG_LINK) * 2
+    hardlink = _member("home/user/pw", tarfile.LNKTYPE).tobuf(tarfile.USTAR_FORMAT)
+    with pytest.raises(RestoreScopeError, match="two GNU long-link"):
+        TarHeaderScan(label=LABEL).feed(header + b"\1" * 1024 + two_k + hardlink)
+
+
+@pytest.mark.parametrize("type", [tarfile.DIRTYPE, tarfile.SYMTYPE, tarfile.LNKTYPE])
+def test_tar_member_node_refuses_data_on_a_directory_symlink_or_hard_link(
+    type: bytes,
+) -> None:
+    """``tarfile`` skips no data for these whatever ``size`` says; an honest capture writes 0."""
+    member = _member("home/user/x", type, size=512, linkname="home/user/y")
+    with pytest.raises(RestoreScopeError, match="recorded with 512 bytes of data"):
+        tar_member_node(member, label=LABEL)
+    assert tar_member_node(
+        _member("home/user/x", type, linkname="home/user/y"), label=LABEL
+    )
 
 
 @pytest.mark.parametrize(
