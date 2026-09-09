@@ -257,7 +257,7 @@ def test_restic_restore_args_anchor_at_the_parent() -> None:
 
 
 def test_restic_restore_args_escape_glob_metacharacters() -> None:
-    """``\\``, ``*``, ``?`` and ``[`` are escaped; a lone ``]`` is already literal."""
+    """Backslash, ``*``, ``?`` and ``[`` are escaped; a lone ``]`` is already literal."""
     args = restic_restore_args("abc123", "/srv/da[t]a*?\\x")
     assert args.include == "/da\\[t]a\\*\\?\\\\x"
     assert args.target == "/srv"
