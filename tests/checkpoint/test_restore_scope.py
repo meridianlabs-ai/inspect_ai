@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import io
 import os
+import re
 import shutil
 import subprocess
 import tarfile
@@ -368,22 +369,84 @@ def test_tar_header_scan_refuses_a_repeated_long_header(
 
 
 def test_tar_header_scan_ends_where_tarfile_does() -> None:
-    """A zero block, a mismatching canonical checksum or a header type the walk refuses ends the scan.
+    """A zero block or a mismatching canonical checksum ends the scan, and nothing else does.
 
-    Anything after those points is either zero padding (checked by the
-    archive strategy) or a member ``tarfile`` refuses, so a chain there
-    is not the scan's to judge: two ``K`` headers behind an end-of-archive
-    marker or a PAX header raise nothing here.
+    ``tarfile`` ends its listing at exactly those two points, and the
+    archive strategy refuses anything but zero padding after them, so a
+    chain there is not the scan's to judge: two ``K`` headers behind an
+    end-of-archive marker or a bad checksum raise nothing here.
     """
     two_k = _long_header(tarfile.GNUTYPE_LONGLINK, _LONG_LINK) * 2
     hardlink = _member("home/user/pw", tarfile.LNKTYPE).tobuf(tarfile.USTAR_FORMAT)
-    pax = _member("././@PaxHeader", tarfile.XHDTYPE).tobuf(tarfile.USTAR_FORMAT)
     bad = bytearray(_member("home/user/x").tobuf(tarfile.USTAR_FORMAT))
     bad[148:156] = b"0000000\0"
-    for prefix in (b"\0" * tarfile.BLOCKSIZE, pax, bytes(bad)):
+    for prefix in (b"\0" * tarfile.BLOCKSIZE, bytes(bad)):
         TarHeaderScan(label=LABEL).feed(prefix + two_k + hardlink)
     with pytest.raises(RestoreScopeError, match="two GNU long-link"):
         TarHeaderScan(label=LABEL).feed(two_k + hardlink)
+
+
+@pytest.mark.parametrize(
+    "type, kind",
+    [
+        pytest.param(tarfile.XHDTYPE, "PAX extended", id="x"),
+        pytest.param(tarfile.XGLTYPE, "PAX global", id="g"),
+        pytest.param(tarfile.SOLARIS_XHDTYPE, "Solaris PAX extended", id="X"),
+    ],
+)
+def test_tar_header_scan_refuses_an_empty_pax_header_tarfile_lists_past(
+    type: bytes, kind: str
+) -> None:
+    """A PAX header with no records is refused, not a stopping point.
+
+    ``tarfile`` consumes ``x``/``g``/``X`` headers without yielding them;
+    one with an empty payload hands the next member empty ``pax_headers``,
+    which :func:`tar_member_node` accepts, and the listing carries on —
+    asserted here, since a scan that stopped at the header would leave a
+    ``K K`` chain behind it unjudged while the walk accepted the link.
+    """
+    pax = _member("././@PaxHeader", type).tobuf(tarfile.USTAR_FORMAT)
+    two_k = _long_header(tarfile.GNUTYPE_LONGLINK, "home/user/a")
+    two_k += _long_header(tarfile.GNUTYPE_LONGLINK, "etc/passwd")
+    hardlink = _member("home/user/pw", tarfile.LNKTYPE).tobuf(tarfile.USTAR_FORMAT)
+    raw = pax + two_k + hardlink + b"\0" * (2 * tarfile.BLOCKSIZE)
+
+    with tarfile.open(fileobj=io.BytesIO(raw), mode="r|") as tar:
+        listed = [(m.name, m.linkname, m.pax_headers) for m in tar]
+    assert listed == [("home/user/pw", "home/user/a", {})]
+
+    with pytest.raises(
+        RestoreScopeError, match=rf"holds a {kind} header \('\./\./@PaxHeader'\)"
+    ):
+        TarHeaderScan(label=LABEL).feed(raw)
+
+
+@pytest.mark.parametrize(
+    "type, kind",
+    [
+        pytest.param(tarfile.GNUTYPE_SPARSE, "GNU sparse file", id="S"),
+        pytest.param(tarfile.CHRTYPE, "character device", id="3"),
+        pytest.param(tarfile.BLKTYPE, "block device", id="4"),
+        pytest.param(tarfile.FIFOTYPE, "fifo", id="6"),
+        pytest.param(tarfile.CONTTYPE, "contiguous file", id="7"),
+        pytest.param(b"Z", "tar type b'Z'", id="unknown"),
+    ],
+)
+def test_tar_header_scan_refuses_header_types_the_walk_would_refuse(
+    type: bytes, kind: str
+) -> None:
+    """Every header type that is not a member or a long header is refused, naming the member.
+
+    The walk would refuse these members when ``tarfile`` yields them, so
+    refusing at the header is equivalent and keeps the scan's rule simple:
+    it stops only where ``tarfile`` provably stops.
+    """
+    header = _member("home/user/odd", type).tobuf(tarfile.USTAR_FORMAT)
+    with pytest.raises(
+        RestoreScopeError,
+        match=rf"holds a {re.escape(kind)} header \('home/user/odd'\)",
+    ):
+        TarHeaderScan(label=LABEL).feed(header)
 
 
 @pytest.mark.parametrize("field", [b"1_000\0      ", b"+12\0        ", b"\xff" * 12])

@@ -60,8 +60,11 @@
 >    directory sticky/setgid bits carry no privilege and are kept, so
 >    `/tmp` or a `g+s` shared dir can be a root). For the archive the
 >    host's `tarfile` and the image's `tar` must also agree on member
->    boundaries: members carrying PAX records or GNU sparse maps are
->    refused, only zero padding may follow the last parsed member, and
+>    boundaries: the raw header stream is scanned alongside `tarfile`
+>    and refused on a PAX, sparse, device or fifo header (`tarfile`
+>    consumes a PAX header without listing it) or a repeated GNU long
+>    header, members carrying PAX records are refused, only zero
+>    padding may follow the last parsed member, and
 >    a `find` over the roots after extraction fails the restore on any
 >    special file or device node the sandbox's tar produced anyway.
 >    Each root is then restored individually (`restic restore

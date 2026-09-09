@@ -33,9 +33,10 @@ Capture mechanics (design §7.2/§8, first implementation):
   archive. On restore the host walks the archive's member headers
   first (``_check_archive``): every member must lie at or under one of
   this attempt's capture roots, be a regular file, directory, symlink
-  or in-scope hard link, carry no PAX records, be preceded by at most
-  one GNU long-name and one long-link header, and (a regular file) no
-  setuid/setgid/sticky bit; the compressed payload is decoded the way
+  or in-scope hard link, carry no PAX records, and (a regular file) no
+  setuid/setgid/sticky bit; the raw header stream may hold no PAX,
+  sparse, device or fifo header and at most one GNU long-name and one
+  long-link header per member; the compressed payload is decoded the way
   the sandbox decodes it (every gzip member, every zstd frame); nothing
   but zero padding may follow the last member ``tarfile`` parsed; and
   the bytes must hash to the recorded digest — all before any of it is
@@ -481,8 +482,9 @@ def _check_archive(
     member thereby reach the walk instead of only the extracting tar.
 
     The decompressed bytes also pass through a :class:`TarHeaderScan`
-    on their way into ``tarfile``, for the header-chain structure the
-    yielded members cannot show.
+    on their way into ``tarfile``, for what the yielded members cannot
+    show: a repeated long header, or a PAX header ``tarfile`` consumes
+    without yielding.
 
     ``tarfile`` ends its listing quietly at the first header it cannot
     parse past offset 0 (a bad checksum, a malformed PAX record), where

@@ -447,10 +447,12 @@ def _boundary_tricks(root: str) -> dict[str, tuple[bytes, str]]:
     a header; ``tarfile`` ends its listing quietly at a header it cannot
     parse, where busybox and GNU tar skip it and continue; of two
     chained GNU long headers ``tarfile`` applies the first where busybox
-    and GNU tar apply the last; and a checksum spelled in a form
-    ``tarfile`` reads but the header scan does not (base-256, signed)
-    must be refused rather than end the scan, or the chain behind it
-    would go unscanned while the walk kept accepting members.
+    and GNU tar apply the last; and a header the scan cannot judge but
+    ``tarfile`` lists past — a checksum spelled in a form the scan does
+    not read (base-256, signed), or a PAX header with no records, which
+    ``tarfile`` consumes without yielding — must be refused rather than
+    end the scan, or the chain behind it would go unscanned while the
+    walk kept accepting members.
     """
     dir_ = _ustar(root, tarfile.DIRTYPE, 0o755)
     ok = _ustar(f"{root}/ok")
@@ -489,20 +491,28 @@ def _boundary_tricks(root: str) -> dict[str, tuple[bytes, str]]:
             + _TAR_END,
             "preceded by two GNU long-name (L) headers",
         ),
+        "empty_pax_hides_a_long_link_chain": (
+            dir_ + _pax_header(b"") + ok + retargeted_link + _TAR_END,
+            "holds a PAX extended header ('././@PaxHeader')",
+        ),
+        "empty_global_pax_hides_a_long_link_chain": (
+            dir_ + _pax_header(b"", tarfile.XGLTYPE) + ok + retargeted_link + _TAR_END,
+            "holds a PAX global header ('././@PaxHeader')",
+        ),
         "pax_size_hides_a_member": (
             dir_ + _pax_header(b"12 size=512\n") + ok + hidden + _TAR_END,
-            "carries PAX extended-header records ['size']",
+            "holds a PAX extended header ('././@PaxHeader')",
         ),
         "global_pax_renames_members": (
             dir_
             + _pax_header(b"20 path=etc/planted\n", tarfile.XGLTYPE)
             + ok
             + _TAR_END,
-            "carries PAX extended-header records ['path']",
+            "holds a PAX global header ('././@PaxHeader')",
         ),
-        "malformed_pax_ends_the_listing": (
+        "malformed_pax_hides_a_member": (
             dir_ + _pax_header(b"9 size=512\n") + ok + hidden + _TAR_END,
-            "holds data after the last member",
+            "holds a PAX extended header ('././@PaxHeader')",
         ),
         "bad_checksum_ends_the_listing": (
             dir_ + _bad_checksum(f"{root}/junk") + ok + hidden + _TAR_END,
@@ -545,17 +555,19 @@ _HOSTILE_MEMBERS: dict[str, Callable[[Path, Path], tuple[tarfile.TarInfo, str]]]
         _member(_rel(root / "sh"), mode=0o2755),
         f"{root}/sh is a regular file with mode 2755",
     ),
+    # Sparse, fifo and device headers are refused by the header scan,
+    # before tarfile yields the member the walk would also refuse.
     "sparse_under_root": lambda root, outside: (
         _member(_rel(root / "sp"), tarfile.GNUTYPE_SPARSE),
-        f"{root}/sp is a tar type b'S' entry",
+        f"holds a GNU sparse file header ('{_rel(root / 'sp')}')",
     ),
     "fifo_under_root": lambda root, outside: (
         _member(_rel(root / "pipe"), tarfile.FIFOTYPE),
-        f"{root}/pipe is a tar type",
+        f"holds a fifo header ('{_rel(root / 'pipe')}')",
     ),
     "chardev_under_root": lambda root, outside: (
         _member(_rel(root / "null"), tarfile.CHRTYPE),
-        f"{root}/null is a tar type",
+        f"holds a character device header ('{_rel(root / 'null')}')",
     ),
     "hardlink_outside": lambda root, outside: (
         _member(_rel(root / "pw"), tarfile.LNKTYPE, linkname="etc/passwd"),
@@ -647,8 +659,8 @@ async def test_archive_restore_refuses_member_boundary_tricks(
     """An archive whose members ``tarfile`` and the sandbox's tar would count differently is refused.
 
     Every member ``tarfile`` yields is in scope and benign; the refusal
-    comes from the PAX records themselves or from the bytes left behind
-    where ``tarfile`` stopped. Nothing is sent to the sandbox.
+    comes from the raw header scan or from the bytes left behind where
+    ``tarfile`` stopped. Nothing is sent to the sandbox.
     """
     env = _CountingSandbox()
     strategy = await _strategy(env, tmp_path)

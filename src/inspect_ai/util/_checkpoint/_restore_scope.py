@@ -38,10 +38,13 @@ GNU sparse member (``S``) carries out-of-band sparse maps; two chained
 GNU long-link headers (``K``) give a hard link one target for
 ``tarfile`` (which keeps the first) and another for busybox and GNU tar
 (which keep the last). An honest capture (``tar -c`` in the default gnu
-format, or busybox) writes none of these, so :func:`tar_member_node`
-refuses PAX and sparse members and a directory, symlink or hard link
-recorded with data, :class:`TarHeaderScan` refuses a repeated long
-header on the raw stream, and the archive strategy also decodes the
+format, or busybox) writes none of these, so :class:`TarHeaderScan`
+refuses, on the raw header stream, a repeated long header and every
+header type other than a regular file, directory, symlink, hard link or
+long header (PAX, sparse, device, fifo, unknown — ``tarfile`` consumes
+a PAX header without ever yielding it), :func:`tar_member_node` refuses
+a member carrying PAX records and a directory, symlink or hard link
+recorded with data, and the archive strategy also decodes the
 compressed stream the way the sandbox does (every gzip member), requires
 it to hold only zero padding after the last member ``tarfile`` could
 parse, and runs :func:`find_special_nodes_command` in the sandbox after
@@ -121,6 +124,20 @@ _TAR_NO_DATA_TYPES = frozenset({tarfile.DIRTYPE, tarfile.SYMTYPE, tarfile.LNKTYP
 """Header types ``tarfile`` never reads data for. :func:`tar_member_node`
 refuses them when ``size`` is non-zero, so every tar agrees the next
 header follows immediately."""
+
+_TAR_REFUSED_HEADER_TYPES: dict[bytes, str] = {
+    tarfile.XHDTYPE: "PAX extended",
+    tarfile.XGLTYPE: "PAX global",
+    tarfile.SOLARIS_XHDTYPE: "Solaris PAX extended",
+    tarfile.GNUTYPE_SPARSE: "GNU sparse file",
+    tarfile.CHRTYPE: "character device",
+    tarfile.BLKTYPE: "block device",
+    tarfile.FIFOTYPE: "fifo",
+    tarfile.CONTTYPE: "contiguous file",
+}
+"""Names for the header types :class:`TarHeaderScan` refuses outright
+(any type outside :data:`_TAR_DATA_TYPES` and :data:`_TAR_NO_DATA_TYPES`
+is refused; one not listed here is named by its typeflag)."""
 
 _TAR_OCTAL_RE = re.compile(rb" *([0-7]*)[ \0]*")
 """The octal number forms ``tarfile`` parses that an honest header can
@@ -429,15 +446,17 @@ class TarHeaderScan:
     regular files and long headers, which every tar skips identically;
     directories, symlinks and hard links carry none (a non-zero size on
     them is refused by :func:`tar_member_node`); and a header of any
-    other type ends the scan, because :func:`tar_member_node` refuses
-    that member — PAX, sparse, device, fifo, unknown — when ``tarfile``
-    yields it. A zero block or a canonical-octal checksum that mismatches
-    ends the scan as well: ``tarfile`` ends its listing there too, and
-    the archive strategy refuses anything but zero padding after the last
-    member it parsed. A checksum in any other form is refused outright,
-    like a size: ``tarfile`` reads base-256, signed and underscored
-    checksums and carries on, so stopping there would leave the rest of
-    the archive unscanned while the walk kept accepting members.
+    other type — PAX, sparse, device, fifo, unknown — is refused
+    outright. The scan may stop only where ``tarfile`` provably stops: a
+    zero block, or a canonical-octal checksum that mismatches (the
+    archive strategy refuses anything but zero padding after the last
+    member ``tarfile`` parsed). Stopping anywhere else would leave the
+    rest of the archive unscanned while the walk kept accepting members:
+    ``tarfile`` consumes a PAX header (``x``, ``g``, ``X``) without ever
+    yielding it — one with no records hands the next member empty
+    ``pax_headers``, which :func:`tar_member_node` accepts — and reads
+    base-256, signed and underscored checksums and carries on, so those
+    are refused rather than treated as an end.
     """
 
     def __init__(self, *, label: str) -> None:
@@ -486,7 +505,14 @@ class TarHeaderScan:
             size = _tar_octal(header[124:136], label=self._label, what="size")
             self._skip = -(-size // tarfile.BLOCKSIZE) * tarfile.BLOCKSIZE
         elif typeflag not in _TAR_NO_DATA_TYPES:
-            self._done = True
+            name = header[:100].split(b"\0", 1)[0].decode("utf-8", "replace")
+            kind = _TAR_REFUSED_HEADER_TYPES.get(typeflag, f"tar type {typeflag!r}")
+            raise RestoreScopeError(
+                f"{self._label}: archive holds a {kind} header ({name!r}); only "
+                f"regular files, directories, symlinks, hard links and GNU long "
+                f"headers are accepted, since the host and the extracting tar may "
+                f"read anything else differently"
+            )
 
 
 def _tar_octal(field: bytes, *, label: str, what: str) -> int:
