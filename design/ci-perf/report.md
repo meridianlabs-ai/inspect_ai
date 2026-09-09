@@ -473,7 +473,9 @@ judgement-based candidates are unchanged (proposal 19).
    passed / 46 skipped in 1.24s in the PR gate's configuration.
    Disruption: safe fix (one `pytestmark`, policy-mandated, with an
    in-directory precedent).
-   Status: **new, shipped in this PR**.
+   Status: **new, shipped in this PR — and measured in CI within the hour;
+   prediction hit.** See "Measured in CI" below.
+   
 
 4. **Stop paying 214ms of control-server startup on every `eval()`.** Carried,
    unchanged, and still the largest measured *test-side* lever. A one-sample
@@ -547,7 +549,8 @@ judgement-based candidates are unchanged (proposal 19).
    (3.11)` at ~90s, saving the locked dependency set rather than an unlocked
    `.[dev]` resolution. No job loses a cache — `test`, `mypy`, `slow-tests` and
    `sandbox-tools-unit` all still write that key. Disruption: safe fix (workflow
-   hygiene). Status: **new, shipped in this PR**.
+   hygiene). Status: **new, shipped in this PR — measured in CI at 33 → 17s,
+   prediction hit.** See "Measured in CI" below.
 
 9. **Rendering `EvalError.traceback_ansi` costs ~60s of worker time per leg.**
    Carried, not re-measured this window; the two `test_agent_bridge.py` Google
@@ -669,6 +672,50 @@ judgement-based candidates are unchanged (proposal 19).
     the next time the collector is writable. Status: carried.
 
 Dropped this report: proposal 16 (pnpm), after three clean windows.
+
+## Measured in CI: this run's two fixes
+
+Both fixes touch code the PR gate runs, so this PR's own CI measured them
+before the run ended. Comparing the `--report-log` artifacts of this PR's Build
+run (34337355178, on the fork) against upstream run 34332424502:
+
+| | before | after | Δ |
+|---|---:|---:|---:|
+| `test_sandbox_egress_restic.py` worker time | 116.4s | **0.1s** | −116.3s |
+| 3.10 leg worker time | 1079.0s | **889.2s** | −189.8s |
+| 3.11 leg worker time | 1100.9s | **897.4s** | −203.5s |
+| 3.10 span (first test start → last stop) | 281.5s | **235.9s** | −45.6s |
+| 3.11 span | 284.0s | **237.8s** | −46.2s |
+| `call` phases collected | 11,626 | 11,602 | −24 |
+| `pre-commit` job exec | 33s (window median) | **17s** | −16s |
+| `slow-tests (checkpoint)` step | 195s / 20 passed | **183.3s / 44 passed** | −11.7s, +24 tests |
+
+**Fix 1 (proposal 3): prediction hit, and the honest arithmetic matters.** The
+marked file is gone from the leg (0.1s is the one test that moved to
+`test_sandbox_egress_extract.py`), exactly the 116.3s predicted. The leg-level
+span fell 45.6s, which is *more* than the ~30s predicted — but only ~29s of it
+is this fix. Diffing per-file worker time across the two runs, the other
+**−73.3s is spread thinly over 612 files** in a uniformly faster direction
+(`test_eval_set.py` −8.3s, `test_eval_set_scanner.py` −5.9s,
+`test_launch_handoff.py` −4.6s, and hundreds of sub-2s deltas), which is a
+faster/less-loaded runner, not anything the change did: 116.3/4 = 29.1s plus
+73.3/4 = 18.3s accounts for the 45.6s observed. So the fix delivers **~29s per
+leg**, against ~30s predicted.
+
+**Fix 2 (proposal 8): prediction hit.** `pre-commit` ran in **17s** against a
+33s window median — 16s removed, against ~15s predicted.
+
+**The cost side of fix 1 did not materialise, and that is the interesting
+result.** The report predicted ~+29s on `slow-tests (checkpoint)` from absorbing
+116.4s of worker time across 4 workers. Measured on this PR's own run (the first
+push to exercise it): **44 passed / 34 skipped in 183.26s**, against 20 passed
+at a ~195s step median. The leg took **24 more tests and 116s more worker time
+for 11.7s less wall** — the checkpoint slow suite had that much idle worker
+capacity, because it is 20 Docker tests whose durations are very uneven. Two
+consequences: the move is unambiguously net-positive rather than
+marginally so, and #5293's `-n logical` bought more headroom than its own
+measurement showed. Small samples on both sides (3 runs before, 1 after), so
+the next snapshot should re-read it.
 
 ## Impact verification
 
