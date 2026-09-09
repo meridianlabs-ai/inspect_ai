@@ -265,23 +265,17 @@ async def _check_snapshot_scope(
 ) -> str:
     """Host-side listing check of the snapshot about to be restored; return its full id.
 
-    Every node must pass :meth:`RestoreRoots.check_node` and every root
-    must be present in the snapshot. Nothing has been sent to the
-    sandbox when this runs, so a refused snapshot leaves it untouched.
+    Every node must pass the :class:`RestoreWalk` and every root must be
+    present in the snapshot. Nothing has been sent to the sandbox when
+    this runs, so a refused snapshot leaves it untouched.
     """
-    seen: set[str] = set()
-    count = 0
+    walk = roots.walker(label=label)
 
     def visit(record: dict[str, Any]) -> None:
-        nonlocal count
-        count += 1
-        roots.check_node_count(count, label=label)
-        root = roots.check_node(restic_node(record, label=label), label=label)
-        if root is not None:
-            seen.add(root)
+        walk.visit(restic_node(record, label=label))
 
     full_id = await walk_snapshot_nodes(host_restic, repo, password, snapshot_id, visit)
-    roots.require_all_present(seen, label=label)
+    walk.finish()
     return full_id
 
 

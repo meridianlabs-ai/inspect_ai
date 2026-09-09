@@ -441,15 +441,15 @@ def _check_archive(
 
     Walks the member headers in stream mode (gzip via the stdlib, zstd
     via ``zstandard``) so nothing is extracted on the host and memory
-    stays bounded by one header; every member must pass
-    :meth:`RestoreRoots.check_node` and every root must be present. The
-    bytes are hashed as they stream by and compared with the recorded
+    stays bounded by one header; every member must pass the
+    :class:`RestoreWalk` and every root must be present. The bytes are
+    hashed as they stream by and compared with the recorded
     digest, so a corrupt or substituted archive is refused here, before
     the copy-in (the in-sandbox digest check before extraction remains
     as the guard against corruption in transit).
     """
     digest = hashlib.sha256()
-    seen: set[str] = set()
+    walk = roots.walker(label=label)
     with open(path, "rb") as raw:
         hashed = io.BufferedReader(_HashingRaw(raw, digest))
         stream: IO[bytes]
@@ -464,17 +464,10 @@ def _check_archive(
         else:
             stream = hashed
             mode = "r|gz"
-        count = 0
         try:
             with tarfile.open(fileobj=stream, mode=mode) as tar:
                 for member in tar:
-                    count += 1
-                    roots.check_node_count(count, label=label)
-                    root = roots.check_node(
-                        tar_member_node(member, label=label), label=label
-                    )
-                    if root is not None:
-                        seen.add(root)
+                    walk.visit(tar_member_node(member, label=label))
         except (tarfile.TarError, zstandard.ZstdError) as exc:
             raise RestoreScopeError(
                 f"{label}: archive {path.name} is unreadable (corrupt or "
@@ -488,7 +481,7 @@ def _check_archive(
             f"{label}: archive digest mismatch: {digest.hexdigest()} != recorded "
             f"{expected_digest}"
         )
-    roots.require_all_present(seen, label=label)
+    walk.finish()
 
 
 def _archive_checkpoint_id(filename: str) -> int | None:

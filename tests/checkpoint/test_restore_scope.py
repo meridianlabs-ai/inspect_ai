@@ -13,6 +13,7 @@ import tarfile
 
 import pytest
 
+from inspect_ai.util._checkpoint import _restore_scope as restore_scope
 from inspect_ai.util._checkpoint._layout.schemas import SnapshotDetails
 from inspect_ai.util._checkpoint._restore_scope import (
     MAX_RESTORE_NODES,
@@ -49,19 +50,20 @@ def test_nested_roots_collapse_to_the_outermost() -> None:
     """``/data`` covers ``/data/sub``; every node under it is credited to ``/data``."""
     roots = RestoreRoots.from_include(["/data/sub", "/data", "/datax"], label=LABEL)
     assert roots.roots == ("/data", "/datax")
-    seen = {
-        root
-        for p in ("/data", "/data/sub/x", "/datax/y")
-        if (root := roots.check_node(_node(p), label=LABEL)) is not None
-    }
-    assert seen == {"/data", "/datax"}
-    roots.require_all_present(seen, label=LABEL)
+    walk = roots.walker(label=LABEL)
+    for p in ("/data", "/data/sub/x", "/datax/y"):
+        walk.visit(_node(p))
+    walk.finish()
 
 
-def test_node_count_is_bounded() -> None:
-    HOME.check_node_count(MAX_RESTORE_NODES, label=LABEL)
-    with pytest.raises(RestoreScopeError, match="more than"):
-        HOME.check_node_count(MAX_RESTORE_NODES + 1, label=LABEL)
+def test_walk_node_count_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(restore_scope, "MAX_RESTORE_NODES", 3)
+    walk = HOME.walker(label=LABEL)
+    for i in range(3):
+        walk.visit(_node(f"/home/user/{i}"))
+    with pytest.raises(RestoreScopeError, match="more than 3 nodes"):
+        walk.visit(_node("/home/user/3"))
+    assert MAX_RESTORE_NODES > 3  # the real cap is generous
 
 
 @pytest.mark.parametrize(
@@ -150,13 +152,27 @@ def test_unnormalized_node_paths_are_refused_not_resolved(path: str) -> None:
         HOME.check_node(_node(path), label=LABEL)
 
 
-def test_every_root_must_be_present() -> None:
+def test_walk_requires_every_root_present() -> None:
     roots = RestoreRoots.from_include(["/home/user", "/data"], label=LABEL)
-    roots.require_all_present({"/home/user", "/data"}, label=LABEL)
+    walk = roots.walker(label=LABEL)
+    walk.visit(_node("/home", "dir", 0o755))  # ancestor: credits no root
+    walk.visit(_node("/home/user", "dir", 0o755))
+    walk.visit(_node("/data/x"))  # a node under a root counts for it
+    walk.finish()
+    partial = roots.walker(label=LABEL)
+    partial.visit(_node("/home/user/x"))
     with pytest.raises(
         RestoreScopeError, match=r"no node at capture root\(s\) \['/data'\]"
     ):
-        roots.require_all_present({"/home/user"}, label=LABEL)
+        partial.finish()
+
+
+def test_walk_rejects_a_node_in_listing_order() -> None:
+    # The first offending node raises; nothing after it is consulted.
+    walk = HOME.walker(label=LABEL)
+    walk.visit(_node("/home/user"))
+    with pytest.raises(RestoreScopeError, match="/etc/passwd"):
+        walk.visit(_node("/etc/passwd"))
 
 
 # --- restic node records ---------------------------------------------------
@@ -302,7 +318,13 @@ def test_recorded_roots_matching_current_set_pass() -> None:
 
 
 def test_recorded_roots_mismatch_names_both_sets() -> None:
-    with pytest.raises(RestoreScopeError, match=r"\['/data'\].*\['/home/user'\]"):
+    # The remedy names both causes: a `sandbox_paths` edit, or an
+    # auto-included home that moved because the image's default user
+    # changed — there is no configuration to restore in the latter case.
+    with pytest.raises(
+        RestoreScopeError,
+        match=r"\['/data'\].*\['/home/user'\].*configuration or the image",
+    ):
         check_recorded_roots(_details(roots=["/data"]), HOME, label=LABEL)
 
 

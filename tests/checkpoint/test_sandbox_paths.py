@@ -92,7 +92,7 @@ async def test_no_entry_defaults_to_home() -> None:
     # Auto-home: capture home; exclude the XDG cache dir + all .cache dirs.
     # `home` marks the include set as the auto-included home dir, so
     # resume re-owns what it restores under it.
-    assert resolved == {
+    assert resolved.paths == {
         "default": SandboxBackupPaths(
             include=["/root"], exclude=["/root/.cache", "**/.cache"], home="/root"
         )
@@ -102,7 +102,7 @@ async def test_no_entry_defaults_to_home() -> None:
 async def test_no_entry_honors_xdg_cache_home() -> None:
     with _sandboxes({"default": FakeSandbox("/root", cache="/var/cache/agent")}):
         resolved = await resolve_sandbox_backup_paths({})
-    assert resolved == {
+    assert resolved.paths == {
         "default": SandboxBackupPaths(
             include=["/root"], exclude=["/var/cache/agent", "**/.cache"], home="/root"
         )
@@ -117,7 +117,7 @@ async def test_entry_still_excludes_caches() -> None:
     # Configured includes win, but caches are excluded even so. The home
     # dir is not the include set, so `home` is unset: configured paths
     # keep their recorded ownership on resume.
-    assert resolved == {
+    assert resolved.paths == {
         "default": SandboxBackupPaths(
             include=["/workspace", "/opt/state"],
             exclude=["/root/.cache", "**/.cache"],
@@ -129,7 +129,8 @@ async def test_entry_still_excludes_caches() -> None:
 async def test_empty_list_opts_out() -> None:
     with _sandboxes({"default": FakeSandbox("/root")}):
         resolved = await resolve_sandbox_backup_paths({"default": []})
-    assert resolved == {}
+    assert resolved.paths == {}
+    assert resolved.unscopable == {}
 
 
 async def test_unresolvable_home_skipped_with_warning(
@@ -140,7 +141,9 @@ async def test_unresolvable_home_skipped_with_warning(
             logging.WARNING, logger="inspect_ai.util._checkpoint.sandbox_paths"
         ):
             resolved = await resolve_sandbox_backup_paths({})
-    assert resolved == {}
+    assert resolved.paths == {}
+    # Unresolvable is not unscopable: the pin check treats it as transient.
+    assert resolved.unscopable == {}
     assert any("could not resolve home dir" in r.message for r in caplog.records)
 
 
@@ -174,7 +177,10 @@ async def test_unscopeable_home_skipped_with_warning(
             logging.WARNING, logger="inspect_ai.util._checkpoint.sandbox_paths"
         ):
             resolved = await resolve_sandbox_backup_paths({})
-    assert set(resolved) == {"tools"}
+    assert set(resolved.paths) == {"tools"}
+    # Reported so the resume-time pin check can name the permanent cause.
+    assert set(resolved.unscopable) == {"default"}
+    assert "cannot be scoped for restore" in resolved.unscopable["default"]
     assert any(
         "home dir of sandbox 'default'" in r.message
         and "skipping sandbox backup" in r.message
@@ -193,7 +199,7 @@ async def test_mixed_sandboxes() -> None:
         resolved = await resolve_sandbox_backup_paths(
             {"tools": ["/opt/agent-state"], "scratch": []}
         )
-    assert resolved == {
+    assert resolved.paths == {
         "default": SandboxBackupPaths(
             include=["/root"], exclude=["/root/.cache", "**/.cache"], home="/root"
         ),

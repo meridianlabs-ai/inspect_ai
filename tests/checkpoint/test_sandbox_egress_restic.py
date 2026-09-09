@@ -14,11 +14,16 @@ recorded snapshots and restores the recorded id. The ingress tests also
 cover the host-side scope check: a snapshot reaching outside the
 capture roots, or carrying a fifo or a setuid/sticky mode, is refused
 before any exec, and a normal home-dir snapshot (symlinks included)
-round-trips without touching anything above its root.
+round-trips without touching anything above its root. The listing
+streamer's failure paths (a rejected node mid-stream, a failing restic,
+a listing with no snapshot record, an unterminated or oversized record)
+run against a shell script standing in for restic, so they need neither
+Docker nor the restic download.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -36,10 +41,12 @@ from inspect_ai.util._checkpoint._layout.schemas import SnapshotDetails
 from inspect_ai.util._checkpoint._repo_ops import (
     forget_unrecorded_snapshots,
     list_snapshots,
+    walk_snapshot_nodes,
 )
 from inspect_ai.util._checkpoint._restore_scope import (
     RestoreRoots,
     RestoreScopeError,
+    restic_node,
 )
 from inspect_ai.util._checkpoint._sandbox_restic.egress import (
     EgressVerificationError,
@@ -910,3 +917,107 @@ async def test_restic_strategy_rejects_recorded_roots_mismatch(tmp_path: Path) -
             env, SandboxBackupPaths(include=["/home/agent"]), details, ctx
         )
     assert env.execs == 0
+
+
+# --- listing streamer (fake restic) ------------------------------------
+#
+# `walk_snapshot_nodes` streams `restic ls --json` off the process pipe.
+# Its failure paths need only a process that writes the right bytes, so
+# a shell script standing in for restic covers them in the fast suite
+# without Docker or the restic download.
+
+_FAKE_ID = "c" * 64
+_SNAPSHOT_RECORD = json.dumps({"message_type": "snapshot", "id": _FAKE_ID})
+
+
+def _node_record(path: str, kind: str = "file") -> str:
+    return json.dumps({"message_type": "node", "path": path, "type": kind, "mode": 420})
+
+
+def _fake_restic(tmp_path: Path, body: str) -> Path:
+    """An executable ``sh`` script that ignores its arguments and runs ``body``."""
+    script = tmp_path / "fake-restic"
+    script.write_text(f"#!/bin/sh\n{body}\n")
+    script.chmod(0o755)
+    return script
+
+
+async def _walk(restic: Path, visit: Callable[[dict[str, Any]], None]) -> str:
+    return await walk_snapshot_nodes(restic, "repo", PASSWORD, _FAKE_ID, visit)
+
+
+async def test_walk_snapshot_nodes_kills_restic_on_a_rejected_node(
+    tmp_path: Path,
+) -> None:
+    # An endless listing whose second node is out of scope: the walker's
+    # error propagates at once (not wrapped in an ExceptionGroup) and the
+    # still-writing process is killed rather than drained.
+    pid_file = tmp_path / "pid"
+    restic = _fake_restic(
+        tmp_path,
+        f"echo $$ > {pid_file}\n"
+        f"echo '{_SNAPSHOT_RECORD}'\n"
+        f"echo '{_node_record('/home/user', 'dir')}'\n"
+        f"echo '{_node_record('/etc/passwd')}'\n"
+        f"while :; do echo '{_node_record('/home/user/x')}'; done",
+    )
+    walk = RestoreRoots.from_include(["/home/user"], label="test").walker(label="test")
+    visited: list[str] = []
+
+    def visit(record: dict[str, Any]) -> None:
+        visited.append(record["path"])
+        walk.visit(restic_node(record, label="test"))
+
+    with anyio.fail_after(30):
+        with pytest.raises(RestoreScopeError, match="/etc/passwd"):
+            await _walk(restic, visit)
+    assert visited == ["/home/user", "/etc/passwd"]
+    pid = int(pid_file.read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+
+
+async def test_walk_snapshot_nodes_reports_restic_stderr_on_failure(
+    tmp_path: Path,
+) -> None:
+    restic = _fake_restic(
+        tmp_path, "echo 'Fatal: unable to open repository' >&2\nexit 1"
+    )
+    with pytest.raises(RuntimeError, match=r"exit 1.*unable to open repository"):
+        await _walk(restic, lambda _record: None)
+
+
+async def test_walk_snapshot_nodes_requires_a_snapshot_record(tmp_path: Path) -> None:
+    restic = _fake_restic(tmp_path, f"echo '{_node_record('/home/user', 'dir')}'")
+    visited: list[str] = []
+    with pytest.raises(RuntimeError, match="no well-formed snapshot record"):
+        await _walk(restic, lambda record: visited.append(record["path"]))
+    assert visited == ["/home/user"]
+
+
+async def test_walk_snapshot_nodes_parses_an_unterminated_final_line(
+    tmp_path: Path,
+) -> None:
+    restic = _fake_restic(
+        tmp_path,
+        f"echo '{_SNAPSHOT_RECORD}'\nprintf '%s' '{_node_record('/home/user/x')}'",
+    )
+    visited: list[str] = []
+    full_id = await _walk(restic, lambda record: visited.append(record["path"]))
+    assert full_id == _FAKE_ID
+    assert visited == ["/home/user/x"]
+
+
+async def test_walk_snapshot_nodes_refuses_an_oversized_record(tmp_path: Path) -> None:
+    # A 2 MiB "path" exceeds the per-record cap; refused with the size
+    # message rather than buffered.
+    head = json.dumps({"message_type": "node", "type": "file"})[:-1] + ',"path":"/'
+    restic = _fake_restic(
+        tmp_path,
+        f"echo '{_SNAPSHOT_RECORD}'\n"
+        f"printf '%s' '{head}'\n"
+        "head -c 2097152 /dev/zero | tr '\\0' a\n"
+        "echo '\"}'",
+    )
+    with pytest.raises(RuntimeError, match="exceeds .* bytes"):
+        await _walk(restic, lambda _record: None)

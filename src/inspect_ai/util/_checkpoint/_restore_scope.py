@@ -14,8 +14,10 @@ The trusted roots are this attempt's resolved capture set
 the default user's home dir resolved against the fresh sandbox) — never
 anything read from the checkpoint dir. Each strategy lists its snapshot
 on the host (``restic ls --json`` against the adopted repo; ``tarfile``
-over the stored archive) and passes every node through
-:meth:`RestoreRoots.check_node`:
+over the stored archive) and feeds every node to a :class:`RestoreWalk`
+(``roots.walker(label=...)``), which applies :meth:`RestoreRoots.check_node`
+to each, bounds the listing length, and on ``finish()`` requires every
+root to have appeared:
 
 - a node must sit at or under a root, or be a *directory* on the path
   above one (restic and tar both record a source path's ancestors);
@@ -50,8 +52,8 @@ from __future__ import annotations
 import posixpath
 import shlex
 import tarfile
-from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from collections.abc import Sequence
+from dataclasses import dataclass, field
 from typing import Any, NamedTuple
 
 from inspect_ai.util._sandbox.environment import SandboxEnvironment
@@ -224,25 +226,52 @@ class RestoreRoots:
             )
         return root
 
-    def check_node_count(self, count: int, *, label: str) -> None:
-        """Refuse a listing longer than :data:`MAX_RESTORE_NODES`."""
-        if count > MAX_RESTORE_NODES:
-            raise RestoreScopeError(
-                f"{label}: snapshot lists more than {MAX_RESTORE_NODES} nodes"
-            )
+    def walker(self, *, label: str) -> RestoreWalk:
+        """A fresh :class:`RestoreWalk` over one snapshot listing."""
+        return RestoreWalk(roots=self, label=label)
 
-    def require_all_present(self, seen: Iterable[str], *, label: str) -> None:
-        """Every root must have had at least one node checked under it.
+
+@dataclass
+class RestoreWalk:
+    """One pass over a snapshot listing: :meth:`visit` each node, then :meth:`finish`.
+
+    Holds the bookkeeping both strategies need so neither re-implements
+    it: the node count against :data:`MAX_RESTORE_NODES`, and which
+    roots have had a node checked under them. ``visit`` raises
+    :class:`RestoreScopeError` for a rejected node (see
+    :meth:`RestoreRoots.check_node`) or an over-long listing; ``finish``
+    raises for a root that never appeared.
+    """
+
+    roots: RestoreRoots
+    label: str
+    _count: int = 0
+    _seen: set[str] = field(default_factory=set)
+
+    def visit(self, node: RestoreNode) -> None:
+        """Check one listed node, in listing order."""
+        self._count += 1
+        if self._count > MAX_RESTORE_NODES:
+            raise RestoreScopeError(
+                f"{self.label}: snapshot lists more than {MAX_RESTORE_NODES} nodes"
+            )
+        root = self.roots.check_node(node, label=self.label)
+        if root is not None:
+            self._seen.add(root)
+
+    def finish(self) -> None:
+        """Every root must have had at least one node visited under it.
 
         An honest capture always records each root itself (restic and
         tar both emit the source path as a node), so a root with no
         node is a snapshot that does not match this attempt's capture
         set — refused rather than restored partially.
         """
-        missing = set(self.roots) - set(seen)
+        missing = set(self.roots.roots) - self._seen
         if missing:
             raise RestoreScopeError(
-                f"{label}: snapshot has no node at capture root(s) {sorted(missing)}"
+                f"{self.label}: snapshot has no node at capture root(s) "
+                f"{sorted(missing)}"
             )
 
 
@@ -373,8 +402,10 @@ def check_recorded_roots(
 
     The recorded roots are diagnostics, never the source of trust (the
     checkpoint dir is what is being restored *from*); a mismatch means
-    the configuration changed between attempts, and is reported rather
-    than restored under either set.
+    the capture set changed between attempts — a ``sandbox_paths`` edit,
+    or an auto-included home dir moving because the image's default
+    user changed — and is reported rather than restored under either
+    set.
     """
     recorded = recorded_roots(details, label=label)
     if recorded is None:
@@ -384,7 +415,9 @@ def check_recorded_roots(
         raise RestoreScopeError(
             f"{label}: snapshot {details.snapshot_id} was captured from "
             f"{sorted(recorded_set)} but this attempt captures {list(roots.roots)}; "
-            f"restore the original sandbox_paths configuration and resume"
+            f"the sandbox_paths configuration or the image's default-user home "
+            f"directory changed between attempts — resume with the configuration "
+            f"and image the snapshot was captured under"
         )
 
 

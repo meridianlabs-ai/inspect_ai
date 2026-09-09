@@ -1006,6 +1006,7 @@ def _check(
     *,
     live: set[str] | None = None,
     opted_out: set[str] | None = None,
+    unscopable: dict[str, str] | None = None,
 ) -> None:
     check_strategy_pin(
         pinned=pinned,
@@ -1014,6 +1015,7 @@ def _check(
         default_strategy=STRATEGY_RESTIC,
         live_sandboxes=live if live is not None else set(configured),
         opted_out=opted_out or set(),
+        unscopable=unscopable or {},
     )
 
 
@@ -1071,9 +1073,28 @@ def test_pin_mirror_case_resolution_failure_has_own_error() -> None:
     # Live, not opted out, yet absent from the effective set: home-dir
     # resolution flaked — distinct message and remedy (no config change
     # happened).
-    with pytest.raises(RuntimeError, match="home directory"):
+    with pytest.raises(RuntimeError, match="home directory") as excinfo:
         _check(
             {"default": STRATEGY_RESTIC, "web": STRATEGY_ARCHIVE},
             {"default": STRATEGY_RESTIC},
             live={"default", "web"},
         )
+    assert "transient" in str(excinfo.value)
+
+
+def test_pin_mirror_case_unscopable_home_has_own_error() -> None:
+    # Live, not opted out, dropped because the home dir can't be scoped
+    # for restore (HOME=/): permanent, so the remedy must not be "resume
+    # again" — it is to configure the paths, opt out, or start fresh.
+    reason = "checkpoint: home dir of sandbox 'web': a capture root of '/' ..."
+    with pytest.raises(RuntimeError, match="cannot be scoped") as excinfo:
+        _check(
+            {"default": STRATEGY_RESTIC, "web": STRATEGY_ARCHIVE},
+            {"default": STRATEGY_RESTIC},
+            live={"default", "web"},
+            unscopable={"web": reason},
+        )
+    message = str(excinfo.value)
+    assert reason in message
+    assert "transient" not in message
+    assert "sandbox_paths" in message and "empty entry" in message

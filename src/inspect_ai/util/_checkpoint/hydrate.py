@@ -302,9 +302,10 @@ async def hydrate(
     # the same name set. (The resume payload copy is *not* driven by
     # this set — it copies whatever storage areas the source actually
     # has; see `copy_payload_files`.)
-    sandbox_backup_paths = await resolve_sandbox_backup_paths(
+    resolved_backup_paths = await resolve_sandbox_backup_paths(
         config.sandbox_paths or {}
     )
+    sandbox_backup_paths = resolved_backup_paths.paths
 
     # Strategy pin (§4.7 of the design): the strategy that starts a
     # sample's checkpoint lineage is the strategy for its lifetime. On
@@ -328,6 +329,7 @@ async def hydrate(
                 for name, paths in (config.sandbox_paths or {}).items()
                 if not paths
             },
+            unscopable=resolved_backup_paths.unscopable,
         )
         if pinned is None:
             # Pre-pin dir (validated all-default above): write the pin so

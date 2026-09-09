@@ -16,11 +16,16 @@ The include set is also what a resume is allowed to write (see
 before the first checkpoint — against the same rules the restore applies:
 every root must be an absolute path other than ``/``. A capture whose
 roots can never be restored would otherwise succeed at every checkpoint
-and fail only when a retry tries to resume.
+and fail only when a retry tries to resume. An auto-included home that
+fails the check is skipped, and reported separately
+(:attr:`ResolvedBackupPaths.unscopable`) so the resume-time strategy pin
+check can tell a permanently unscopable home from a transient resolution
+failure.
 """
 
 from dataclasses import dataclass, field
 from logging import getLogger
+from typing import NamedTuple
 
 from inspect_ai.util._sandbox.context import sandbox_environments_context_var
 from inspect_ai.util._sandbox.environment import SandboxEnvironment
@@ -51,9 +56,23 @@ class SandboxBackupPaths:
     restored under an auto-included home to the home dir's owner."""
 
 
+class ResolvedBackupPaths(NamedTuple):
+    """Result of :func:`resolve_sandbox_backup_paths`."""
+
+    paths: dict[str, SandboxBackupPaths]
+    """Sandbox name → effective backup paths, for every backed-up sandbox."""
+
+    unscopable: dict[str, str]
+    """Sandbox name → reason, for each auto-home sandbox skipped because
+    its home dir cannot be scoped for restore (an image with ``HOME=/``).
+    Unlike an unresolvable home this is a property of the image, not a
+    transient failure, so a resume that finds such a sandbox pinned
+    reports it with its own remedy."""
+
+
 async def resolve_sandbox_backup_paths(
     config_paths: dict[str, list[str]],
-) -> dict[str, SandboxBackupPaths]:
+) -> ResolvedBackupPaths:
     """Effective per-sandbox backup paths for the current sample.
 
     Include set, for each live sandbox:
@@ -72,10 +91,11 @@ async def resolve_sandbox_backup_paths(
     before any checkpoint is taken. An auto-home sandbox whose home dir
     can't be resolved, or resolves to a path that can't be scoped (an
     image with ``HOME=/``), is skipped with a warning rather than failing
-    the checkpoint.
+    the checkpoint; the latter is also returned in ``unscopable``.
     """
     envs = sandbox_environments_context_var.get(None) or {}
     resolved: dict[str, SandboxBackupPaths] = {}
+    unscopable: dict[str, str] = {}
     for name, env in envs.items():
         configured = config_paths.get(name)
         if configured is not None and not configured:
@@ -97,6 +117,7 @@ async def resolve_sandbox_backup_paths(
                 )
             except RestoreScopeError as exc:
                 logger.warning(f"{exc}; skipping sandbox backup for it")
+                unscopable[name] = str(exc)
                 continue
         else:
             logger.warning(
@@ -109,7 +130,7 @@ async def resolve_sandbox_backup_paths(
         resolved[name] = SandboxBackupPaths(
             include=include, exclude=exclude, home=None if configured else home
         )
-    return resolved
+    return ResolvedBackupPaths(paths=resolved, unscopable=unscopable)
 
 
 async def _resolve_home_and_cache(
