@@ -708,10 +708,12 @@ async def test_ingress_restores_symlinks_and_leaves_ancestors_alone(
 ) -> None:
     """A normal home-dir snapshot round-trips: nested dirs, symlinks, modes.
 
-    The capture root's parent is an ancestor node in the snapshot; the
-    per-root restore form never writes it, so a mode change made after
-    capture survives the restore (``--target /`` would have reset it to
-    the recorded mode).
+    Directory sticky and setgid bits (a drop dir, a ``g+s`` shared dir)
+    are legitimate content and come back as recorded. The capture root's
+    parent is an ancestor node in the snapshot; the per-root restore
+    form never writes it, so a mode change made after capture survives
+    the restore (``--target /`` would have reset it to the recorded
+    mode).
     """
     src = repos.src
     (src / "sub").mkdir()
@@ -722,6 +724,10 @@ async def test_ingress_restores_symlinks_and_leaves_ancestors_alone(
     (src / "script.sh").chmod(0o755)
     (src / "private").mkdir()
     (src / "private").chmod(0o700)
+    (src / "drop").mkdir()
+    (src / "drop").chmod(0o1777)
+    (src / "shared").mkdir()
+    (src / "shared").chmod(0o2775)
     parent = src.parent
     parent.chmod(0o750)
     id1 = repos.backup("ckpt-00001")
@@ -739,6 +745,8 @@ async def test_ingress_restores_symlinks_and_leaves_ancestors_alone(
     assert os.readlink(src / "abs-link") == "/etc/hostname"
     assert (src / "script.sh").stat().st_mode & 0o777 == 0o755
     assert (src / "private").stat().st_mode & 0o777 == 0o700
+    assert (src / "drop").stat().st_mode & 0o7777 == 0o1777
+    assert (src / "shared").stat().st_mode & 0o7777 == 0o2775
     # Files the fresh sandbox had are left alone, as before.
     assert (src / "post-capture.txt").exists()
     # The ancestor keeps its post-capture mode: nothing above the root was written.
@@ -766,9 +774,9 @@ def _hostile_snapshots() -> dict[str, tuple[Callable[[_Repos, Path], list[str]],
         (repos.src / "sh").chmod(0o4755)
         return [str(repos.src)]
 
-    def sticky(repos: _Repos, other: Path) -> list[str]:
-        (repos.src / "drop").mkdir()
-        (repos.src / "drop").chmod(0o1777)
+    def setgid(repos: _Repos, other: Path) -> list[str]:
+        (repos.src / "gsh").write_text("#!/bin/sh\n")
+        (repos.src / "gsh").chmod(0o2755)
         return [str(repos.src)]
 
     def fifo(repos: _Repos, other: Path) -> list[str]:
@@ -780,8 +788,8 @@ def _hostile_snapshots() -> dict[str, tuple[Callable[[_Repos, Path], list[str]],
     return {
         "outside_root": (outside, "/other lies outside"),
         "etc_hostname": (etc, "/etc lies outside"),
-        "setuid_under_root": (setuid, "sh has mode 4755"),
-        "sticky_dir_under_root": (sticky, "drop has mode 1777"),
+        "setuid_under_root": (setuid, "sh is a regular file with mode 4755"),
+        "setgid_file_under_root": (setgid, "gsh is a regular file with mode 2755"),
         "fifo_under_root": (fifo, "pipe is a fifo"),
     }
 
@@ -984,6 +992,16 @@ async def test_walk_snapshot_nodes_reports_restic_stderr_on_failure(
         tmp_path, "echo 'Fatal: unable to open repository' >&2\nexit 1"
     )
     with pytest.raises(RuntimeError, match=r"exit 1.*unable to open repository"):
+        await _walk(restic, lambda _record: None)
+
+
+@pytest.mark.parametrize("line", ["Fatal: not json", "[1, 2]"])
+async def test_walk_snapshot_nodes_labels_a_non_json_listing_line(
+    tmp_path: Path, line: str
+) -> None:
+    """A stdout line that is not a JSON object fails with the repo named, not a bare decode error."""
+    restic = _fake_restic(tmp_path, f"echo '{_SNAPSHOT_RECORD}'\necho '{line}'")
+    with pytest.raises(RuntimeError, match=rf"restic ls on repo: .*{re.escape(line)}"):
         await _walk(restic, lambda _record: None)
 
 

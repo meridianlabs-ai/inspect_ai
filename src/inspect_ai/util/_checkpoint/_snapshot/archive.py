@@ -33,11 +33,17 @@ Capture mechanics (design §7.2/§8, first implementation):
   archive. On restore the host walks the archive's member headers
   first (``_check_archive``): every member must lie at or under one of
   this attempt's capture roots, be a regular file, directory, symlink
-  or in-scope hard link, and carry no setuid/setgid/sticky bit — and the
-  bytes must hash to the recorded digest — before any of it is copied
-  in; extraction then names the roots as tar member arguments so only
-  they are written. A second digest check runs inside the sandbox
-  before extraction; it detects corruption in transit when that sandbox
+  or in-scope hard link, carry no PAX records, and (a regular file) no
+  setuid/setgid/sticky bit; nothing but zero padding may follow the
+  last member ``tarfile`` parsed; and the bytes must hash to the
+  recorded digest — all before any of it is copied in. Extraction then
+  names the roots as tar member arguments so only they are written, and
+  a ``find`` over the roots afterwards fails the restore if the
+  sandbox's tar nonetheless produced a special file or device node
+  (``_restore_scope.find_special_nodes_command``) — the layer that does
+  not depend on ``tarfile`` and the image's tar agreeing on member
+  boundaries. A second digest check runs inside the sandbox before
+  extraction; it detects corruption in transit when that sandbox
   follows the protocol and cannot constrain one controlled by the agent.
 - Compression is zstd when available in the sandbox, else gzip
   (present in effectively every image, busybox included) — the
@@ -73,6 +79,7 @@ from .._restore_scope import (
     RestoreRoots,
     RestoreScopeError,
     check_recorded_roots,
+    find_special_nodes_command,
     tar_member_argument,
     tar_member_node,
 )
@@ -91,6 +98,9 @@ parent is unlistable by the agent and ``.cache`` falls inside the
 always-on capture exclude, so staging never captures itself."""
 
 _DEFAULT_CHUNK_SIZE = DEFAULT_COPY_CHUNK_SIZE
+
+_TAIL_READ_SIZE = 1024 * 1024
+"""Chunk size for reading past the last tar member (padding check, digest)."""
 
 _ARCHIVE_NAME_RE = re.compile(r"ckpt-\d{5,}\.tar\.(?:zst|gz)")
 """The exact archive filename form ``snapshot()`` generates — also the
@@ -343,6 +353,9 @@ class ArchiveStrategy(SandboxSnapshotStrategy):
         # byte reaches a final path. Extraction names each capture root
         # as a member argument, so tar writes only members at or under a
         # root — the second layer behind the host-side listing check.
+        # The find afterwards is the third: whatever this tar made of the
+        # member boundaries, a special file or device node under a root
+        # fails the restore (the sandbox is discarded on failure).
         members = " ".join(
             shlex.quote(tar_member_argument(root)) for root in roots.roots
         )
@@ -358,6 +371,9 @@ class ArchiveStrategy(SandboxSnapshotStrategy):
             f'{{ echo "archive digest mismatch: $digest != {expected_digest}" >&2; '
             f"exit 1; }}\n"
             f"{extract}\n"
+            f"bad=$({find_special_nodes_command(roots.roots)})\n"
+            f'[ -z "$bad" ] || {{ echo "extraction produced $bad: a setuid, setgid '
+            f'or sticky regular file, or a fifo or device node" >&2; exit 1; }}\n'
             f"rm -rf {self._staging_root}\n"
         )
         result = await env.exec(["sh", "-c", script], user="root")
@@ -447,6 +463,14 @@ def _check_archive(
     digest, so a corrupt or substituted archive is refused here, before
     the copy-in (the in-sandbox digest check before extraction remains
     as the guard against corruption in transit).
+
+    ``tarfile`` ends its listing quietly at the first header it cannot
+    parse past offset 0 (a bad checksum, a malformed PAX record), where
+    busybox and GNU tar skip the block and keep extracting — the members
+    behind it would never reach the walk. So after the loop the rest of
+    the decompressed stream must be zero padding; anything else is
+    refused. Read through ``tar.fileobj`` (tarfile's stream wrapper),
+    not ``stream``: the wrapper reads ahead of what tarfile consumed.
     """
     digest = hashlib.sha256()
     walk = roots.walker(label=label)
@@ -468,13 +492,22 @@ def _check_archive(
             with tarfile.open(fileobj=stream, mode=mode) as tar:
                 for member in tar:
                     walk.visit(tar_member_node(member, label=label))
+                if tar.fileobj is None:
+                    raise RuntimeError(f"{label}: tarfile closed its stream early")
+                while chunk := tar.fileobj.read(_TAIL_READ_SIZE):
+                    if chunk.strip(b"\0"):
+                        raise RestoreScopeError(
+                            f"{label}: archive {path.name} holds data after the last "
+                            f"member the host could parse; the extracting tar could "
+                            f"read it as further members, so the archive is refused"
+                        )
         except (tarfile.TarError, zstandard.ZstdError) as exc:
             raise RestoreScopeError(
                 f"{label}: archive {path.name} is unreadable (corrupt or "
                 f"truncated): {exc}"
             ) from exc
         # tar stops at the end-of-archive marker; hash whatever trails it.
-        while hashed.read(1024 * 1024):
+        while hashed.read(_TAIL_READ_SIZE):
             pass
     if digest.hexdigest() != expected_digest:
         raise RestoreScopeError(

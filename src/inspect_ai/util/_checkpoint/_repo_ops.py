@@ -230,7 +230,18 @@ async def _consume_ls_records(
             ) from None
         line = raw.strip()
         if line:
-            record = json.loads(line)
+            try:
+                record = json.loads(line)
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"restic ls on {repo}: listing line is not JSON: "
+                    f"{line[:200].decode(errors='replace')!r}"
+                ) from exc
+            if not isinstance(record, dict):
+                raise RuntimeError(
+                    f"restic ls on {repo}: listing line is not a JSON object: "
+                    f"{line[:200].decode(errors='replace')!r}"
+                )
             # restic 0.17+ emits ``message_type``; ``struct_type`` is the
             # pre-0.17 key.
             kind = record.get("message_type", record.get("struct_type"))

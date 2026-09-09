@@ -9,7 +9,11 @@ per-root restic restore arguments.
 from __future__ import annotations
 
 import io
+import os
+import shutil
+import subprocess
 import tarfile
+from pathlib import Path
 
 import pytest
 
@@ -21,6 +25,7 @@ from inspect_ai.util._checkpoint._restore_scope import (
     RestoreRoots,
     RestoreScopeError,
     check_recorded_roots,
+    find_special_nodes_command,
     recorded_roots,
     restic_node,
     restic_restore_args,
@@ -124,11 +129,21 @@ def test_special_node_kinds_are_refused(kind: str) -> None:
 
 
 @pytest.mark.parametrize("mode", [0o4755, 0o2755, 0o1777, 0o6777, 0o7777])
-def test_special_mode_bits_are_refused(mode: int) -> None:
+def test_special_mode_bits_on_regular_files_are_refused(mode: int) -> None:
     with pytest.raises(RestoreScopeError, match="setuid, setgid or sticky"):
         HOME.check_node(_node("/home/user/bin/sh", mode=mode), label=LABEL)
-    with pytest.raises(RestoreScopeError, match="setuid, setgid or sticky"):
-        HOME.check_node(_node("/home/user/d", "dir", mode), label=LABEL)
+
+
+@pytest.mark.parametrize("mode", [0o1777, 0o2775, 0o3777])
+def test_special_mode_bits_on_directories_are_accepted(mode: int) -> None:
+    """Sticky and setgid on a directory carry no privilege: ``/tmp`` can be a root."""
+    assert HOME.check_node(_node("/home/user/shared", "dir", mode), label=LABEL)
+    tmp = RestoreRoots.from_include(["/tmp"], label=LABEL)
+    assert tmp.check_node(_node("/tmp", "dir", mode), label=LABEL) == "/tmp"
+    walk = tmp.walker(label=LABEL)
+    walk.visit(_node("/tmp", "dir", 0o1777))
+    walk.visit(_node("/tmp/f"))
+    walk.finish()
 
 
 def test_hard_link_target_must_be_under_a_root() -> None:
@@ -253,6 +268,62 @@ def test_tar_member_node_kinds_and_modes() -> None:
                 tar_member_node(_member("home/user/dev", type), label=LABEL),
                 label=LABEL,
             )
+
+
+@pytest.mark.parametrize("type", [tarfile.GNUTYPE_SPARSE, tarfile.CONTTYPE])
+def test_tar_member_node_refuses_regular_file_variants(type: bytes) -> None:
+    """``S`` and ``7`` count as regular to ``TarInfo.isreg()`` but not here."""
+    node = tar_member_node(_member("home/user/f", type), label=LABEL)
+    with pytest.raises(RestoreScopeError, match=f"/home/user/f is a tar type {type!r}"):
+        HOME.check_node(node, label=LABEL)
+
+
+@pytest.mark.parametrize("records", [{"size": "512"}, {"path": "home/user/f"}])
+def test_tar_member_node_refuses_pax_records(records: dict[str, str]) -> None:
+    """A member ``tarfile`` patched from PAX records is refused before any scope check.
+
+    The extracting tar may not apply the same records (busybox ignores
+    PAX), so the two would disagree on the member's name or on where the
+    next one starts.
+    """
+    member = _member("home/user/f", pax_headers=records)
+    with pytest.raises(RestoreScopeError, match="carries PAX extended-header"):
+        tar_member_node(member, label=LABEL)
+
+
+@pytest.mark.parametrize(
+    "find", [["find"], pytest.param(["busybox", "find"], id="busybox")]
+)
+def test_find_special_nodes_command_matches_what_check_node_refuses(
+    tmp_path: Path, find: list[str]
+) -> None:
+    """The in-sandbox ``find`` names a setuid file or fifo, never a sticky/setgid dir."""
+    if shutil.which(find[0]) is None:
+        pytest.skip(f"{find[0]} not installed")
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "sticky").mkdir()
+    (root / "sticky").chmod(0o1777)
+    (root / "shared").mkdir()
+    (root / "shared").chmod(0o2775)
+    (root / "plain").write_text("ok")
+    (root / "link").symlink_to("plain")
+    command = find_special_nodes_command([str(root)])
+    assert command.startswith("find ")
+    command = " ".join(find) + command[len("find") :]
+
+    def run() -> str:
+        return subprocess.run(
+            ["sh", "-c", command], capture_output=True, text=True, check=True
+        ).stdout.strip()
+
+    assert run() == ""
+    (root / "sticky" / "sh").write_text("#!/bin/sh\n")
+    (root / "sticky" / "sh").chmod(0o4755)
+    assert run() == str(root / "sticky" / "sh")
+    (root / "sticky" / "sh").chmod(0o755)
+    os.mkfifo(root / "pipe")
+    assert run() == str(root / "pipe")
 
 
 @pytest.mark.parametrize(

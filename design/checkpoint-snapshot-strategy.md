@@ -55,13 +55,20 @@
 >    --json` against the adopted repo; `tarfile` over the stored
 >    archive) and refused if any node lies outside `paths.include`
 >    (directories on the way to a root excepted), is a device, fifo or
->    socket, is a hard link out of scope, or carries a setuid, setgid
->    or sticky bit (`_checkpoint/_restore_scope.py`); each root is then
->    restored individually (`restic restore <id>:<parent> --target
->    <parent> --include /<name> --include-xattr user.*`; `tar -x --
->    <root>`) so nothing above a root is written or has its metadata
->    restored, and no `security.*`/`system.*` extended attribute (file
->    capabilities, ACLs) is reapplied. `snapshot()` records
+>    socket, is a hard link out of scope, or is a regular file carrying
+>    a setuid, setgid or sticky bit (`_checkpoint/_restore_scope.py`;
+>    directory sticky/setgid bits carry no privilege and are kept, so
+>    `/tmp` or a `g+s` shared dir can be a root). For the archive the
+>    host's `tarfile` and the image's `tar` must also agree on member
+>    boundaries: members carrying PAX records or GNU sparse maps are
+>    refused, only zero padding may follow the last parsed member, and
+>    a `find` over the roots after extraction fails the restore on any
+>    special file or device node the sandbox's tar produced anyway.
+>    Each root is then restored individually (`restic restore
+>    <id>:<parent> --target <parent> --include /<name> --include-xattr
+>    user.*`; `tar -x -- <root>`) so nothing above a root is written or
+>    has its metadata restored, and no `security.*`/`system.*` extended
+>    attribute (file capabilities, ACLs) is reapplied. `snapshot()` records
 >    `paths.include` as a `roots` extra on `SnapshotDetails`; a recorded
 >    set that differs from this attempt's is an error naming both. For
 >    an auto-included home dir the core re-owns everything restored

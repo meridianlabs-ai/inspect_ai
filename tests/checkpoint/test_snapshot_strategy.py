@@ -121,6 +121,12 @@ def _write_data(data_dir: Path) -> dict[str, bytes]:
     link = data_dir / "link.txt"
     if not link.is_symlink():
         link.symlink_to("notes.txt")
+    # Directory special bits are legitimate capture content (a `/tmp`-style
+    # drop dir, a `chmod g+s` shared dir) and must survive a restore.
+    (data_dir / "drop").mkdir(exist_ok=True)
+    (data_dir / "drop").chmod(0o1777)
+    (data_dir / "shared").mkdir(exist_ok=True)
+    (data_dir / "shared").chmod(0o2775)
     cache = data_dir / ".cache"
     cache.mkdir(exist_ok=True)
     (cache / "junk").write_bytes(b"never captured")
@@ -161,6 +167,8 @@ async def test_archive_snapshot_restore_roundtrip(tmp_path: Path) -> None:
     (data_dir / "link.txt").unlink()
     (data_dir / ".cache" / "junk").unlink()
     (data_dir / "extra-not-in-snapshot.txt").write_bytes(b"post-capture")
+    (data_dir / "drop").rmdir()
+    (data_dir / "shared").rmdir()
     sibling.write_bytes(b"changed after capture")
 
     await strategy.restore(env, paths, details, ctx)
@@ -169,6 +177,9 @@ async def test_archive_snapshot_restore_roundtrip(tmp_path: Path) -> None:
         assert (data_dir / rel).read_bytes() == content
     assert (data_dir / "link.txt").is_symlink()
     assert os.readlink(data_dir / "link.txt") == "notes.txt"
+    # The sticky and setgid dirs pass the host-side walk and are restored
+    # (GNU tar as non-root drops the bits themselves; as root it keeps them).
+    assert (data_dir / "drop").is_dir() and (data_dir / "shared").is_dir()
     # Excluded at capture: the cache dir's contents are not in the
     # archive, so restore does not recreate them.
     assert not (data_dir / ".cache" / "junk").exists()
@@ -369,12 +380,76 @@ def _crafted_archive(
             if data is not None:
                 info.size = len(data)
             tar.addfile(info, io.BytesIO(data) if data is not None else None)
+    return _compressed_archive(path, raw.getvalue())
+
+
+def _compressed_archive(path: Path, raw_tar: bytes) -> str:
+    """Compress ``raw_tar`` as ``path``'s extension says; return the file's sha256."""
     if path.name.endswith(".tar.zst"):
-        payload = zstandard.ZstdCompressor().compress(raw.getvalue())
+        payload = zstandard.ZstdCompressor().compress(raw_tar)
     else:
-        payload = gzip.compress(raw.getvalue())
+        payload = gzip.compress(raw_tar)
     path.write_bytes(payload)
     return hashlib.sha256(payload).hexdigest()
+
+
+def _ustar(name: str, type: bytes = tarfile.REGTYPE, mode: int = 0o644) -> bytes:
+    """One raw 512-byte ustar header for an empty member."""
+    return _member(name, type, mode=mode).tobuf(tarfile.USTAR_FORMAT)
+
+
+def _pax_header(records: bytes, type: bytes = tarfile.XHDTYPE) -> bytes:
+    """A raw PAX extended (``x``) or global (``g``) header with ``records``."""
+    info = tarfile.TarInfo("././@PaxHeader")
+    info.type = type
+    info.size = len(records)
+    padding = b"\0" * (-len(records) % tarfile.BLOCKSIZE)
+    return info.tobuf(tarfile.USTAR_FORMAT) + records + padding
+
+
+def _bad_checksum(name: str) -> bytes:
+    header = bytearray(_ustar(name))
+    header[148:156] = b"0000000\0"
+    return bytes(header)
+
+
+_TAR_END = b"\0" * (2 * tarfile.BLOCKSIZE)
+
+
+def _boundary_tricks(root: str) -> dict[str, tuple[bytes, str]]:
+    """Name → (raw tar bytes, substring the refusal must name).
+
+    Archives on which ``tarfile`` and an extracting tar disagree about
+    where members start or what they are called, each hiding a setuid
+    ``sh`` under the root. busybox tar ignores PAX, so a ``size`` record
+    that makes ``tarfile`` skip a block leaves busybox reading that block
+    as a header; and ``tarfile`` ends its listing quietly at a header it
+    cannot parse, where busybox and GNU tar skip it and continue.
+    """
+    dir_ = _ustar(root, tarfile.DIRTYPE, 0o755)
+    ok = _ustar(f"{root}/ok")
+    hidden = _ustar(f"{root}/sh", mode=0o4755)
+    return {
+        "pax_size_hides_a_member": (
+            dir_ + _pax_header(b"12 size=512\n") + ok + hidden + _TAR_END,
+            "carries PAX extended-header records ['size']",
+        ),
+        "global_pax_renames_members": (
+            dir_
+            + _pax_header(b"20 path=etc/planted\n", tarfile.XGLTYPE)
+            + ok
+            + _TAR_END,
+            "carries PAX extended-header records ['path']",
+        ),
+        "malformed_pax_ends_the_listing": (
+            dir_ + _pax_header(b"9 size=512\n") + ok + hidden + _TAR_END,
+            "holds data after the last member",
+        ),
+        "bad_checksum_ends_the_listing": (
+            dir_ + _bad_checksum(f"{root}/junk") + ok + hidden + _TAR_END,
+            "holds data after the last member",
+        ),
+    }
 
 
 def _member(
@@ -405,11 +480,15 @@ _HOSTILE_MEMBERS: dict[str, Callable[[Path, Path], tuple[tarfile.TarInfo, str]]]
     ),
     "setuid_under_root": lambda root, outside: (
         _member(_rel(root / "sh"), mode=0o4755),
-        f"{root}/sh has mode 4755",
+        f"{root}/sh is a regular file with mode 4755",
     ),
-    "sticky_dir_under_root": lambda root, outside: (
-        _member(_rel(root / "d"), tarfile.DIRTYPE, mode=0o1777),
-        f"{root}/d has mode 1777",
+    "setgid_file_under_root": lambda root, outside: (
+        _member(_rel(root / "sh"), mode=0o2755),
+        f"{root}/sh is a regular file with mode 2755",
+    ),
+    "sparse_under_root": lambda root, outside: (
+        _member(_rel(root / "sp"), tarfile.GNUTYPE_SPARSE),
+        f"{root}/sp is a tar type b'S' entry",
     ),
     "fifo_under_root": lambda root, outside: (
         _member(_rel(root / "pipe"), tarfile.FIFOTYPE),
@@ -485,6 +564,121 @@ async def test_archive_restore_refuses_hostile_archive(
     assert env.execs == execs_before
     assert not (root / "notes.txt").exists()
     assert not outside.exists()
+
+
+def _hostile_details(archive_name: str, digest: str, root: Path) -> SnapshotDetails:
+    return SnapshotDetails.model_validate(
+        dict(
+            snapshot_id="ckpt-00001",
+            size_bytes=1,
+            duration_ms=1,
+            strategy=STRATEGY_ARCHIVE,
+            archive=archive_name,
+            content_sha256=digest,
+            roots=[str(root)],
+        )
+    )
+
+
+@pytest.mark.parametrize("compression", ["gz", "zst"])
+@pytest.mark.parametrize("trick", sorted(_boundary_tricks("x")))
+async def test_archive_restore_refuses_member_boundary_tricks(
+    tmp_path: Path, trick: str, compression: str
+) -> None:
+    """An archive whose members ``tarfile`` and the sandbox's tar would count differently is refused.
+
+    Every member ``tarfile`` yields is in scope and benign; the refusal
+    comes from the PAX records themselves or from the bytes left behind
+    where ``tarfile`` stopped. Nothing is sent to the sandbox.
+    """
+    env = _CountingSandbox()
+    strategy = await _strategy(env, tmp_path)
+    ctx = _context(tmp_path / "sample")
+    root = tmp_path / "capture" / "data"
+    root.mkdir(parents=True)
+    raw, expected = _boundary_tricks(_rel(root))[trick]
+    storage = Path(ctx.storage_dir)
+    storage.mkdir(parents=True)
+    archive_name = f"ckpt-00001.tar.{compression}"
+    digest = _compressed_archive(storage / archive_name, raw)
+
+    execs_before = env.execs
+    with pytest.raises(RestoreScopeError, match=re.escape(expected)):
+        await strategy.restore(
+            env,
+            SandboxBackupPaths(include=[str(root)]),
+            _hostile_details(archive_name, digest, root),
+            ctx,
+        )
+    assert env.execs == execs_before
+    assert not (root / "ok").exists()
+    assert not (root / "sh").exists()
+
+
+def _tar_shim(tmp_path: Path, implementation: str) -> dict[str, str] | None:
+    """``extra_env`` putting ``implementation``'s tar first on ``PATH`` (``None`` = host tar)."""
+    if implementation == "host":
+        return None
+    if shutil.which(implementation) is None:
+        pytest.skip(f"{implementation} not installed")
+    shim = tmp_path / "tar-shim"
+    shim.mkdir()
+    (shim / "tar").symlink_to(shutil.which(implementation) or implementation)
+    return {"PATH": f"{shim}:{os.environ['PATH']}"}
+
+
+@pytest.mark.parametrize("implementation", ["host", "busybox"])
+async def test_archive_extraction_guard_fails_on_a_planted_special_file(
+    tmp_path: Path, implementation: str
+) -> None:
+    """Third layer: a special node the sandbox's tar wrote under a root fails the restore.
+
+    The host-side check is bypassed so the archive reaches extraction.
+    With busybox tar the archive is the PAX ``size`` trick: the setuid
+    ``sh`` it hides is extracted by busybox (which ignores PAX and, unlike
+    GNU tar as non-root, keeps the mode bits) and was never seen by
+    ``tarfile``. With the host's tar it is a plain archive carrying a
+    fifo, since GNU tar honors the PAX record and would hide the member
+    as ``tarfile`` did.
+    """
+    env = LocalShellSandbox(extra_env=_tar_shim(tmp_path, implementation))
+    strategy = await _strategy(env, tmp_path)
+    ctx = _context(tmp_path / "sample")
+    root = tmp_path / "capture" / "data"
+    root.mkdir(parents=True)
+    storage = Path(ctx.storage_dir)
+    storage.mkdir(parents=True)
+    archive_name = "ckpt-00001.tar.gz"
+    if implementation == "busybox":
+        raw, _ = _boundary_tricks(_rel(root))["pax_size_hides_a_member"]
+        digest = _compressed_archive(storage / archive_name, raw)
+        planted = root / "sh"
+    else:
+        digest = _crafted_archive(
+            storage / archive_name,
+            [
+                _member(_rel(root), tarfile.DIRTYPE),
+                _member(_rel(root / "ok")),
+                _member(_rel(root / "pipe"), tarfile.FIFOTYPE),
+            ],
+            {},
+        )
+        planted = root / "pipe"
+
+    with patch(
+        "inspect_ai.util._checkpoint._snapshot.archive._check_archive",
+        return_value=None,
+    ):
+        with pytest.raises(RuntimeError, match=rf"extraction produced {planted}"):
+            await strategy.restore(
+                env,
+                SandboxBackupPaths(include=[str(root)]),
+                _hostile_details(archive_name, digest, root),
+                ctx,
+            )
+    # The node did land (the guard runs after extraction); the failed
+    # restore is what discards the sandbox.
+    assert planted.exists()
 
 
 @pytest.mark.parametrize("compression", ["gz", "zst"])

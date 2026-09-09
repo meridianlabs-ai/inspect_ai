@@ -24,7 +24,22 @@ root to have appeared:
 - a node under a root must be a regular file, directory, symlink, or
   (tar) hard link whose target is also under a root — no device, fifo,
   or socket nodes;
-- a node under a root carries no setuid, setgid, or sticky bit.
+- a regular file under a root carries no setuid, setgid, or sticky
+  bit. Directories are exempt: their sticky and setgid bits (``/tmp``,
+  a ``chmod g+s`` shared dir) carry no privilege, and a configured root
+  that is itself such a directory must stay resumable.
+
+The tar listing has a second concern: the host parses it with
+``tarfile`` but the sandbox extracts it with whatever ``tar`` the image
+ships, and the two must agree on where every member starts. A PAX
+extended header (``x``/``g``) can move the boundary (``size``) or rename
+a member (``path``), and busybox tar ignores PAX; a GNU sparse member
+(``S``) carries out-of-band sparse maps. An honest capture (``tar -c``
+in the default gnu format, or busybox) writes neither, so
+:func:`tar_member_node` refuses both, and the archive strategy also
+requires the stream to hold only zero padding after the last member
+``tarfile`` could parse and runs :func:`find_special_nodes_command` in
+the sandbox after extraction.
 
 Symlink targets are not constrained: an agent legitimately keeps
 symlinks in ``$HOME``. Neither tool follows a restored symlink while
@@ -70,6 +85,19 @@ _GO_MODE_STICKY = 1 << 20
 for ``mode`` (the permission bits are the low 9 bits as usual)."""
 
 _RESTORABLE_KINDS = frozenset({"file", "dir", "symlink", "hardlink"})
+
+_TAR_MEMBER_KINDS: dict[bytes, str] = {
+    tarfile.REGTYPE: "file",
+    tarfile.AREGTYPE: "file",
+    tarfile.DIRTYPE: "dir",
+    tarfile.SYMTYPE: "symlink",
+    tarfile.LNKTYPE: "hardlink",
+}
+"""The tar typeflags an honest ``tar -c`` writes for restorable nodes.
+
+Deliberately not ``TarInfo.isreg()``: that also accepts GNU sparse
+members (``S``), whose sparse maps ``tarfile`` and the extracting tar
+may size differently, and contiguous files (``7``)."""
 
 MAX_RESTORE_NODES = 5_000_000
 """Most nodes a snapshot listing may hold before the restore is refused.
@@ -189,7 +217,12 @@ class RestoreRoots:
         Raises :class:`RestoreScopeError` naming the offending path when
         the node lies outside every root, is a non-directory ancestor,
         has a kind that is not restorable, is a hard link whose target
-        lies outside every root, or carries a special mode bit.
+        lies outside every root, or is a regular file carrying a special
+        mode bit. Setuid and setgid escalate only on executable regular
+        files; on a directory they mean group inheritance, and sticky
+        (``/tmp``) restricts deletion, so directory bits are accepted as
+        recorded and Linux ignores sticky on files anyway. Symlink modes
+        are always ``0777``.
         """
         path = normalize_absolute(node.path, label=label, what="snapshot node path")
         root = self.containing_root(path)
@@ -219,10 +252,10 @@ class RestoreRoots:
                     f"{label}: snapshot node {path} is a hard link to {target}, "
                     f"outside every capture root"
                 )
-        if node.mode & _SPECIAL_MODE_BITS:
+        if node.kind == "file" and node.mode & _SPECIAL_MODE_BITS:
             raise RestoreScopeError(
-                f"{label}: snapshot node {path} has mode {node.mode:04o} with a "
-                f"setuid, setgid or sticky bit set"
+                f"{label}: snapshot node {path} is a regular file with mode "
+                f"{node.mode:04o}: a setuid, setgid or sticky bit is set"
             )
         return root
 
@@ -304,22 +337,27 @@ def tar_member_node(member: tarfile.TarInfo, *, label: str) -> RestoreNode:
     leading ``/``; an absolute or ``.``/``..``-bearing name is refused
     outright rather than normalized, since the extracting tar decides
     its own interpretation of such a name.
+
+    A member that came with PAX extended-header records is refused
+    (:class:`RestoreScopeError`): ``tarfile`` has applied them — a
+    ``size`` record moved the next member's boundary, a ``path`` record
+    renamed this one — and the extracting tar may not (busybox ignores
+    PAX), so the two would disagree on what the archive holds. Neither
+    gnu-format GNU tar nor busybox writes PAX headers.
     """
     path = _tar_member_path(member.name, label=label, what="archive member")
+    if member.pax_headers:
+        raise RestoreScopeError(
+            f"{label}: archive member {path} carries PAX extended-header records "
+            f"{sorted(member.pax_headers)}, which the extracting tar may interpret "
+            f"differently from the host; an honest capture writes none"
+        )
     link_target: str | None = None
-    if member.isreg():
-        kind = "file"
-    elif member.isdir():
-        kind = "dir"
-    elif member.issym():
-        kind = "symlink"
-    elif member.islnk():
-        kind = "hardlink"
+    kind = _TAR_MEMBER_KINDS.get(member.type, f"tar type {member.type!r} entry")
+    if kind == "hardlink":
         link_target = _tar_member_path(
             member.linkname, label=label, what=f"hard link target of {path}"
         )
-    else:
-        kind = f"tar type {member.type!r} entry"
     return RestoreNode(
         path=path, kind=kind, mode=member.mode & 0o7777, link_target=link_target
     )
@@ -344,6 +382,28 @@ def tar_member_argument(root: str) -> str:
     already rejected every out-of-scope member.
     """
     return root.lstrip("/")
+
+
+def find_special_nodes_command(roots: Sequence[str]) -> str:
+    """A ``find`` over ``roots`` printing the first node :meth:`RestoreRoots.check_node` would refuse.
+
+    The in-sandbox check after a tar extraction, independent of how the
+    extracting tar parsed the archive: a regular file with a setuid,
+    setgid or sticky bit, or a fifo, character or block device node.
+    Sockets are not looked for — no tar can create one from an archive.
+    ``-xdev`` keeps it off anything mounted under a root. Uses only
+    predicates busybox find shares with GNU find (``-perm /MODE``,
+    ``-type``), and ``head`` rather than ``-quit`` for the same reason.
+    Nodes that were under a root before the restore are examined too;
+    an honest capture already includes them, so they have passed the
+    host-side walk.
+    """
+    quoted = " ".join(shlex.quote(root) for root in roots)
+    return (
+        f"find {quoted} -xdev "
+        f"\\( \\( -type f -perm /{_SPECIAL_MODE_BITS:o} \\) -o -type p -o -type c "
+        f"-o -type b \\) -print | head -n 1"
+    )
 
 
 class ResticRestoreArgs(NamedTuple):
