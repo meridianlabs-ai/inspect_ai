@@ -425,6 +425,14 @@ def _bad_checksum(name: str) -> bytes:
     return bytes(header)
 
 
+def _checksum_in_form(name: str, spell: Callable[[int], bytes]) -> bytes:
+    """A header for ``name`` whose correct checksum is spelled by ``spell`` (base-256, signed, …)."""
+    header = bytearray(_ustar(name))
+    header[148:156] = b"        "
+    header[148:156] = spell(sum(header))
+    return bytes(header)
+
+
 _TAR_END = b"\0" * (2 * tarfile.BLOCKSIZE)
 
 
@@ -437,21 +445,40 @@ def _boundary_tricks(root: str) -> dict[str, tuple[bytes, str]]:
     under the root. busybox tar ignores PAX, so a ``size`` record that
     makes ``tarfile`` skip a block leaves busybox reading that block as
     a header; ``tarfile`` ends its listing quietly at a header it cannot
-    parse, where busybox and GNU tar skip it and continue; and of two
+    parse, where busybox and GNU tar skip it and continue; of two
     chained GNU long headers ``tarfile`` applies the first where busybox
-    and GNU tar apply the last.
+    and GNU tar apply the last; and a checksum spelled in a form
+    ``tarfile`` reads but the header scan does not (base-256, signed)
+    must be refused rather than end the scan, or the chain behind it
+    would go unscanned while the walk kept accepting members.
     """
     dir_ = _ustar(root, tarfile.DIRTYPE, 0o755)
     ok = _ustar(f"{root}/ok")
     hidden = _ustar(f"{root}/sh", mode=0o4755)
+    retargeted_link = (
+        _long_header(tarfile.GNUTYPE_LONGLINK, f"{root}/ok")
+        + _long_header(tarfile.GNUTYPE_LONGLINK, "etc/passwd")
+        + _ustar(f"{root}/pw", tarfile.LNKTYPE)
+    )
     return {
-        "second_long_link_retargets_a_hard_link": (
+        "base256_checksum_hides_a_long_link_chain": (
             dir_
-            + ok
-            + _long_header(tarfile.GNUTYPE_LONGLINK, f"{root}/ok")
-            + _long_header(tarfile.GNUTYPE_LONGLINK, "etc/passwd")
-            + _ustar(f"{root}/pw", tarfile.LNKTYPE)
+            + _checksum_in_form(
+                f"{root}/ok", lambda total: b"\x80" + total.to_bytes(7, "big")
+            )
+            + retargeted_link
             + _TAR_END,
+            "holds a checksum field that is not octal",
+        ),
+        "signed_checksum_hides_a_long_link_chain": (
+            dir_
+            + _checksum_in_form(f"{root}/ok", lambda total: f"+{total:06o}\0".encode())
+            + retargeted_link
+            + _TAR_END,
+            "holds a checksum field that is not octal",
+        ),
+        "second_long_link_retargets_a_hard_link": (
+            dir_ + ok + retargeted_link + _TAR_END,
             "preceded by two GNU long-link (K) headers",
         ),
         "second_long_name_renames_a_member": (

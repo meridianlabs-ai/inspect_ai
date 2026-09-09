@@ -431,9 +431,13 @@ class TarHeaderScan:
     them is refused by :func:`tar_member_node`); and a header of any
     other type ends the scan, because :func:`tar_member_node` refuses
     that member — PAX, sparse, device, fifo, unknown — when ``tarfile``
-    yields it. A zero block or a bad checksum ends the scan as well:
-    ``tarfile`` ends its listing there too, and the archive strategy
-    refuses anything but zero padding after the last member it parsed.
+    yields it. A zero block or a canonical-octal checksum that mismatches
+    ends the scan as well: ``tarfile`` ends its listing there too, and
+    the archive strategy refuses anything but zero padding after the last
+    member it parsed. A checksum in any other form is refused outright,
+    like a size: ``tarfile`` reads base-256, signed and underscored
+    checksums and carries on, so stopping there would leave the rest of
+    the archive unscanned while the walk kept accepting members.
     """
 
     def __init__(self, *, label: str) -> None:
@@ -461,7 +465,9 @@ class TarHeaderScan:
                 self._header(header)
 
     def _header(self, header: bytes) -> None:
-        if header.count(0) == tarfile.BLOCKSIZE or not _tar_checksum_ok(header):
+        if header.count(0) == tarfile.BLOCKSIZE or not _tar_checksum_ok(
+            header, label=self._label
+        ):
             self._done = True
             return
         typeflag = header[156:157]
@@ -487,6 +493,18 @@ def _tar_octal(field: bytes, *, label: str, what: str) -> int:
     """A tar header number: GNU base-256 (``0x80`` lead byte) or canonical octal."""
     if field[0] == 0o200:
         return int.from_bytes(field[1:], "big")
+    return _tar_canonical_octal(field, label=label, what=what)
+
+
+def _tar_canonical_octal(field: bytes, *, label: str, what: str) -> int:
+    """A tar header number in canonical octal only: digits padded with spaces or NULs.
+
+    A strict subset of what ``tarfile`` reads — it also takes a base-256
+    field and, via ``int(s, 8)``, a signed (``+12``), underscored
+    (``1_000``) or tab-led value — so a field in any other form is
+    refused rather than read: the scan must never guess at a value, or
+    stop, where ``tarfile`` carries on. An honest capture writes none.
+    """
     match = _TAR_OCTAL_RE.fullmatch(field)
     if match is None:
         raise RestoreScopeError(
@@ -496,18 +514,16 @@ def _tar_octal(field: bytes, *, label: str, what: str) -> int:
     return int(match.group(1) or b"0", 8)
 
 
-def _tar_checksum_ok(header: bytes) -> bool:
-    """Whether ``header`` carries a valid checksum, by ``tarfile``'s rule.
+def _tar_checksum_ok(header: bytes, *, label: str) -> bool:
+    """Whether ``header``'s canonical-octal checksum matches its bytes, by ``tarfile``'s rule.
 
     The stored value may match the unsigned or the signed byte sum (with
     the checksum field itself counted as spaces), as ``tarfile`` accepts
-    either. An unparseable checksum field counts as invalid, which is
-    also where ``tarfile`` stops.
+    either; a mismatch ends its listing, which is the only checksum
+    outcome the scan may stop on. A checksum field in any other form
+    raises :class:`RestoreScopeError` (see :func:`_tar_canonical_octal`).
     """
-    match = _TAR_OCTAL_RE.fullmatch(header[148:156])
-    if match is None:
-        return False
-    stored = int(match.group(1) or b"0", 8)
+    stored = _tar_canonical_octal(header[148:156], label=label, what="checksum")
     unsigned = 256 + sum(header[:148]) + sum(header[156:])
     signed = (
         256

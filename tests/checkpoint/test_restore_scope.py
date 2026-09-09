@@ -368,7 +368,7 @@ def test_tar_header_scan_refuses_a_repeated_long_header(
 
 
 def test_tar_header_scan_ends_where_tarfile_does() -> None:
-    """A zero block, a bad checksum or a header type the walk refuses ends the scan.
+    """A zero block, a mismatching canonical checksum or a header type the walk refuses ends the scan.
 
     Anything after those points is either zero padding (checked by the
     archive strategy) or a member ``tarfile`` refuses, so a chain there
@@ -402,6 +402,58 @@ def _header_with_size_field(name: str, field: bytes) -> bytes:
     header[148:156] = b"        "
     header[148:156] = f"{sum(header):06o}\0 ".encode()
     return bytes(header)
+
+
+_CHECKSUM_FORMS = ["base256", "signed", "underscored", "tab_led", "prefixed"]
+
+
+def _checksum_field(total: int, form: str) -> bytes:
+    """``total`` spelled as an 8-byte checksum field in ``form``, each of which ``tarfile.nti`` reads."""
+    if form == "base256":
+        return b"\x80" + total.to_bytes(7, "big")
+    octal = f"{total:06o}"
+    text = {
+        "signed": f"+{octal}",
+        "underscored": f"{octal[0]}_{octal[1:]}",
+        "tab_led": f"\t{octal}",
+        "prefixed": f"0o{total:o}",
+    }[form]
+    field = f"{text}\0".encode().ljust(8, b"\0")
+    assert len(field) == 8
+    return field
+
+
+def _header_with_checksum_form(name: str, form: str) -> bytes:
+    """A regular-file header whose numerically correct checksum is spelled in ``form``."""
+    header = bytearray(_member(name).tobuf(tarfile.USTAR_FORMAT))
+    header[148:156] = b"        "
+    header[148:156] = _checksum_field(sum(header), form)
+    return bytes(header)
+
+
+@pytest.mark.parametrize("form", sorted(_CHECKSUM_FORMS))
+def test_tar_header_scan_refuses_checksum_fields_tarfile_would_read(form: str) -> None:
+    """A checksum ``tarfile`` reads but the scan cannot is refused, not a stopping point.
+
+    ``tarfile`` accepts a base-256 checksum and every ``int(s, 8)`` form
+    and lists on; had the scan merely stopped there, a ``K K`` chain
+    behind such a header would retarget a hard link unseen while the
+    walk kept accepting members. The header carries its true byte sum,
+    so ``tarfile`` continues through it — asserted, since that is the
+    whole reason stopping would be wrong.
+    """
+    header = _header_with_checksum_form("home/user/a", form)
+    two_k = _long_header(tarfile.GNUTYPE_LONGLINK, "home/user/a")
+    two_k += _long_header(tarfile.GNUTYPE_LONGLINK, "etc/passwd")
+    hardlink = _member("home/user/pw", tarfile.LNKTYPE).tobuf(tarfile.USTAR_FORMAT)
+    raw = header + two_k + hardlink + b"\0" * (2 * tarfile.BLOCKSIZE)
+
+    with tarfile.open(fileobj=io.BytesIO(raw), mode="r|") as tar:
+        listed = [(m.name, m.linkname) for m in tar]
+    assert listed == [("home/user/a", ""), ("home/user/pw", "home/user/a")]
+
+    with pytest.raises(RestoreScopeError, match="checksum field that is not octal"):
+        TarHeaderScan(label=LABEL).feed(raw)
 
 
 def test_tar_header_scan_reads_base256_sizes_like_tarfile() -> None:
