@@ -8,6 +8,7 @@ from typing import Iterator, Literal, Union, overload
 
 import pytest
 
+from inspect_ai.util._checkpoint._restore_scope import RestoreScopeError
 from inspect_ai.util._checkpoint.sandbox_paths import (
     SandboxBackupPaths,
     resolve_sandbox_backup_paths,
@@ -141,6 +142,44 @@ async def test_unresolvable_home_skipped_with_warning(
             resolved = await resolve_sandbox_backup_paths({})
     assert resolved == {}
     assert any("could not resolve home dir" in r.message for r in caplog.records)
+
+
+@pytest.mark.parametrize(
+    "include, message",
+    [
+        (["workspace"], "not an absolute path"),
+        (["/workspace", "relative/state"], "not an absolute path"),
+        (["/"], "capture root of '/'"),
+    ],
+)
+async def test_unrestorable_configured_entry_fails_at_provisioning(
+    include: list[str], message: str
+) -> None:
+    # A configured include set is validated with the restore's own rules
+    # so a capture that could never be restored fails before the first
+    # checkpoint is taken, not when the retry tries to resume.
+    with _sandboxes({"default": FakeSandbox("/root")}):
+        with pytest.raises(RestoreScopeError, match=message) as excinfo:
+            await resolve_sandbox_backup_paths({"default": include})
+    assert "sandbox_paths for sandbox 'default'" in str(excinfo.value)
+
+
+async def test_unscopeable_home_skipped_with_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # An image with HOME=/ has no home dir a restore can scope to; like an
+    # unresolvable home, that is the image's doing, not a config error.
+    with _sandboxes({"default": FakeSandbox("/"), "tools": FakeSandbox("/root")}):
+        with caplog.at_level(
+            logging.WARNING, logger="inspect_ai.util._checkpoint.sandbox_paths"
+        ):
+            resolved = await resolve_sandbox_backup_paths({})
+    assert set(resolved) == {"tools"}
+    assert any(
+        "home dir of sandbox 'default'" in r.message
+        and "skipping sandbox backup" in r.message
+        for r in caplog.records
+    )
 
 
 async def test_mixed_sandboxes() -> None:

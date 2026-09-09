@@ -10,6 +10,13 @@ default user's XDG cache dir (``$XDG_CACHE_HOME`` or ``$HOME/.cache``) and
 any ``.cache`` directory anywhere in the tree (``**/.cache``) — even when
 the include paths are user-specified. The user controls only what's
 *included*; caches are always dropped so they don't bloat the backup.
+
+The include set is also what a resume is allowed to write (see
+``_restore_scope``), so it is checked here — at sample provisioning,
+before the first checkpoint — against the same rules the restore applies:
+every root must be an absolute path other than ``/``. A capture whose
+roots can never be restored would otherwise succeed at every checkpoint
+and fail only when a retry tries to resume.
 """
 
 from dataclasses import dataclass, field
@@ -17,6 +24,8 @@ from logging import getLogger
 
 from inspect_ai.util._sandbox.context import sandbox_environments_context_var
 from inspect_ai.util._sandbox.environment import SandboxEnvironment
+
+from ._restore_scope import RestoreRoots, RestoreScopeError
 
 logger = getLogger(__name__)
 
@@ -57,8 +66,13 @@ async def resolve_sandbox_backup_paths(
     the default user's XDG cache dir and ``**/.cache`` — caches are never
     backed up regardless of the include set.
 
-    An auto-home sandbox whose home dir can't be resolved is skipped with a
-    warning rather than failing the checkpoint.
+    Every include set must be restorable (``RestoreRoots.from_include``):
+    absolute paths, none of them ``/``. A configured entry that is not
+    raises :class:`RestoreScopeError` — a configuration error, surfaced
+    before any checkpoint is taken. An auto-home sandbox whose home dir
+    can't be resolved, or resolves to a path that can't be scoped (an
+    image with ``HOME=/``), is skipped with a warning rather than failing
+    the checkpoint.
     """
     envs = sandbox_environments_context_var.get(None) or {}
     resolved: dict[str, SandboxBackupPaths] = {}
@@ -72,8 +86,18 @@ async def resolve_sandbox_backup_paths(
         home, cache = await _resolve_home_and_cache(env)
         if configured:
             include = configured
+            RestoreRoots.from_include(
+                include, label=f"checkpoint: sandbox_paths for sandbox {name!r}"
+            )
         elif home:
             include = [home]
+            try:
+                RestoreRoots.from_include(
+                    include, label=f"checkpoint: home dir of sandbox {name!r}"
+                )
+            except RestoreScopeError as exc:
+                logger.warning(f"{exc}; skipping sandbox backup for it")
+                continue
         else:
             logger.warning(
                 f"checkpoint: could not resolve home dir for sandbox "
