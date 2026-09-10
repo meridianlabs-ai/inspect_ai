@@ -3006,7 +3006,7 @@ class _RecordingSandbox:
         self, cmd: list[str], user: str | None = None, **kwargs: object
     ) -> ExecResult[str]:
         self.commands.append(cmd)
-        if cmd[:3] == ["stat", "-c", "%u"] or cmd[:2] == ["test", "-e"]:
+        if cmd[:4] == ["stat", "-L", "-c", "%u"] or cmd[:2] == ["test", "-e"]:
             if not self.home_exists:
                 return ExecResult(
                     success=False, returncode=1, stdout="", stderr="No such file"
@@ -3087,7 +3087,10 @@ async def test_hydrate_sandbox_refuses_resume_without_committed_record() -> None
             [_sandbox_checkpoint(1, {"other": "o1"})],
         )
     assert strategy.calls == ["setup"]
-    assert env.commands == [["stat", "-c", "%u", "/root"], _symlink_pass("/root")]
+    assert env.commands == [
+        ["stat", "-L", "-c", "%u", "/root"],
+        _symlink_pass("/root"),
+    ]
 
 
 async def test_hydrate_sandbox_reowns_auto_home_around_restore() -> None:
@@ -3112,7 +3115,7 @@ async def test_hydrate_sandbox_reowns_auto_home_around_restore() -> None:
     assert restored_paths is paths
     assert isinstance(ref, SnapshotDetails) and ref.snapshot_id == "d2"
     assert env.commands == [
-        ["stat", "-c", "%u", "/home/agent"],
+        ["stat", "-L", "-c", "%u", "/home/agent"],
         _symlink_pass("/home/agent"),
         [
             "sh",
@@ -3133,7 +3136,7 @@ async def test_hydrate_sandbox_reowns_missing_home_to_default_user() -> None:
     )
     assert strategy.calls == ["setup", "discard_orphans", "restore"]
     assert env.commands == [
-        ["stat", "-c", "%u", "/home/agent"],
+        ["stat", "-L", "-c", "%u", "/home/agent"],
         ["test", "-e", "/home/agent"],
         ["id", "-u"],
         _symlink_pass("/home/agent"),

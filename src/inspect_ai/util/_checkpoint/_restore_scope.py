@@ -745,9 +745,12 @@ async def home_owner_uid(env: SandboxEnvironment, home: str, *, label: str) -> i
     itself (tar does; restic's per-root form does not) would otherwise
     hand back whatever owner the snapshot recorded. A home dir the image
     never created (the agent made it during the captured attempt) has no
-    owner to read; the default user's own uid stands in for it.
+    owner to read; the default user's own uid stands in for it. ``-L``
+    follows a home dir that is itself an image symlink to its target's
+    owner (the link itself is typically root's); a dangling link falls
+    through to the ``test -e`` check, which follows links too.
     """
-    result = await env.exec(["stat", "-c", "%u", home], user="root")
+    result = await env.exec(["stat", "-L", "-c", "%u", home], user="root")
     text = result.stdout.strip()
     if result.success and text.isdigit():
         return int(text)
