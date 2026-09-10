@@ -29,6 +29,7 @@ from inspect_ai.util._checkpoint._restore_scope import (
     check_recorded_roots,
     find_special_nodes_command,
     recorded_roots,
+    remove_existing_symlinks_command,
     restic_node,
     restic_restore_args,
     tar_member_argument,
@@ -576,6 +577,53 @@ def test_find_special_nodes_command_matches_what_check_node_refuses(
     (root / "sticky" / "sh").chmod(0o755)
     os.mkfifo(root / "pipe")
     assert run() == str(root / "pipe")
+
+
+@pytest.mark.parametrize(
+    "find", [["find"], pytest.param(["busybox", "find"], id="busybox")]
+)
+def test_remove_existing_symlinks_command_deletes_only_symlinks_under_roots(
+    tmp_path: Path, find: list[str]
+) -> None:
+    """The pre-restore pass deletes every symlink under a root and nothing else.
+
+    A link pointing outside the root, one pointing inside it, one nested
+    in a subdirectory and a root that is itself a dangling symlink go;
+    the files and directories beside them, the link targets, a symlink
+    beside the root and a root the image never created are left alone.
+    """
+    if shutil.which(find[0]) is None:
+        pytest.skip(f"{find[0]} not installed")
+    outside = tmp_path / "etc"
+    outside.mkdir()
+    (outside / "passwd").write_text("root:x:0:0\n")
+    root = tmp_path / "home" / "us er's"
+    (root / "sub").mkdir(parents=True)
+    (root / "plain").write_text("ok")
+    (root / "sub" / "deep").write_text("deep")
+    (root / "l").symlink_to("../../etc")
+    (root / "inner").symlink_to("plain")
+    (root / "sub" / "nested").symlink_to("/nonexistent")
+    sibling = tmp_path / "home" / "other"
+    sibling.symlink_to("../etc")
+    link_root = tmp_path / "data"
+    link_root.symlink_to("nowhere")
+    missing = tmp_path / "never-created"
+
+    command = remove_existing_symlinks_command(
+        [str(root), str(link_root), str(missing)]
+    )
+    assert command.count("then find ") == 3 and command.count("-xdev") == 3
+    command = command.replace("then find ", "then " + " ".join(find) + " ")
+    subprocess.run(["sh", "-c", "set -e\n" + command], check=True, capture_output=True)
+
+    for gone in (root / "l", root / "inner", root / "sub" / "nested", link_root):
+        assert not gone.is_symlink() and not gone.exists()
+    assert (root / "plain").read_text() == "ok"
+    assert (root / "sub" / "deep").read_text() == "deep"
+    assert (outside / "passwd").read_text() == "root:x:0:0\n"
+    assert os.readlink(sibling) == "../etc"
+    assert not missing.exists()
 
 
 @pytest.mark.parametrize(

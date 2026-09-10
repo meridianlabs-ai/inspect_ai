@@ -55,7 +55,16 @@ symlinks in ``$HOME``. Neither tool follows a restored symlink while
 writing later members (restic writes each node at its own tree path;
 GNU tar defers absolute and ``..`` symlinks with a placeholder and
 busybox tar defers all symlinks to the end, so ``l -> /etc`` followed
-by ``l/x`` fails rather than writing ``/etc/x``). Ancestors are exempt
+by ``l/x`` fails rather than writing ``/etc/x``). A symlink the *fresh
+image* ships under a root is resolved, though: the listings judge
+paths lexically, but the extracting tool writes through whatever
+already exists, so a snapshot holding ``l/x`` and a hard link to
+``l/passwd`` where the image has ``l -> /etc`` would plant ``/etc/x``
+and alias ``/etc/passwd``. Both strategies therefore run
+:func:`remove_existing_symlinks_command` in the sandbox before writing:
+every symlink already under a root is deleted, and the snapshot — which
+holds every link that was under the root at capture — recreates the
+ones it has. Ancestors are exempt
 from the mode check (``/tmp`` is sticky) because the strategies restore
 each root individually — ``restic restore <id>:<parent> --include
 /<name>`` and ``tar -x <root>`` — so nothing above a root is written or
@@ -572,6 +581,36 @@ def tar_member_argument(root: str) -> str:
     already rejected every out-of-scope member.
     """
     return root.lstrip("/")
+
+
+def remove_existing_symlinks_command(roots: Sequence[str]) -> str:
+    """Shell lines deleting every symlink already under ``roots`` in the fresh sandbox.
+
+    Run as root under ``set -e`` before either tool writes a node. The
+    host walk judges paths lexically, but the tool resolves them through
+    what the fresh image already has: where the image ships ``l -> /etc``
+    under a root, busybox tar writes a member ``l/x`` into ``/etc/x``
+    (GNU tar refuses the open) and both tars create a hard link to
+    ``l/passwd`` as an alias of ``/etc/passwd``; restic 0.18 replaces a
+    node of the wrong type itself and is covered for the same invariant.
+    Nothing is lost for an honest snapshot: it holds every symlink that
+    was under the root at capture and recreates them; a link it lacks
+    was deleted by the agent, or lives in an excluded cache dir and is
+    recreated as an ordinary directory when next needed. A root that is
+    itself a symlink is deleted too and comes back as the snapshot
+    recorded it. ``-xdev`` keeps the pass off anything mounted under a
+    root (a symlink inside a compose volume is shared state); a root the
+    image never created is skipped rather than failed. Uses only
+    predicates and actions busybox find shares with GNU find.
+    """
+    lines = []
+    for root in roots:
+        quoted = shlex.quote(root)
+        lines.append(
+            f"if [ -e {quoted} ] || [ -L {quoted} ]; then "
+            f"find {quoted} -xdev -type l -exec rm -f -- {{}} +; fi"
+        )
+    return "\n".join(lines)
 
 
 def find_special_nodes_command(roots: Sequence[str]) -> str:

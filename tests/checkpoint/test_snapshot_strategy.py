@@ -819,6 +819,101 @@ async def test_archive_extraction_guard_fails_on_a_planted_special_file(
     assert planted.exists()
 
 
+@pytest.mark.parametrize("implementation", ["host", "busybox"])
+async def test_archive_restore_never_writes_through_an_image_symlink(
+    tmp_path: Path, implementation: str
+) -> None:
+    """A symlink the fresh image ships under the root cannot route a member outside it.
+
+    The archive passes the host walk: a directory, a regular file
+    ``l/shadow`` and a hard link ``pw -> l/passwd``, all lexically under
+    the root. In the fresh sandbox ``l`` is a symlink to a directory
+    outside the root, through which busybox tar would write ``shadow``
+    and both tars would hard-link ``pw`` to the outside ``passwd``. The
+    restore deletes the image's symlinks under the root first, so
+    ``shadow`` lands in a real directory ``l`` and the hard link, whose
+    target no longer exists, fails the restore.
+    """
+    env = LocalShellSandbox(extra_env=_tar_shim(tmp_path, implementation))
+    strategy = await _strategy(env, tmp_path)
+    ctx = _context(tmp_path / "sample")
+    root = tmp_path / "capture" / "data"
+    root.mkdir(parents=True)
+    outside = tmp_path / "capture" / "etc"
+    outside.mkdir()
+    (outside / "passwd").write_text("root:x:0:0\n")
+    (root / "l").symlink_to("../etc")
+    storage = Path(ctx.storage_dir)
+    storage.mkdir(parents=True)
+    archive_name = "ckpt-00001.tar.gz"
+    digest = _crafted_archive(
+        storage / archive_name,
+        [
+            _member(_rel(root), tarfile.DIRTYPE),
+            _member(_rel(root / "l" / "shadow")),
+            _member(
+                _rel(root / "pw"),
+                tarfile.LNKTYPE,
+                linkname=_rel(root / "l" / "passwd"),
+            ),
+        ],
+        {_rel(root / "l" / "shadow"): b"planted\n"},
+    )
+
+    with pytest.raises(RuntimeError, match="archive snapshot restore failed"):
+        await strategy.restore(
+            env,
+            SandboxBackupPaths(include=[str(root)]),
+            _hostile_details(archive_name, digest, root),
+            ctx,
+        )
+
+    assert not (outside / "shadow").exists()
+    assert (outside / "passwd").stat().st_nlink == 1
+    assert not (root / "pw").exists()
+    assert (root / "l").is_dir() and not (root / "l").is_symlink()
+
+
+@pytest.mark.parametrize("implementation", ["host", "busybox"])
+async def test_archive_restore_replaces_image_symlinks_with_the_snapshot(
+    tmp_path: Path, implementation: str
+) -> None:
+    """Image symlinks under the root give way to what the snapshot holds at each path.
+
+    A directory where the snapshot has one (its file lands there, not in
+    the link's target), a link where the snapshot has a link, and nothing
+    where the snapshot has nothing. The capture runs with the host's tar;
+    only the restore runs under ``implementation``.
+    """
+    capture_env = LocalShellSandbox()
+    strategy = await _strategy(capture_env, tmp_path)
+    ctx = _context(tmp_path / "sample")
+    data_dir = tmp_path / "capture" / "data"
+    _write_data(data_dir)
+    (data_dir / "local").mkdir()
+    (data_dir / "local" / "x").write_text("captured\n")
+    paths = SandboxBackupPaths(include=[str(data_dir)])
+    details = await strategy.snapshot(capture_env, paths, 1, ctx)
+
+    env = LocalShellSandbox(extra_env=_tar_shim(tmp_path, implementation))
+    shutil.rmtree(data_dir)
+    data_dir.mkdir()
+    elsewhere = tmp_path / "capture" / "elsewhere"
+    elsewhere.mkdir()
+    (data_dir / "local").symlink_to("../elsewhere")
+    (data_dir / "link.txt").symlink_to("/etc/hostname")
+    (data_dir / "stale").symlink_to("/etc")
+
+    await strategy.restore(env, paths, details, ctx)
+
+    assert (data_dir / "local").is_dir() and not (data_dir / "local").is_symlink()
+    assert (data_dir / "local" / "x").read_text() == "captured\n"
+    assert not (elsewhere / "x").exists()
+    assert os.readlink(data_dir / "link.txt") == "notes.txt"
+    assert not (data_dir / "stale").is_symlink()
+    assert not (data_dir / "stale").exists()
+
+
 @pytest.mark.parametrize("compression", ["gz", "zst"])
 def test_check_archive_hashes_bytes_past_the_tar_end_marker(
     tmp_path: Path, compression: str

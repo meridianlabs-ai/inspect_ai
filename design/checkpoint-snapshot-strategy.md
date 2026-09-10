@@ -386,7 +386,11 @@ Implementation requirements:
   roots and structurally validated on the host before any byte enters
   the sandbox (implementation-status item 5; `_restore_scope`). The
   resume source is not authenticated; structural validation is the
-  whole defense.
+  whole defense. The validation is lexical, and the restoring tool
+  resolves paths through what the fresh image already has, so every
+  symlink the image ships under a root is deleted in the sandbox
+  before anything is written (`remove_existing_symlinks_command`);
+  the snapshot recreates the links it holds.
 
 ### 4.7 Strategy identity is recorded and pinned
 

@@ -828,6 +828,41 @@ async def test_ingress_refuses_snapshot_reaching_outside_scope(
 
 
 @pytest.mark.slow
+async def test_ingress_never_writes_through_an_image_symlink(
+    repos: _Repos, tmp_path: Path
+) -> None:
+    """A symlink the fresh image ships under the root is deleted before restic writes.
+
+    The snapshot holds a directory ``l`` with a file; the fresh sandbox
+    has ``l`` as a symlink to a directory outside the root. The restore
+    leaves that directory untouched and puts the file in a real ``l``
+    (restic 0.18 replaces the mismatched node itself; the pre-restore
+    pass makes the invariant independent of that). A link the snapshot
+    never held is gone afterwards.
+    """
+    src = repos.src
+    (src / "l").mkdir()
+    (src / "l" / "shadow").write_text("captured\n")
+    id1 = repos.backup("ckpt-00001")
+    fresh = _FreshSandbox(repos, tmp_path)
+    shutil.rmtree(src)
+    src.mkdir()
+    outside = src.parent / "etc"
+    outside.mkdir()
+    (outside / "passwd").write_text("root:x:0:0\n")
+    (src / "l").symlink_to("../etc")
+    (src / "stale").symlink_to("/etc")
+
+    await fresh.ingress(id1)
+
+    assert not (outside / "shadow").exists()
+    assert (src / "l").is_dir() and not (src / "l").is_symlink()
+    assert (src / "l" / "shadow").read_text() == "captured\n"
+    assert not (src / "stale").is_symlink()
+    assert (src / "notes.txt").read_text() == "v1\n"
+
+
+@pytest.mark.slow
 async def test_ingress_restores_root_with_glob_characters_literally(
     repos: _Repos, tmp_path: Path
 ) -> None:

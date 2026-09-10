@@ -40,10 +40,13 @@ Capture mechanics (design §7.2/§8, first implementation):
   the sandbox decodes it (every gzip member, every zstd frame); nothing
   but zero padding may follow the last member ``tarfile`` parsed; and
   the bytes must hash to the recorded digest — all before any of it is
-  copied in. Extraction then names the roots as tar member arguments so
-  only they are written, and a ``find`` over the roots afterwards fails
-  the restore if the
-  sandbox's tar nonetheless produced a special file or device node
+  copied in. In the sandbox, every symlink the image left under a root
+  is deleted first (``_restore_scope.remove_existing_symlinks_command``)
+  so no member is written, or hard-linked, through one into a path
+  outside the root. Extraction then names the roots as tar member
+  arguments so only they are written, and a ``find`` over the roots
+  afterwards fails the restore if the sandbox's tar nonetheless produced
+  a special file or device node
   (``_restore_scope.find_special_nodes_command``) — the layer that does
   not depend on ``tarfile`` and the image's tar agreeing on member
   boundaries. A second digest check runs inside the sandbox before
@@ -87,6 +90,7 @@ from .._restore_scope import (
     TarHeaderScan,
     check_recorded_roots,
     find_special_nodes_command,
+    remove_existing_symlinks_command,
     tar_member_argument,
     tar_member_node,
 )
@@ -357,12 +361,14 @@ class ArchiveStrategy(SandboxSnapshotStrategy):
                 first = False
 
         # Verify-then-extract: a corrupt archive is rejected before any
-        # byte reaches a final path. Extraction names each capture root
-        # as a member argument, so tar writes only members at or under a
-        # root — the second layer behind the host-side listing check.
-        # The find afterwards is the third: whatever this tar made of the
-        # member boundaries, a special file or device node under a root
-        # fails the restore (the sandbox is discarded on failure).
+        # byte reaches a final path. Symlinks the image left under the
+        # roots go before extraction, so no member lands through one.
+        # Extraction names each capture root as a member argument, so
+        # tar writes only members at or under a root — the second layer
+        # behind the host-side listing check. The find afterwards is the
+        # third: whatever this tar made of the member boundaries, a
+        # special file or device node under a root fails the restore
+        # (the sandbox is discarded on failure).
         members = " ".join(
             shlex.quote(tar_member_argument(root)) for root in roots.roots
         )
@@ -377,6 +383,7 @@ class ArchiveStrategy(SandboxSnapshotStrategy):
             f'[ "$digest" = "{expected_digest}" ] || '
             f'{{ echo "archive digest mismatch: $digest != {expected_digest}" >&2; '
             f"exit 1; }}\n"
+            f"{remove_existing_symlinks_command(roots.roots)}\n"
             f"{extract}\n"
             f"bad=$({find_special_nodes_command(roots.roots)})\n"
             f'[ -z "$bad" ] || {{ echo "extraction produced $bad: a setuid, setgid '
