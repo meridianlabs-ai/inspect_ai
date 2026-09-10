@@ -50,6 +50,22 @@ async def test_subprocess_binary():
 
 
 @pytest.mark.anyio
+async def test_subprocess_child_exits_before_reading_stdin():
+    """A child that exits without draining its stdin reports its exit status.
+
+    The input exceeds the pipe buffer so the write cannot complete unless the
+    child reads; the child never does, so the write hits a closed pipe. That is
+    the child's failure to report, not a broken-pipe error from the helper.
+    """
+    result = await subprocess(
+        ["sh", "-c", "echo refused >&2; exit 3"], input="x" * (1024 * 1024)
+    )
+    assert result.success is False
+    assert result.returncode == 3
+    assert result.stderr == "refused\n"
+
+
+@pytest.mark.anyio
 async def test_subprocess_cwd():
     parent_dir = Path(os.getcwd()).parent.as_posix()
     result = await subprocess(
