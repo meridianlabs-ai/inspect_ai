@@ -29,6 +29,7 @@ from inspect_ai.util._checkpoint._restore_scope import (
     check_recorded_roots,
     find_special_nodes_command,
     recorded_roots,
+    remove_existing_symlinks,
     remove_existing_symlinks_command,
     restic_node,
     restic_restore_args,
@@ -624,6 +625,50 @@ def test_remove_existing_symlinks_command_deletes_only_symlinks_under_roots(
     assert (outside / "passwd").read_text() == "root:x:0:0\n"
     assert os.readlink(sibling) == "../etc"
     assert not missing.exists()
+
+
+async def test_remove_existing_symlinks_runs_as_root_and_reports_failure() -> None:
+    """The pass runs the command as root under ``set -e`` and a failure names the roots."""
+    from test_helpers.local_shell_sandbox import LocalShellSandbox
+
+    from inspect_ai.util._subprocess import ExecResult
+
+    class _Recording(LocalShellSandbox):
+        def __init__(self, success: bool) -> None:
+            super().__init__()
+            self.success = success
+            self.calls: list[tuple[list[str], str | None]] = []
+
+        async def exec(
+            self,
+            cmd: list[str],
+            input: str | bytes | None = None,
+            cwd: str | None = None,
+            env: dict[str, str] | None = None,
+            user: str | None = None,
+            timeout: int | None = None,
+            timeout_retry: bool = True,
+            concurrency: bool = True,
+        ) -> ExecResult[str]:
+            self.calls.append((cmd, user))
+            return ExecResult(
+                success=self.success,
+                returncode=0 if self.success else 1,
+                stdout="",
+                stderr="" if self.success else "find: permission denied\n",
+            )
+
+    ok = _Recording(success=True)
+    await remove_existing_symlinks(ok, HOME, label=LABEL)
+    (cmd, user), *rest = ok.calls
+    assert not rest and user == "root"
+    assert cmd[:2] == ["sh", "-c"] and cmd[2].startswith("set -e\n")
+    assert cmd[2].endswith(remove_existing_symlinks_command(HOME.roots))
+
+    failing = _Recording(success=False)
+    with pytest.raises(RuntimeError, match=re.escape("['/home/user']")) as exc_info:
+        await remove_existing_symlinks(failing, HOME, label=LABEL)
+    assert "permission denied" in str(exc_info.value)
 
 
 @pytest.mark.parametrize(

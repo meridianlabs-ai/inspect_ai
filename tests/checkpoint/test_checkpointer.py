@@ -51,6 +51,7 @@ from inspect_ai.util._checkpoint import (
     checkpointer,
 )
 from inspect_ai.util._checkpoint._layout.schemas import Checkpoint, SnapshotDetails
+from inspect_ai.util._checkpoint._restore_scope import remove_existing_symlinks_command
 from inspect_ai.util._checkpoint._triggers import CheckpointTriggerKind
 from inspect_ai.util._checkpoint.checkpointer import Checkpointer, ResumeCheckpoint
 from inspect_ai.util._checkpoint.checkpointer_impl import (
@@ -2972,9 +2973,12 @@ class _RecordingStrategy(_StubStrategy):
         super().__init__()
         self.calls: list[str] = []
         self.restored: list[tuple[object, object]] = []
+        self.commands_before_setup: list[list[str]] = []
 
     async def setup(self, env: object, ctx: object) -> None:
         self.calls.append("setup")
+        if isinstance(env, _RecordingSandbox):
+            self.commands_before_setup = list(env.commands)
 
     async def discard_orphans(self, committed: object, ctx: object) -> None:
         self.calls.append("discard_orphans")
@@ -3012,6 +3016,11 @@ class _RecordingSandbox:
             assert user is None, "the default user's uid is read as the default user"
             return ExecResult(success=True, returncode=0, stdout="1000\n", stderr="")
         return ExecResult(success=True, returncode=0, stdout="", stderr="")
+
+
+def _symlink_pass(*roots: str) -> list[str]:
+    """The core's pre-``setup`` exec deleting the image's symlinks under ``roots``."""
+    return ["sh", "-c", "set -e\n" + remove_existing_symlinks_command(roots)]
 
 
 def _sandbox_checkpoint(checkpoint_id: int, sandboxes: dict[str, str]) -> Checkpoint:
@@ -3078,11 +3087,17 @@ async def test_hydrate_sandbox_refuses_resume_without_committed_record() -> None
             [_sandbox_checkpoint(1, {"other": "o1"})],
         )
     assert strategy.calls == ["setup"]
-    assert env.commands == []
+    assert env.commands == [["stat", "-c", "%u", "/root"], _symlink_pass("/root")]
 
 
 async def test_hydrate_sandbox_reowns_auto_home_around_restore() -> None:
-    """Auto-home: read the owner before the restore, re-own under it after."""
+    """Auto-home: read the owner before the restore, re-own under it after.
+
+    The owner is read from the untouched image, before the symlink pass
+    (a home dir that is itself an image symlink stats through to its
+    target's owner), and the pass runs before ``setup`` so nothing the
+    strategy places is written through an image symlink.
+    """
     strategy = _RecordingStrategy()
     env = _RecordingSandbox()
     paths = SandboxBackupPaths(include=["/home/agent"], home="/home/agent")
@@ -3098,12 +3113,14 @@ async def test_hydrate_sandbox_reowns_auto_home_around_restore() -> None:
     assert isinstance(ref, SnapshotDetails) and ref.snapshot_id == "d2"
     assert env.commands == [
         ["stat", "-c", "%u", "/home/agent"],
+        _symlink_pass("/home/agent"),
         [
             "sh",
             "-c",
             "find /home/agent -xdev ! -user 1001 -exec chown -h 1001 {} +",
         ],
     ]
+    assert strategy.commands_before_setup == env.commands[:2]
 
 
 async def test_hydrate_sandbox_reowns_missing_home_to_default_user() -> None:
@@ -3119,6 +3136,7 @@ async def test_hydrate_sandbox_reowns_missing_home_to_default_user() -> None:
         ["stat", "-c", "%u", "/home/agent"],
         ["test", "-e", "/home/agent"],
         ["id", "-u"],
+        _symlink_pass("/home/agent"),
         [
             "sh",
             "-c",
@@ -3128,13 +3146,15 @@ async def test_hydrate_sandbox_reowns_missing_home_to_default_user() -> None:
 
 
 async def test_hydrate_sandbox_keeps_recorded_ownership_for_configured_paths() -> None:
+    """Configured roots: no owner probe or re-own, only the pre-``setup`` symlink pass."""
     strategy = _RecordingStrategy()
     env = _RecordingSandbox()
     await _hydrate_one_sandbox(
         strategy,
         env,
-        SandboxBackupPaths(include=["/data"]),
+        SandboxBackupPaths(include=["/data", "/data/sub", "/srv"]),
         [_sandbox_checkpoint(1, {"default": "d1"})],
     )
     assert strategy.calls == ["setup", "discard_orphans", "restore"]
-    assert env.commands == []
+    assert env.commands == [_symlink_pass("/data", "/srv")]
+    assert strategy.commands_before_setup == env.commands

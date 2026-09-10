@@ -143,7 +143,10 @@ class SandboxSnapshotStrategy(Protocol):
         tooling (for restic, this is where the restic binary is
         installed into the sandbox); when ``ctx.resuming`` is false,
         also initialize fresh strategy state (restic: init the
-        in-sandbox repo).
+        in-sandbox repo). On resume the core has already deleted every
+        symlink the image ships under a capture root, so tooling placed
+        under one (``/root/.cache/inspect`` when the default user is
+        root) lands in real directories.
         """
         ...
 
@@ -182,9 +185,12 @@ class SandboxSnapshotStrategy(Protocol):
         symlink, and any regular file with a setuid/setgid/sticky mode —
         see ``_restore_scope`` — then restore each root individually so
         nothing above it is touched. May assume ``setup`` and
-        ``discard_orphans`` ran first, and that the storage area holds
-        the prior attempt's state (the core copied it there before this
-        attempt started).
+        ``discard_orphans`` ran first, that the storage area holds the
+        prior attempt's state (the core copied it there before this
+        attempt started), and that no symlink the image shipped under a
+        root remains in the sandbox (the core deleted them before
+        ``setup``, so neither the strategy's own state nor a restored
+        node is written through one).
         """
         ...
 

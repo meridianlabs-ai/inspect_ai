@@ -107,7 +107,6 @@ from .._repo_ops import (
 from .._restore_scope import (
     RESTORED_XATTRS,
     RestoreRoots,
-    remove_existing_symlinks_command,
     restic_node,
     restic_restore_args,
 )
@@ -173,11 +172,7 @@ async def ingress_sandbox(
     3. Stream the tarball into the sandbox via root ``sh`` so the agent
        never sees the bytes in flight, extracting into the standard
        in-sandbox repo location (``/root/.cache/inspect/repo``).
-    4. Delete every symlink the fresh image has under a root
-       (``remove_existing_symlinks_command``), so no snapshot node is
-       written through one into a path outside the root; the snapshot
-       recreates the links it holds.
-    5. For each root, ``restic restore <id>:<parent> --target <parent>
+    4. For each root, ``restic restore <id>:<parent> --target <parent>
        --include /<name> --include-xattr user.*`` inside the sandbox, so
        the root lands at its original absolute path and nothing above
        it is written (restic would otherwise restore the recorded
@@ -188,7 +183,11 @@ async def ingress_sandbox(
        bit by another name — or a ``system.posix_acl_*`` grant.
 
     ``snapshot_id`` is the latest committed checkpoint's recorded id;
-    the caller resolves it, there is no ``latest`` fallback.
+    the caller resolves it, there is no ``latest`` fallback. The caller
+    has also already deleted every symlink the fresh image ships under a
+    root (``_restore_scope.remove_existing_symlinks``, run by the core
+    before the strategy's ``setup`` injected restic), so neither the repo
+    extracted in step 3 nor a snapshot node is written through one.
 
     Egress's two-phase manifest is reseeded by writing a manifest line
     for every file in the freshly-populated repo, so the next fire's
@@ -232,16 +231,6 @@ async def ingress_sandbox(
     result = await env.exec(["sh", "-c", extract_script], input=tar_bytes, user="root")
     if not result.success:
         raise RuntimeError(f"Failed to ingress sandbox restic repo: {result.stderr}")
-
-    unlink = await env.exec(
-        ["sh", "-c", "set -e\n" + remove_existing_symlinks_command(roots.roots)],
-        user="root",
-    )
-    if not unlink.success:
-        raise RuntimeError(
-            f"Failed to remove the fresh sandbox's symlinks under {list(roots.roots)} "
-            f"before restoring: {unlink.stderr}"
-        )
 
     for root in roots.roots:
         args = restic_restore_args(full_id, root)

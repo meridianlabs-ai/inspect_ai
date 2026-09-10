@@ -387,10 +387,13 @@ Implementation requirements:
   the sandbox (implementation-status item 5; `_restore_scope`). The
   resume source is not authenticated; structural validation is the
   whole defense. The validation is lexical, and the restoring tool
-  resolves paths through what the fresh image already has, so every
-  symlink the image ships under a root is deleted in the sandbox
-  before anything is written (`remove_existing_symlinks_command`);
-  the snapshot recreates the links it holds.
+  resolves paths through what the fresh image already has, so on
+  resume the core deletes every symlink the image ships under a root
+  before the strategy's `setup` places anything in the sandbox
+  (`_restore_scope.remove_existing_symlinks`); the strategy's own
+  tooling under `/root/.cache/inspect` is inside the root when the
+  default user is root, so a later pass would sever it. The snapshot
+  recreates the links it holds.
 
 ### 4.7 Strategy identity is recorded and pinned
 

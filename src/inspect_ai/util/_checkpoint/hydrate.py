@@ -91,7 +91,12 @@ from ._layout.staging_dir import (
     is_remote_destination,
 )
 from ._repo_ops import drop_orphan_snapshots
-from ._restore_scope import enforce_home_owner, home_owner_uid
+from ._restore_scope import (
+    RestoreRoots,
+    enforce_home_owner,
+    home_owner_uid,
+    remove_existing_symlinks,
+)
 from ._resume_copy import copy_payload_files
 from ._snapshot import (
     SandboxSnapshotSession,
@@ -499,15 +504,30 @@ async def _hydrate_sandbox(
     (materialize the latest committed snapshot into the fresh sandbox,
     scoped to this attempt's capture paths). A sandbox no committed
     checkpoint records is an error: the host can vouch for nothing in
-    its storage area, so there is no snapshot to restore. For an
-    auto-included home dir the owner is read before the restore and
-    every restored node re-owned to it afterwards (the strategies
-    restore recorded uid/gid as root; see ``_restore_scope``). The
-    retry startup copy already replicated the storage area into this
-    attempt (see ``_resume_copy``).
+    its storage area, so there is no snapshot to restore. The retry
+    startup copy already replicated the storage area into this attempt
+    (see ``_resume_copy``).
+
+    On resume, two things happen against the untouched image before
+    ``setup`` places anything in the sandbox (see ``_restore_scope``):
+    for an auto-included home dir its owner is read, and every restored
+    node is re-owned to it after the restore (the strategies restore
+    recorded uid/gid as root); and every symlink the image ships under a
+    capture root is deleted, so neither the strategy's own state (which
+    lives under the root when the default user is root) nor a snapshot
+    node is written through one. A hydration that fails after this point
+    fails the sample, so the pass leaves nothing a later attempt sees.
     """
     env = sandbox(name)
     strategy, ctx, paths = session
+    label = f"resume: sandbox {name!r}"
+    home = paths.home
+    owner: int | None = None
+    if resume is not None:
+        if home is not None:
+            owner = await home_owner_uid(env, home, label=label)
+        roots = RestoreRoots.from_include(paths.include, label=label)
+        await remove_existing_symlinks(env, roots, label=label)
     with trace_action(logger, action, f"sandbox {name} setup"):
         await strategy.setup(env, ctx)
     if resume is None:
@@ -520,9 +540,6 @@ async def _hydrate_sandbox(
             f"{name!r}; refusing to restore an unrecorded snapshot into it"
         )
     await strategy.discard_orphans(committed, ctx)
-    label = f"resume: sandbox {name!r}"
-    home = paths.home
-    owner = await home_owner_uid(env, home, label=label) if home is not None else None
     with trace_action(logger, action, f"sandbox {name} restore"):
         await strategy.restore(env, paths, committed[-1].details, ctx)
     if home is not None and owner is not None:

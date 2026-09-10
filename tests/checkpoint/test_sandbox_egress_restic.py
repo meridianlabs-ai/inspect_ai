@@ -46,6 +46,7 @@ from inspect_ai.util._checkpoint._repo_ops import (
 from inspect_ai.util._checkpoint._restore_scope import (
     RestoreRoots,
     RestoreScopeError,
+    remove_existing_symlinks,
     restic_node,
 )
 from inspect_ai.util._checkpoint._sandbox_restic.egress import (
@@ -834,11 +835,12 @@ async def test_ingress_never_writes_through_an_image_symlink(
     """A symlink the fresh image ships under the root is deleted before restic writes.
 
     The snapshot holds a directory ``l`` with a file; the fresh sandbox
-    has ``l`` as a symlink to a directory outside the root. The restore
-    leaves that directory untouched and puts the file in a real ``l``
-    (restic 0.18 replaces the mismatched node itself; the pre-restore
-    pass makes the invariant independent of that). A link the snapshot
-    never held is gone afterwards.
+    has ``l`` as a symlink to a directory outside the root. The core's
+    pre-``setup`` pass (run here as ``_hydrate_sandbox`` would) deletes
+    the link, and the restore leaves that directory untouched and puts
+    the file in a real ``l`` (restic 0.18 replaces the mismatched node
+    itself; the pass makes the invariant independent of that). A link
+    the snapshot never held is gone afterwards.
     """
     src = repos.src
     (src / "l").mkdir()
@@ -853,6 +855,9 @@ async def test_ingress_never_writes_through_an_image_symlink(
     (src / "l").symlink_to("../etc")
     (src / "stale").symlink_to("/etc")
 
+    await remove_existing_symlinks(
+        fresh.env, RestoreRoots.from_include([str(src)], label="test"), label="test"
+    )
     await fresh.ingress(id1)
 
     assert not (outside / "shadow").exists()

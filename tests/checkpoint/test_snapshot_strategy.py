@@ -33,7 +33,11 @@ from test_helpers.local_shell_sandbox import LocalShellSandbox
 
 from inspect_ai.util._checkpoint._copy import copy_out, copy_out_partial_path
 from inspect_ai.util._checkpoint._layout.schemas import Checkpoint, SnapshotDetails
-from inspect_ai.util._checkpoint._restore_scope import RestoreScopeError
+from inspect_ai.util._checkpoint._restore_scope import (
+    RestoreRoots,
+    RestoreScopeError,
+    remove_existing_symlinks,
+)
 from inspect_ai.util._checkpoint._snapshot import (
     committed_snapshots_for,
     snapshot_strategy_name,
@@ -55,8 +59,11 @@ from inspect_ai.util._checkpoint._snapshot.registry import (
 )
 from inspect_ai.util._checkpoint._snapshot.types import (
     CommittedSnapshot,
+    SandboxSnapshotSession,
     SnapshotContext,
 )
+from inspect_ai.util._checkpoint.checkpointer import ResumeCheckpoint
+from inspect_ai.util._checkpoint.hydrate import _hydrate_sandbox
 from inspect_ai.util._checkpoint.sandbox_paths import SandboxBackupPaths
 from inspect_ai.util._subprocess import ExecResult
 
@@ -819,6 +826,13 @@ async def test_archive_extraction_guard_fails_on_a_planted_special_file(
     assert planted.exists()
 
 
+async def _remove_image_symlinks(env: LocalShellSandbox, root: Path) -> None:
+    """The core's pre-``setup`` pass on resume (``_hydrate_sandbox``), for a strategy-level test."""
+    await remove_existing_symlinks(
+        env, RestoreRoots.from_include([str(root)], label="test"), label="test"
+    )
+
+
 @pytest.mark.parametrize("implementation", ["host", "busybox"])
 async def test_archive_restore_never_writes_through_an_image_symlink(
     tmp_path: Path, implementation: str
@@ -830,9 +844,9 @@ async def test_archive_restore_never_writes_through_an_image_symlink(
     the root. In the fresh sandbox ``l`` is a symlink to a directory
     outside the root, through which busybox tar would write ``shadow``
     and both tars would hard-link ``pw`` to the outside ``passwd``. The
-    restore deletes the image's symlinks under the root first, so
-    ``shadow`` lands in a real directory ``l`` and the hard link, whose
-    target no longer exists, fails the restore.
+    core deletes the image's symlinks under the root before the restore,
+    so ``shadow`` lands in a real directory ``l`` and the hard link,
+    whose target no longer exists, fails the restore.
     """
     env = LocalShellSandbox(extra_env=_tar_shim(tmp_path, implementation))
     strategy = await _strategy(env, tmp_path)
@@ -843,6 +857,7 @@ async def test_archive_restore_never_writes_through_an_image_symlink(
     outside.mkdir()
     (outside / "passwd").write_text("root:x:0:0\n")
     (root / "l").symlink_to("../etc")
+    await _remove_image_symlinks(env, root)
     storage = Path(ctx.storage_dir)
     storage.mkdir(parents=True)
     archive_name = "ckpt-00001.tar.gz"
@@ -904,6 +919,7 @@ async def test_archive_restore_replaces_image_symlinks_with_the_snapshot(
     (data_dir / "link.txt").symlink_to("/etc/hostname")
     (data_dir / "stale").symlink_to("/etc")
 
+    await _remove_image_symlinks(env, data_dir)
     await strategy.restore(env, paths, details, ctx)
 
     assert (data_dir / "local").is_dir() and not (data_dir / "local").is_symlink()
@@ -912,6 +928,69 @@ async def test_archive_restore_replaces_image_symlinks_with_the_snapshot(
     assert os.readlink(data_dir / "link.txt") == "notes.txt"
     assert not (data_dir / "stale").is_symlink()
     assert not (data_dir / "stale").exists()
+
+
+async def test_hydrate_removes_image_symlinks_before_the_strategy_stages_under_the_root(
+    tmp_path: Path,
+) -> None:
+    """The symlink pass runs before ``setup``, so strategy state under the root survives it.
+
+    The strategy's sandbox dir is ``<root>/.cache/inspect`` (the default
+    ``/root/.cache/inspect`` when the default user is root) and the fresh
+    image ships ``<root>/.cache`` as a symlink to a directory outside the
+    root. Had the pass run after ``setup`` or the archive staging, the
+    strategy's ``install -d`` would have created its dirs through the
+    link and the pass would then have severed them, failing the restore
+    with "no such file". Run first, the link goes before anything is
+    placed and every later ``install -d`` creates real directories; the
+    link's target is never written.
+    """
+    root = tmp_path / "capture" / "home"
+    files = _write_data(root)
+    sandbox_dir = str(root / ".cache" / "inspect")
+    sample = tmp_path / "sample"
+    paths = SandboxBackupPaths(include=[str(root)])
+    capture_env = LocalShellSandbox()
+    capture = ArchiveStrategy(chunk_size=256 * 1024, sandbox_dir=sandbox_dir)
+    await capture.setup(capture_env, _context(sample))
+    details = await capture.snapshot(capture_env, paths, 1, _context(sample))
+
+    shutil.rmtree(root)
+    root.mkdir()
+    elsewhere = tmp_path / "capture" / "cache"
+    elsewhere.mkdir()
+    (root / ".cache").symlink_to("../cache")
+    env = LocalShellSandbox()
+    ctx = _context(sample, resuming=True)
+    checkpoint = Checkpoint(
+        checkpoint_id=1,
+        trigger="turn",
+        turn=1,
+        created_at=datetime.now(timezone.utc),
+        duration_ms=0,
+        size_bytes=0,
+        host=SnapshotDetails(snapshot_id="host", size_bytes=0, duration_ms=0),
+        sandboxes={"default": details},
+    )
+
+    with patch("inspect_ai.util._checkpoint.hydrate.sandbox", return_value=env):
+        await _hydrate_sandbox(
+            name="default",
+            session=SandboxSnapshotSession(
+                ArchiveStrategy(chunk_size=256 * 1024, sandbox_dir=sandbox_dir),
+                ctx,
+                paths,
+            ),
+            resume=ResumeCheckpoint(attempt="resume"),
+            committed_checkpoints=[checkpoint],
+            action="test",
+        )
+
+    for rel, content in files.items():
+        assert (root / rel).read_bytes() == content
+    assert (root / ".cache").is_dir() and not (root / ".cache").is_symlink()
+    assert not (elsewhere / "inspect").exists()
+    assert not (Path(sandbox_dir) / "snapshot-staging").exists()
 
 
 @pytest.mark.parametrize("compression", ["gz", "zst"])

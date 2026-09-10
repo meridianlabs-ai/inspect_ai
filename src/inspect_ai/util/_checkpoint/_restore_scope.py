@@ -60,11 +60,14 @@ image* ships under a root is resolved, though: the listings judge
 paths lexically, but the extracting tool writes through whatever
 already exists, so a snapshot holding ``l/x`` and a hard link to
 ``l/passwd`` where the image has ``l -> /etc`` would plant ``/etc/x``
-and alias ``/etc/passwd``. Both strategies therefore run
-:func:`remove_existing_symlinks_command` in the sandbox before writing:
-every symlink already under a root is deleted, and the snapshot — which
-holds every link that was under the root at capture — recreates the
-ones it has. Ancestors are exempt
+and alias ``/etc/passwd``. The core therefore runs
+:func:`remove_existing_symlinks` in the sandbox on resume before the
+strategy's ``setup`` — before anything at all is placed in the sandbox,
+including the strategy's own tooling under ``/root/.cache/inspect``,
+which sits under the root whenever the default user is root: every
+symlink already under a root is deleted, and the snapshot — which holds
+every link that was under the root at capture — recreates the ones it
+has. Ancestors are exempt
 from the mode check (``/tmp`` is sticky) because the strategies restore
 each root individually — ``restic restore <id>:<parent> --include
 /<name>`` and ``tar -x <root>`` — so nothing above a root is written or
@@ -586,8 +589,9 @@ def tar_member_argument(root: str) -> str:
 def remove_existing_symlinks_command(roots: Sequence[str]) -> str:
     """Shell lines deleting every symlink already under ``roots`` in the fresh sandbox.
 
-    Run as root under ``set -e`` before either tool writes a node. The
-    host walk judges paths lexically, but the tool resolves them through
+    Run as root under ``set -e`` (see :func:`remove_existing_symlinks`)
+    before the strategy places anything in the sandbox. The host walk
+    judges paths lexically, but the restoring tool resolves them through
     what the fresh image already has: where the image ships ``l -> /etc``
     under a root, busybox tar writes a member ``l/x`` into ``/etc/x``
     (GNU tar refuses the open) and both tars create a hard link to
@@ -611,6 +615,30 @@ def remove_existing_symlinks_command(roots: Sequence[str]) -> str:
             f"find {quoted} -xdev -type l -exec rm -f -- {{}} +; fi"
         )
     return "\n".join(lines)
+
+
+async def remove_existing_symlinks(
+    env: SandboxEnvironment, roots: RestoreRoots, *, label: str
+) -> None:
+    """Run :func:`remove_existing_symlinks_command` over ``roots`` as root.
+
+    The core calls this on resume before the strategy's ``setup``, so
+    that the strategy's own state (the injected restic binary and repo,
+    the staged archive — all under ``/root/.cache/inspect``, which is
+    inside the root when the default user is root) is created as real
+    directories rather than written through an image symlink that this
+    pass then severs. Running it any later would leave that state
+    unreachable at its path and fail the restore without naming the cause.
+    """
+    result = await env.exec(
+        ["sh", "-c", "set -e\n" + remove_existing_symlinks_command(roots.roots)],
+        user="root",
+    )
+    if not result.success:
+        raise RuntimeError(
+            f"{label}: removing the fresh sandbox's symlinks under "
+            f"{list(roots.roots)} before restoring failed: {result.stderr.strip()}"
+        )
 
 
 def find_special_nodes_command(roots: Sequence[str]) -> str:
