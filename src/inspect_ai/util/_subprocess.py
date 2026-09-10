@@ -139,14 +139,10 @@ async def subprocess(
             env={**os.environ, **(env or {})},
         )
         try:
-            # Like subprocess.communicate(): a child that exits (or closes its
-            # stdin) before reading all of its input is reported through its
-            # exit status and stderr below, not as a broken pipe here.
+            # write to stdin (convert input to bytes)
             if process.stdin and input:
-                with contextlib.suppress(anyio.BrokenResourceError):
-                    await process.stdin.send(input)
-                with contextlib.suppress(anyio.BrokenResourceError):
-                    await process.stdin.aclose()
+                await process.stdin.send(input)
+                await process.stdin.aclose()
 
             if redirect_output_to_logger:
                 consume = _log_stream
