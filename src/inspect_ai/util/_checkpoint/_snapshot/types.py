@@ -181,9 +181,10 @@ class SandboxSnapshotStrategy(Protocol):
         under. The snapshot is untrusted data, so before any of it enters
         the sandbox the strategy must list it on the host and reject any
         node outside ``paths.include`` (directories on the way to a root
-        excepted), any node that is not a regular file, directory, or
-        symlink, and any regular file with a setuid/setgid/sticky mode —
-        see ``_restore_scope`` — then restore each root individually so
+        excepted), any node that is not a regular file, directory,
+        symlink, or hard link whose target is under a root, and any
+        regular file with a setuid/setgid/sticky mode — see
+        ``_restore_scope`` — then restore each root individually so
         nothing above it is touched. May assume ``setup`` and
         ``discard_orphans`` ran first, that the storage area holds the
         prior attempt's state (the core copied it there before this

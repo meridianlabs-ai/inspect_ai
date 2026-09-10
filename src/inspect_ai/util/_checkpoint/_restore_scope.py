@@ -67,13 +67,12 @@ including the strategy's own tooling under ``/root/.cache/inspect``,
 which sits under the root whenever the default user is root: every
 symlink already under a root is deleted, and the snapshot — which holds
 every link that was under the root at capture — recreates the ones it
-has. Ancestors are exempt
-from the mode check (``/tmp`` is sticky) because the strategies restore
-each root individually — ``restic restore <id>:<parent> --include
-/<name>`` and ``tar -x <root>`` — so nothing above a root is written or
-has its metadata restored. Extended attributes are outside both
-listings; the restic restore reapplies only ``user.*``
-(:data:`RESTORED_XATTRS`) and the archive never carries any.
+has. Ancestors are exempt from the mode check (``/tmp`` is sticky)
+because the strategies restore each root individually — ``restic
+restore <id>:<parent> --include /<name>`` and ``tar -x <root>`` — so
+nothing above a root is written or has its metadata restored. Extended
+attributes are outside both listings; the restic restore reapplies only
+``user.*`` (:data:`RESTORED_XATTRS`) and the archive never carries any.
 
 Ownership is the residual: restic and tar restore recorded uid/gid when
 running as root. For the auto-home case the core snapshots the home
@@ -299,7 +298,7 @@ class RestoreRoots:
         if node.kind not in _RESTORABLE_KINDS:
             raise RestoreScopeError(
                 f"{label}: snapshot node {path} is a {node.kind}; only regular "
-                f"files, directories and symlinks are restored"
+                f"files, directories, symlinks and in-scope hard links are restored"
             )
         if node.kind == "hardlink":
             target = normalize_absolute(
