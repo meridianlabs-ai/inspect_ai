@@ -1,5 +1,6 @@
 ## Unreleased
 
+- OpenAI-compatible token-counting and compaction endpoints that return 405 are now handled the same as those that return 404.
 - Bedrock and SageMaker now require `aiobotocore` instead of `aioboto3`, which is no longer installed, and Inspect no longer holds `botocore` back to an old release.
 - Bugfix: `eval_retry` now reuses the model roles recorded in the original log, including roles the task set itself in `Task(...)`.
 - Review: New `Reviewer` protocol and `review` policies (`Task(review=)`, `eval(review=)`, `--review`) run after a tool call executes and before the model sees its result, and can `continue`, `terminate`, or `escalate`; each decision is recorded as a `ReviewEvent`.
@@ -12,6 +13,7 @@
 - Agent Bridge: Bare model names now resolve using the provider of the bridge endpoint, so clients can send names without a provider prefix.
 - Scoring: `multiple_choice()` now recognizes answer letters wrapped in LaTeX or markdown (`$B$`, `**B**`, `(B)`), which previously scored INCORRECT.
 - Datasets: `csv_dataset()` now honors the dialect's delimiter when no explicit delimiter is supplied, including tab-separated and registered custom dialects.
+- Datasets: `csv_dataset()` now loads UTF-8 files with a byte-order mark, including Excel CSV exports, without requiring an explicit encoding.
 - Datasets: `file_dataset()` now reads `.tsv` and `.tab` files as tab-delimited instead of rejecting them.
 - Elicitation: long lines in `ask_user` prompts are no longer hard-wrapped by the console, so long commands copy out of the terminal intact.
 - Compaction: summary compaction now produces a more detailed, structured summary that preserves code snippets, user messages, and any security-relevant constraints stated earlier in the conversation.
