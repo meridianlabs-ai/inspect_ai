@@ -519,7 +519,7 @@ jobs:
         env:
           DOCKER_BUILDKIT: 1
           BUILDKIT_PROGRESS: plain
-        run: uv run pytest --runslow -m slow tests/tools/ -x
+        run: uv run pytest --runslow -m slow tests/tools/ -x -v --durations=0
 
       - name: Minimize uv cache
         if: ${{ !cancelled() }}
@@ -621,7 +621,7 @@ jobs:
           # the non-dev name; _check_main_divergence would otherwise return
           # "edited" on this PR (version.txt differs from main).
           INSPECT_SANDBOX_TOOLS_INSTALL_STATE: clean
-        run: uv run pytest --runslow -m slow tests/tools/ -x
+        run: uv run pytest --runslow -m slow tests/tools/ -x -v --durations=0
 
       - name: Minimize uv cache
         if: ${{ !cancelled() }}
