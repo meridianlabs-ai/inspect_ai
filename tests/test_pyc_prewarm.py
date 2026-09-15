@@ -9,6 +9,7 @@ and the code in it is what pytest's own rewrite produces.
 """
 
 import sys
+import warnings
 from pathlib import Path
 
 import pytest
@@ -79,6 +80,30 @@ def test_rewrite_to_cache_leaves_unparsable_source_to_the_worker(
 
     assert not rewrite_to_cache(source, pytestconfig, state)
     assert not cached_pyc_path(source).exists()
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # compiler warning (SyntaxWarning on 3.12+, DeprecationWarning before)
+        pytest.param('def test_x():\n    assert "\\d" == r"\\d"\n', id="escape"),
+        # pytest's own rewrite-time PytestAssertRewriteWarning
+        pytest.param("def test_x():\n    assert (1, 'msg')\n", id="always-true"),
+    ],
+)
+def test_rewrite_to_cache_leaves_warning_emitting_source_to_the_worker(
+    body: str, tmp_path: Path, pytestconfig: pytest.Config
+) -> None:
+    # were it cached here, the worker would load the pyc without compiling and
+    # the warning would never reach pytest's warnings summary
+    source = _write_test_module(tmp_path / "test_warns.py", body)
+    state = pytestconfig.stash[assertstate_key]
+
+    with warnings.catch_warnings(record=True) as emitted:
+        warnings.simplefilter("always")
+        assert not rewrite_to_cache(source, pytestconfig, state)
+    assert not cached_pyc_path(source).exists()
+    assert emitted == [], "the helper let the warning escape instead of bailing"
 
 
 def _counts(result: PrewarmResult) -> PrewarmResult:

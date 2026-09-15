@@ -32,6 +32,7 @@ import os
 import sys
 import threading
 import time
+import warnings
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
@@ -162,14 +163,20 @@ def rewrite_to_cache(
     """Write the rewritten pyc for ``source`` exactly as pytest's import hook would.
 
     Best effort: returns False (writing nothing) when the cache directory is
-    unwritable or the source does not compile. The worker's own import then
-    reports any real error through the normal collection-error path.
+    unwritable, the source does not compile, or parsing/rewriting it emits any
+    warning (a ``SyntaxWarning``, pytest's "assertion is always true"). The
+    worker's own import then compiles that module under pytest's collection-
+    time warning capture, so the error or warning is reported exactly as it
+    would be without the prewarm; a child compiling it here would instead
+    print the warning raw to stderr and leave it out of the warnings summary.
     """
     pyc = cached_pyc_path(source)
     try:
         if not try_makedirs(pyc.parent):
             return False
-        source_stat, code = _rewrite_test(source, config)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            source_stat, code = _rewrite_test(source, config)
         return _write_pyc(state, code, source_stat, pyc)
     except Exception:
         return False
