@@ -1,0 +1,129 @@
+"""Meta-tests for the assertion-rewrite pyc prewarm in tests/conftest.py.
+
+The prewarm (``test_helpers.pyc_prewarm``) leans on pytest's private rewrite
+functions to write, ahead of the xdist workers, exactly the cached pyc each
+worker would otherwise write itself. These tests pin the two properties the
+speedup depends on: pytest accepts the prewarmed pyc as valid for the source
+(else every worker silently rewrites anyway and the prewarm is dead weight),
+and the code in it is what pytest's own rewrite produces.
+"""
+
+import sys
+from pathlib import Path
+
+import pytest
+from _pytest.assertion.rewrite import _read_pyc, _rewrite_test, assertstate_key
+from test_helpers.pyc_prewarm import (
+    PrewarmResult,
+    cached_pyc_path,
+    prewarm_files,
+    pyc_is_current,
+    rewrite_candidates,
+    rewrite_to_cache,
+)
+
+_TEST_SOURCE = "def test_something():\n    x = 1\n    assert x == 2, 'nope'\n"
+
+
+def _write_test_module(path: Path, body: str = _TEST_SOURCE) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body)
+    return path
+
+
+def test_rewrite_candidates_match_pytest_rewrite_rules(
+    tmp_path: Path, pytestconfig: pytest.Config
+) -> None:
+    tree = tmp_path / "suite"
+    expected = {
+        _write_test_module(tree / "test_a.py"),
+        _write_test_module(tree / "sub" / "b_test.py"),
+        _write_test_module(tree / "sub" / "conftest.py", "x = 1\n"),
+    }
+    helper = _write_test_module(tree / "helper.py", "x = 1\n")  # not a test module
+    _write_test_module(tree / "__pycache__" / "test_stale.py")  # cache dir
+    (tree / "notes.txt").write_text("not python")
+
+    assert set(rewrite_candidates(pytestconfig, [str(tree)])) == expected
+
+    # a file named on the command line is rewritten whatever its name, and a
+    # node id resolves to its file
+    assert rewrite_candidates(pytestconfig, [str(helper)]) == [helper]
+    assert rewrite_candidates(pytestconfig, [f"{tree / 'test_a.py'}::test_x"]) == [
+        tree / "test_a.py"
+    ]
+    assert rewrite_candidates(pytestconfig, [str(tree / "missing")]) == []
+
+
+def test_rewrite_to_cache_writes_pyc_pytest_accepts(
+    tmp_path: Path, pytestconfig: pytest.Config
+) -> None:
+    source = _write_test_module(tmp_path / "test_mod.py")
+    state = pytestconfig.stash[assertstate_key]
+    assert not pyc_is_current(source)
+
+    assert rewrite_to_cache(source, pytestconfig, state)
+
+    assert pyc_is_current(source)
+    cached = _read_pyc(source, cached_pyc_path(source))
+    assert cached is not None, "pytest rejected the prewarmed pyc"
+    _, expected = _rewrite_test(source, pytestconfig)
+    assert cached == expected
+
+
+def test_rewrite_to_cache_leaves_unparsable_source_to_the_worker(
+    tmp_path: Path, pytestconfig: pytest.Config
+) -> None:
+    source = _write_test_module(tmp_path / "test_bad.py", "def broken(:\n")
+    state = pytestconfig.stash[assertstate_key]
+
+    assert not rewrite_to_cache(source, pytestconfig, state)
+    assert not cached_pyc_path(source).exists()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="prewarm forks; Linux only")
+def test_prewarm_files_rewrites_only_stale_and_reports(
+    tmp_path: Path, pytestconfig: pytest.Config
+) -> None:
+    sources = [
+        _write_test_module(tmp_path / f"test_{i}.py", _TEST_SOURCE + f"y = {i}\n")
+        for i in range(5)
+    ]
+    state = pytestconfig.stash[assertstate_key]
+    assert rewrite_to_cache(sources[0], pytestconfig, state)
+
+    result = prewarm_files(sources, pytestconfig, processes=2)
+
+    assert result[:5] == (5, 4, 4, 2, 0)
+    assert result.seconds > 0 and result.skipped is None
+    for source in sources:
+        cached = _read_pyc(source, cached_pyc_path(source))
+        assert cached is not None, f"no valid pyc for {source.name}"
+        assert cached == _rewrite_test(source, pytestconfig)[1]
+
+    # everything cached now: nothing to do, no children forked
+    assert prewarm_files(sources, pytestconfig, processes=2)[:5] == (5, 0, 0, 0, 0)
+
+    # editing a source (size changes, so mtime granularity is irrelevant)
+    # invalidates only its own entry
+    sources[2].write_text(_TEST_SOURCE + "y = 'changed'\n")
+    assert prewarm_files(sources, pytestconfig, processes=2)[:5] == (5, 1, 1, 1, 0)
+    refreshed = _read_pyc(sources[2], cached_pyc_path(sources[2]))
+    assert refreshed is not None
+    assert refreshed == _rewrite_test(sources[2], pytestconfig)[1]
+
+
+def test_describe_reports_skip_reason_and_failures() -> None:
+    assert PrewarmResult.skip("no fork here").describe() == "skipped (no fork here)"
+    ran = PrewarmResult(
+        candidates=10,
+        stale=6,
+        rewritten=4,
+        processes=2,
+        failed_processes=1,
+        seconds=1.25,
+    )
+    assert ran.describe() == (
+        "10 test modules, 6 stale, 4 rewritten by 2 processes in 1.2s; "
+        "1 process(es) failed"
+    )
