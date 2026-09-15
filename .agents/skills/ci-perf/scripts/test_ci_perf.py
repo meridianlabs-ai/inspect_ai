@@ -515,12 +515,17 @@ def test_collection_retries_out_of_window_page(monkeypatch: pytest.MonkeyPatch) 
         created = "2000-01-01T00:00:00Z" if calls == 1 else until
         return {
             "workflow_runs": [
-                {"id": 1, "created_at": created, "run_started_at": created}
+                {
+                    "id": 1,
+                    "created_at": created,
+                    "run_started_at": created,
+                    "head_repository": {"full_name": "UKGovernmentBEIS/inspect_ai"},
+                }
             ]
         }
 
     monkeypatch.setattr(collector, "gh_api", fake_api)
-    assert collector.fetch_runs("owner/repo", 1)[0]["id"] == 1
+    assert collector.fetch_runs("owner/repo", 1).runs[0]["id"] == 1
     assert calls == 2
 
 
@@ -554,13 +559,175 @@ def test_collection_repeated_page_is_bounded(monkeypatch: pytest.MonkeyPatch) ->
         calls += 1
         until = parse_qs(urlparse(path).query)["created"][0].split("..")[1]
         return {
-            "workflow_runs": [{"id": 1, "created_at": until, "run_started_at": until}]
+            "workflow_runs": [
+                {
+                    "id": 1,
+                    "created_at": until,
+                    "run_started_at": until,
+                    "head_repository": {"full_name": "UKGovernmentBEIS/inspect_ai"},
+                }
+            ]
         }
 
     monkeypatch.setattr(collector, "gh_api", fake_api)
     with pytest.raises(RuntimeError, match="all three"):
         collector.fetch_runs("owner/repo", 2)
     assert calls == 6
+
+
+def _listing_page(path: str, pages: dict[int, list[dict[str, Any]]]) -> Any:
+    """Serve a fake run listing, stamping every run into the requested window."""
+    from urllib.parse import parse_qs, urlparse
+
+    query = parse_qs(urlparse(path).query)
+    until = query["created"][0].split("..")[1]
+    page = int(query["page"][0])
+    return {
+        "workflow_runs": [
+            {"run_started_at": until, **run, "created_at": until}
+            for run in pages.get(page, [])
+        ]
+    }
+
+
+def _run(run_id: int, head_repo: str | None) -> dict[str, Any]:
+    return {
+        "id": run_id,
+        "head_repository": {"full_name": head_repo} if head_repo else None,
+    }
+
+
+def test_limit_counts_trusted_runs_and_pages_past_untrusted_ones(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import collect_ci_data as collector
+
+    upstream, fork = "UKGovernmentBEIS/inspect_ai", "meridianlabs-ai/inspect_ai"
+    pages = {
+        1: [_run(1, "outsider/inspect_ai"), _run(2, upstream), _run(3, None)],
+        2: [_run(4, "another/inspect_ai"), _run(5, fork), _run(6, upstream)],
+        3: [_run(7, upstream), _run(8, fork)],
+    }
+    requested: list[int] = []
+
+    def fake_api(path: str) -> Any:
+        page = _listing_page(path, pages)
+        requested.append(len(page["workflow_runs"]))
+        return page
+
+    monkeypatch.setattr(collector, "gh_api", fake_api)
+    runs, excluded = collector.fetch_runs("owner/repo", 4)
+    assert sorted(run["id"] for run in runs) == [2, 5, 6, 7]
+    assert excluded == 3
+    assert len(requested) == 3
+    assert all(collector.is_trusted(run) for run in runs)
+    assert "WARNING" not in capsys.readouterr().err
+
+
+def test_truncation_keeps_newest_runs_and_counts_exclusions_inside_window(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import collect_ci_data as collector
+
+    upstream = "UKGovernmentBEIS/inspect_ai"
+
+    def at(run: dict[str, Any], day: int, hour: int) -> dict[str, Any]:
+        return {**run, "run_started_at": f"2026-09-{day:02d}T{hour:02d}:00:00Z"}
+
+    pages = {
+        1: [
+            at(_run(1, upstream), 9, 10),
+            at(_run(2, None), 9, 9),
+            at(_run(3, upstream), 9, 8),
+        ],
+        2: [
+            at(_run(4, upstream), 9, 7),
+            at(_run(5, "outsider/inspect_ai"), 9, 6),
+            at(_run(6, upstream), 9, 5),
+            # A >12h gap that lies entirely in the last page's overshoot.
+            at(_run(7, "outsider/inspect_ai"), 8, 4),
+        ],
+    }
+    monkeypatch.setattr(collector, "gh_api", lambda path: _listing_page(path, pages))
+    runs, excluded = collector.fetch_runs("owner/repo", 3)
+    assert [run["id"] for run in runs] == [1, 3, 4]
+    # Runs 5 to 7 are older than the oldest kept run, so they are outside the
+    # analyzed window: they must not inflate the exclusion count, and the gap
+    # before run 7 must not trigger a warning about a span nobody analyzes.
+    assert excluded == 1
+    assert "WARNING" not in capsys.readouterr().err
+
+
+def test_time_gap_inside_window_warns_at_full_listing_density(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import collect_ci_data as collector
+
+    upstream = "UKGovernmentBEIS/inspect_ai"
+    pages = {
+        1: [
+            {**_run(1, upstream), "run_started_at": "2026-09-09T10:00:00Z"},
+            {
+                **_run(2, "outsider/inspect_ai"),
+                "run_started_at": "2026-09-09T09:00:00Z",
+            },
+            {**_run(3, upstream), "run_started_at": "2026-09-07T08:00:00Z"},
+        ]
+    }
+    monkeypatch.setattr(collector, "gh_api", lambda path: _listing_page(path, pages))
+    runs, excluded = collector.fetch_runs("owner/repo", 2)
+    assert [run["id"] for run in runs] == [1, 3]
+    assert excluded == 1
+    err = capsys.readouterr().err
+    assert "WARNING" in err and "gap" in err
+
+
+def test_window_exhausted_before_limit_returns_what_was_found(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import collect_ci_data as collector
+
+    pages = {
+        1: [_run(1, "outsider/inspect_ai"), _run(2, "UKGovernmentBEIS/inspect_ai")]
+    }
+    monkeypatch.setattr(collector, "gh_api", lambda path: _listing_page(path, pages))
+    runs, excluded = collector.fetch_runs("owner/repo", 5)
+    assert [run["id"] for run in runs] == [2]
+    assert excluded == 1
+    assert "ran out after 1 trusted runs; 5 were requested" in capsys.readouterr().err
+
+
+def test_window_without_trusted_runs_fails_explicitly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import collect_ci_data as collector
+
+    pages = {1: [_run(1, "outsider/inspect_ai"), _run(2, None)]}
+    monkeypatch.setattr(collector, "gh_api", lambda path: _listing_page(path, pages))
+    with pytest.raises(RuntimeError, match="no completed PR runs from trusted"):
+        collector.fetch_runs("owner/repo", 5, days=2)
+
+
+def test_untrusted_only_page_is_not_stale_but_a_repeated_page_is(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import collect_ci_data as collector
+
+    untrusted = [_run(1, "outsider/inspect_ai"), _run(2, "another/inspect_ai")]
+    pages_seen: list[int] = []
+
+    def fake_api(path: str) -> Any:
+        from urllib.parse import parse_qs, urlparse
+
+        pages_seen.append(int(parse_qs(urlparse(path).query)["page"][0]))
+        return _listing_page(path, {1: untrusted, 2: untrusted})
+
+    monkeypatch.setattr(collector, "gh_api", fake_api)
+    with pytest.raises(RuntimeError, match="all three"):
+        collector.fetch_runs("owner/repo", 1)
+    # Each attempt advanced past the all-untrusted first page (not stale) and
+    # stopped on the second page because it repeated the first page's ids.
+    assert pages_seen == [1, 2] * 3
 
 
 def test_untrusted_head_repository_runs_are_dropped_before_any_fetch(
@@ -582,7 +749,7 @@ def test_untrusted_head_repository_runs_are_dropped_before_any_fetch(
             "head_repository": {"full_name": head_repo} if head_repo else None,
         }
 
-    fetched = [
+    listing = [
         run(1, "UKGovernmentBEIS/inspect_ai"),
         run(2, "outsider/inspect_ai"),
         run(3, "meridianlabs-ai/inspect_ai"),
@@ -592,6 +759,8 @@ def test_untrusted_head_repository_runs_are_dropped_before_any_fetch(
 
     def fake_api(path: str) -> Any:
         requested.append(path)
+        if "/actions/runs?" in path:
+            return _listing_page(path, {1: listing})
         run_id = int(path.split("/runs/")[1].split("/")[0])
         job = {
             "id": run_id * 10,
@@ -607,7 +776,6 @@ def test_untrusted_head_repository_runs_are_dropped_before_any_fetch(
         requested.append(path)
         return "1.50s call tests/a.py::test_a\n== 1 passed in 1.50s =="
 
-    monkeypatch.setattr(collector, "fetch_runs", lambda repo, limit, days: fetched)
     monkeypatch.setattr(collector, "gh_api", fake_api)
     monkeypatch.setattr(collector, "gh_api_text", fake_log)
     out, summary_out = tmp_path / "raw.json", tmp_path / "summary.json"
@@ -617,16 +785,29 @@ def test_untrusted_head_repository_runs_are_dropped_before_any_fetch(
     collector.main()
 
     result = json.loads(out.read_text())
-    assert [r["id"] for r in result["runs"]] == [1, 3]
+    assert sorted(r["id"] for r in result["runs"]) == [1, 3]
     assert result["run_count"] == 2
     assert result["excluded_untrusted_runs"] == 2
     assert set(result["pytest_durations"]) == {"1/test (3.11)", "3/test (3.11)"}
     assert not [p for p in requested if "/runs/2/" in p or "/jobs/20/" in p]
     assert not [p for p in requested if "/runs/4/" in p or "/jobs/40/" in p]
     assert "excluded 2 from untrusted head repositories" in capsys.readouterr().err
-    assert (
-        json.loads(summary_out.read_text())["workflow_wall_seconds"]["Build"]["n"] == 2
-    )
+    summary = json.loads(summary_out.read_text())
+    assert summary["workflow_wall_seconds"]["Build"]["n"] == 2
+    assert summary["window"]["excluded_untrusted_runs"] == 2
+
+
+def test_summary_records_window_span_and_untrusted_exclusions(
+    snapshot: dict[str, Any],
+) -> None:
+    result = summarize(snapshot)
+    assert result["window"]["hours"] == 2
+    assert result["window"]["excluded_untrusted_runs"] is None
+    snapshot["excluded_untrusted_runs"] = 110
+    result = summarize(snapshot)
+    assert result["window"]["excluded_untrusted_runs"] == 110
+    assert "(2.0h)" in render(result)
+    assert "untrusted head repositories: 110" in render(result)
 
 
 def test_invalid_distribution_timings_are_counted_and_excluded(
