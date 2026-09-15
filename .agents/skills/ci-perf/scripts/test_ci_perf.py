@@ -625,30 +625,61 @@ def test_limit_counts_trusted_runs_and_pages_past_untrusted_ones(
 
 
 def test_truncation_keeps_newest_runs_and_counts_exclusions_inside_window(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     import collect_ci_data as collector
 
     upstream = "UKGovernmentBEIS/inspect_ai"
 
-    def at(run: dict[str, Any], hour: int) -> dict[str, Any]:
-        return {**run, "run_started_at": f"2026-09-09T{hour:02d}:00:00Z"}
+    def at(run: dict[str, Any], day: int, hour: int) -> dict[str, Any]:
+        return {**run, "run_started_at": f"2026-09-{day:02d}T{hour:02d}:00:00Z"}
 
     pages = {
-        1: [at(_run(1, upstream), 10), at(_run(2, None), 9), at(_run(3, upstream), 8)],
+        1: [
+            at(_run(1, upstream), 9, 10),
+            at(_run(2, None), 9, 9),
+            at(_run(3, upstream), 9, 8),
+        ],
         2: [
-            at(_run(4, upstream), 7),
-            at(_run(5, "outsider/inspect_ai"), 6),
-            at(_run(6, upstream), 5),
-            at(_run(7, "outsider/inspect_ai"), 4),
+            at(_run(4, upstream), 9, 7),
+            at(_run(5, "outsider/inspect_ai"), 9, 6),
+            at(_run(6, upstream), 9, 5),
+            # A >12h gap that lies entirely in the last page's overshoot.
+            at(_run(7, "outsider/inspect_ai"), 8, 4),
         ],
     }
     monkeypatch.setattr(collector, "gh_api", lambda path: _listing_page(path, pages))
     runs, excluded = collector.fetch_runs("owner/repo", 3)
     assert [run["id"] for run in runs] == [1, 3, 4]
-    # Runs 5 and 7 are older than the oldest kept run, so they are outside the
-    # analyzed window and must not inflate the exclusion count.
+    # Runs 5 to 7 are older than the oldest kept run, so they are outside the
+    # analyzed window: they must not inflate the exclusion count, and the gap
+    # before run 7 must not trigger a warning about a span nobody analyzes.
     assert excluded == 1
+    assert "WARNING" not in capsys.readouterr().err
+
+
+def test_time_gap_inside_window_warns_at_full_listing_density(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import collect_ci_data as collector
+
+    upstream = "UKGovernmentBEIS/inspect_ai"
+    pages = {
+        1: [
+            {**_run(1, upstream), "run_started_at": "2026-09-09T10:00:00Z"},
+            {
+                **_run(2, "outsider/inspect_ai"),
+                "run_started_at": "2026-09-09T09:00:00Z",
+            },
+            {**_run(3, upstream), "run_started_at": "2026-09-07T08:00:00Z"},
+        ]
+    }
+    monkeypatch.setattr(collector, "gh_api", lambda path: _listing_page(path, pages))
+    runs, excluded = collector.fetch_runs("owner/repo", 2)
+    assert [run["id"] for run in runs] == [1, 3]
+    assert excluded == 1
+    err = capsys.readouterr().err
+    assert "WARNING" in err and "gap" in err
 
 
 def test_window_exhausted_before_limit_returns_what_was_found(

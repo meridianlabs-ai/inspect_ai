@@ -95,9 +95,10 @@ def fetch_runs(repo: str, limit: int, days: int = 7) -> TrustedRuns:
     account for roughly half of upstream's PR run volume, so filtering after a
     fetch cap would halve the analysis window. Paging continues until `limit`
     trusted runs are in hand or the listing runs out. The returned count of
-    excluded runs covers the untrusted runs inside the analyzed window (from
-    the oldest kept run onward), so it is comparable with the kept count
-    rather than inflated by whatever the last page overshot.
+    excluded runs and the time-gap check both cover the analyzed window (from
+    the oldest kept run onward, trusted and untrusted alike), so the count is
+    comparable with the kept count and a gap warning describes the window that
+    is actually analyzed rather than whatever the last page overshot.
 
     The unfiltered endpoint has served weeks-old cached pages during live runs.
     Fix the created-at range for all pages and validate every returned record
@@ -156,13 +157,14 @@ def fetch_runs(repo: str, limit: int, days: int = 7) -> TrustedRuns:
             fetched = sorted(
                 by_id.values(), key=lambda r: r["run_started_at"], reverse=True
             )
-            warn_on_time_gap(fetched)
             runs = [run for run in fetched if run["id"] in trusted][:limit]
             oldest = runs[-1]["run_started_at"]
-            excluded = sum(
-                run["id"] not in trusted and run["run_started_at"] >= oldest
-                for run in fetched
-            )
+            # The analyzed window is everything from the oldest kept run onward,
+            # including untrusted runs: they keep the gap check at full listing
+            # density, and the last page's overshoot is left out of both checks.
+            window = [run for run in fetched if run["run_started_at"] >= oldest]
+            warn_on_time_gap(window)
+            excluded = sum(run["id"] not in trusted for run in window)
             return TrustedRuns(runs, excluded)
         print(
             f"WARNING: stale or repeated CI page; retry {attempt + 1}/3",
