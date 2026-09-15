@@ -81,7 +81,18 @@ def test_rewrite_to_cache_leaves_unparsable_source_to_the_worker(
     assert not cached_pyc_path(source).exists()
 
 
+def _counts(result: PrewarmResult) -> PrewarmResult:
+    """The result with its wall time zeroed, so it compares by field name."""
+    assert result.seconds > 0 and result.skipped is None
+    return result._replace(seconds=0.0)
+
+
 @pytest.mark.skipif(sys.platform != "linux", reason="prewarm forks; Linux only")
+# Under xdist the worker carries an execnet thread, so Python 3.12+ warns on
+# fork(); the real controller path is kept warning-free by its thread guard.
+@pytest.mark.filterwarnings(
+    "ignore:This process .* is multi-threaded:DeprecationWarning"
+)
 def test_prewarm_files_rewrites_only_stale_and_reports(
     tmp_path: Path, pytestconfig: pytest.Config
 ) -> None:
@@ -94,20 +105,25 @@ def test_prewarm_files_rewrites_only_stale_and_reports(
 
     result = prewarm_files(sources, pytestconfig, processes=2)
 
-    assert result[:5] == (5, 4, 4, 2, 0)
-    assert result.seconds > 0 and result.skipped is None
+    assert _counts(result) == PrewarmResult(
+        candidates=5, stale=4, rewritten=4, processes=2, failed_processes=0, seconds=0.0
+    )
     for source in sources:
         cached = _read_pyc(source, cached_pyc_path(source))
         assert cached is not None, f"no valid pyc for {source.name}"
         assert cached == _rewrite_test(source, pytestconfig)[1]
 
     # everything cached now: nothing to do, no children forked
-    assert prewarm_files(sources, pytestconfig, processes=2)[:5] == (5, 0, 0, 0, 0)
+    assert _counts(prewarm_files(sources, pytestconfig, processes=2)) == PrewarmResult(
+        candidates=5, stale=0, rewritten=0, processes=0, failed_processes=0, seconds=0.0
+    )
 
     # editing a source (size changes, so mtime granularity is irrelevant)
     # invalidates only its own entry
     sources[2].write_text(_TEST_SOURCE + "y = 'changed'\n")
-    assert prewarm_files(sources, pytestconfig, processes=2)[:5] == (5, 1, 1, 1, 0)
+    assert _counts(prewarm_files(sources, pytestconfig, processes=2)) == PrewarmResult(
+        candidates=5, stale=1, rewritten=1, processes=1, failed_processes=0, seconds=0.0
+    )
     refreshed = _read_pyc(sources[2], cached_pyc_path(sources[2]))
     assert refreshed is not None
     assert refreshed == _rewrite_test(sources[2], pytestconfig)[1]
