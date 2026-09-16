@@ -209,6 +209,15 @@ jobs:
     # paths keep the full guard.
     # The guarded branch's own label.name clause is shadowed by the exception
     # today — kept as defense-in-depth should the exception ever be narrowed.
+    # Phase 2 of the credential-separation design moves the machine account
+    # to the GitHub App `meridian-marvin` (bot login meridian-marvin[bot]):
+    # the ci-perf publish and triage land jobs in meridianlabs-ai/actions
+    # apply `auto` as that bot once they mint app tokens (actions#120). The
+    # label path admits exactly that login past the `[bot]` skip; every other
+    # bot is still skipped, and the reusable workflow's trigger check still
+    # verifies the labeler (it trusts this login by name, agents#110). The
+    # rest of this stub's marvin/bot handling is converted in the stub
+    # rollout that follows the agents mint PR.
     # author_association filter (OWNER/MEMBER/COLLABORATOR) on the text
     # paths: a COST filter, not the gate. On a public repo anyone can comment
     # `@auto` on a PR; without this every such comment spun a runner. It is
@@ -225,7 +234,7 @@ jobs:
     if: |
       ( github.event_name == 'issues' && github.event.action == 'labeled'
         && github.event.label.name == 'auto'
-        && !endsWith(github.actor, '[bot]') ) ||
+        && ( !endsWith(github.actor, '[bot]') || github.actor == 'meridian-marvin[bot]' ) ) ||
       ( github.actor != 'i-am-marvin' && !endsWith(github.actor, '[bot]') && (
         ( github.event.action == 'edited'
           && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
