@@ -123,9 +123,11 @@ jobs:
         '@claude'
         }}
       base_branch: main
-      # Fork has no PR-open auto-review; post @review from the reusable
-      # post-step AFTER it applies the `auto` label (avoids the label/@review race).
-      request_review_after_open: "true"
+      # No automatic review of the PRs this agent opens: a review is asked for
+      # (an @review comment, or from an Orca workspace), never posted by the
+      # land job (decision: Ransom, 2026-09-16; was "true" while the fork
+      # substituted this for PR-open auto-review, which is off everywhere now).
+      request_review_after_open: "false"
       # Fork-specific guidance. Goes through the reusable workflow's
       # append_system_prompt input (a single composed --append-system-prompt),
       # NOT claude_args — a second --append-system-prompt would collide with the
@@ -266,9 +268,11 @@ jobs:
       trigger_phrase: "@auto"
       label_trigger: "auto"
       base_branch: main
-      # Fork has no PR-open auto-review; post @review from the reusable
-      # post-step AFTER it applies the `auto` label (avoids the label/@review race).
-      request_review_after_open: "true"
+      # No automatic review of the PRs this agent opens: a review is asked for
+      # (an @review comment, or from an Orca workspace), never posted by the
+      # land job (decision: Ransom, 2026-09-16; was "true" while the fork
+      # substituted this for PR-open auto-review, which is off everywhere now).
+      request_review_after_open: "false"
       # Same fork guidance as the `claude` job (reused via the YAML anchor).
       append_system_prompt: *fork_prompt
       branch_sync_append: *fork_branch_sync
