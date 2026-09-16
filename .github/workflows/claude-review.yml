@@ -1,28 +1,35 @@
-# Read-only reviewer for the meridianlabs-ai/inspect_ai fork. Independent of the
-# dev agent (claude.yml) — different trigger, lower permissions.
+# Read-only reviewer for the meridianlabs-ai/inspect_ai fork, on demand only:
+# comment @review on a PR (or on an External-labeled issue) to run it.
+# Independent of the dev agent (claude.yml) — different trigger, lower
+# permissions.
 #
-# On this fork the pull_request trigger below does NOT fire: GitHub resolves
-# pull_request-family workflows from the PR's branches (`main` / a feature
-# branch), which don't carry this file (it lives only on `meridian`). So
-# auto-review-on-open can't happen the usual way. Instead the dev agent posts a
-# top-level `@review` comment when it opens a PR, and `allowed_bots:
-# "claude[bot]"` below lets that bot-authored comment through (claude-code-action
-# rejects bot actors otherwise). Humans can also `@review` any PR manually. The
-# pull_request trigger is kept so this stub still works if copied to a normal
-# repo where the base branch carries the workflow.
+# Auto-review on PR open / ready_for_review is deliberately OFF (decision:
+# Ransom, 2026-09-16: no unasked CI reviews in any Meridian repo; reviews are
+# driven from Orca workspaces). The `pull_request` trigger this stub carried
+# never fired for PRs against `main` (GitHub resolves pull_request-family
+# workflows from the PR's branches, and `main` is a pristine mirror without
+# this file), but it did fire for PRs against `meridian` itself — #501 was
+# reviewed unasked on open, 2026-09-16 — so it is removed together with its
+# `if` clause. The dev agent's `request_review_after_open` in claude.yml is
+# off for the same reason. The template in meridianlabs-ai/agents
+# examples/claude-review-stub.yml keeps the trigger as a commented-out block;
+# copy it back from there to restore auto-review.
+#
+# `allowed_bots: "claude[bot]"` below stays so a bot-authored top-level
+# `@review` comment still reaches the reviewer (claude-code-action rejects
+# bot actors otherwise); humans can `@review` any PR.
 
 name: Review
 
 on:
-  pull_request:
-    types: [opened, reopened, ready_for_review]
   issue_comment:
     types: [created]
 
 jobs:
   review:
-    # Run on PR events, or on a PR comment containing @review. `@review` does
-    # not collide with the dev agent's `@claude` trigger.
+    # Run on a PR comment containing @review, or on an @review comment on an
+    # External-labeled issue. `@review` does not collide with the dev agent's
+    # `@claude` trigger.
     # The comment gates exclude the reviewer's own comments — ones that
     # backtick the trigger token or carry the claude-review-comment marker
     # the reusable prompts the reviewer to stamp. Without this, a reviewer
@@ -32,7 +39,6 @@ jobs:
     # observed on agents#20/#36). Keep in sync with
     # agents:examples/claude-review-stub.yml.
     if: >
-      github.event_name == 'pull_request' ||
       (github.event.issue.pull_request != null &&
        contains(github.event.comment.body, '@review') &&
        !contains(github.event.comment.body, '`@review`') &&
@@ -58,8 +64,8 @@ jobs:
       id-token: write
       actions: read
     with:
-      # Honor the dev agent's @review comment posted when it opens a PR (it runs
-      # as claude[bot]; the action rejects bot actors unless listed here). The
+      # Honor a dev-agent @review comment (it runs as claude[bot]; the action
+      # rejects bot actors unless listed here). The
       # reviewer is read-only, so this only ever starts a review — never a write.
       allowed_bots: "claude[bot]"
       # Fork-specific reviewer guidance. On this fork only top-level PR comments
