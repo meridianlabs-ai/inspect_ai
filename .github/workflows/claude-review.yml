@@ -1,7 +1,8 @@
 # Read-only reviewer for the meridianlabs-ai/inspect_ai fork, on demand only:
 # comment @review on a PR (or on an External-labeled issue) to run it.
-# Independent of the dev agent (claude.yml) — different trigger, lower
-# permissions.
+# Release-please PRs are skipped, gated in the reusable workflow.
+# Independent of the dev agent (claude.yml) — different trigger, different
+# (lower) permissions.
 #
 # Auto-review on PR open / ready_for_review is deliberately OFF (decision:
 # Ransom, 2026-09-16: no unasked CI reviews in any Meridian repo; reviews are
@@ -15,9 +16,18 @@
 # examples/claude-review-stub.yml keeps the trigger as a commented-out block;
 # copy it back from there to restore auto-review.
 #
+# Caveat: PRs from forks — a maintainer can review a fork PR with an @review
+# comment, the same trust decision made explicitly — the reusable's trig
+# check enforces it (fork-head @review requires a commenter with write
+# access, checked before checkout), and the run then treats the fork's tree
+# as UNTRUSTED code: no runner-side provisioning, execution only inside the
+# reviewer's OS-level sandbox, project Claude Code configuration stripped
+# from the checkout, and the Claude engine even if the PR is labeled
+# engine:codex (agents#59).
+#
 # `allowed_bots: "claude[bot]"` below stays so a bot-authored top-level
 # `@review` comment still reaches the reviewer (claude-code-action rejects
-# bot actors otherwise); humans can `@review` any PR.
+# bot actors otherwise); write-access humans can `@review` any PR.
 
 name: Review
 
@@ -27,33 +37,71 @@ on:
 
 jobs:
   review:
-    # Run on a PR comment containing @review, or on an @review comment on an
-    # External-labeled issue. `@review` does not collide with the dev agent's
-    # `@claude` trigger.
-    # The comment gates exclude the reviewer's own comments — ones that
-    # backtick the trigger token or carry the claude-review-comment marker
-    # the reusable prompts the reviewer to stamp. Without this, a reviewer
-    # summary mentioning the token spawns a run whose newest-wins
-    # concurrency cancels the run that posted the summary before the
-    # verdict marker posts, and the loop never engages (agents#37;
-    # observed on agents#20/#36). Keep in sync with
-    # agents:examples/claude-review-stub.yml.
+    # Run on a PR comment containing @review (works on drafts, and on a fork
+    # PR when the commenter has write access — see the header, sandboxed
+    # path), or on an @review comment on an External-labeled issue. `@review`
+    # does not collide with the dev agent's `@claude` trigger.
+    # The two comment gates exclude the reviewer's own comments: reviewing
+    # files that contain the trigger token makes it routine for the review
+    # summary's prose to mention that token, which passes this cheap
+    # substring gate and spawns a Review run whose newest-wins concurrency
+    # CANCELS the very run that posted the summary, before it posts the
+    # verdict marker; the loop then never engages (observed: agents#36
+    # round 2, 2026-08-31 — a backticked mention; agents#20 round 2,
+    # 2026-08-27 — a bare mention followed by '/'). The reusable's
+    # word-boundary trig gate rejects both shapes, so the spawned run only
+    # ever no-ops — but its concurrency entry does the damage the moment
+    # the job starts, so it must not start at all. Hence two exclusions:
+    # a backticked token (mirrors the word-boundary gate's deliberate
+    # blindness to backticked mentions; deterministic) and the
+    # claude-review-comment marker the reviewer is prompted to stamp on
+    # every top-level comment it posts (covers bare non-word-boundary
+    # mentions like agents#20's; prompt-driven). Cost: a comment carrying
+    # either alongside a genuine bare trigger is wrongly skipped — rare,
+    # recoverable by re-commenting the bare token alone.
+    # author_association filter (OWNER/MEMBER/COLLABORATOR) on both comment
+    # paths: a COST filter, not the gate (the shape the dev stub's
+    # `claude-auto` job uses). On a public repo anyone can comment `@review`;
+    # without this every such comment spun a runner (Claude Security
+    # 4085111). It is not authoritative — CONTRIBUTOR is anyone with a
+    # merged commit, and whether org members show as MEMBER depends on org
+    # settings — so the reusable workflow's trig check (a fail-closed
+    # permission lookup on the actor, before any write or checkout) remains
+    # the authority. A writer whose association is reported looser than
+    # expected is dropped here silently — trig would have AUTHORIZED them,
+    # so this filter is what they hit, and there is no fallback path: a
+    # collaborator re-triggers. The loops' hand-back passes: their land jobs
+    # post `@review` as the machine account, a User with write access. A
+    # Bot commenter (the payload's user.type — a GitHub App, `[bot]` suffix
+    # or not) passes too: its association is NONE whatever it may do, and
+    # the reusable's `allowed_bots` input is what decides a bot's request
+    # (its trig step refuses every bot not named there), so the filter must
+    # not drop an allow-listed bot first. Bounded cost: only Apps installed
+    # on the repo can comment as a Bot, and github-actions[bot] triggers no
+    # workflow. Phase 2's App identity passes the same way and is admitted
+    # by the reusable's TRUSTED_LOGINS.
     if: >
       (github.event.issue.pull_request != null &&
+       (contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) ||
+        github.event.comment.user.type == 'Bot') &&
        contains(github.event.comment.body, '@review') &&
        !contains(github.event.comment.body, '`@review`') &&
        !contains(github.event.comment.body, '<!-- claude-review-comment -->')) ||
       (github.event.issue.pull_request == null &&
        contains(github.event.issue.labels.*.name, 'External') &&
+       (contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) ||
+        github.event.comment.user.type == 'Bot') &&
        contains(github.event.comment.body, '@review') &&
        !contains(github.event.comment.body, '`@review`') &&
        !contains(github.event.comment.body, '<!-- claude-review-comment -->'))
     uses: meridianlabs-ai/agents/.github/workflows/claude-review.yml@main
-    # Machine-account PAT for the deterministic ack/stage steps only (eyes
-    # reaction + board stage); never handed to the review agent, which stays
-    # read-only. Absent -> those steps no-op.
+    # The machine account's secrets, for the gate's deterministic ack/stage
+    # steps (eyes reaction + board stage) and the land job's posts; never
+    # handed to the review agent, which stays read-only. Absent -> the gate
+    # steps no-op and the land job posts with the job token.
     secrets:
-      MARVIN_TOKEN: ${{ secrets.MARVIN_TOKEN }}
+      MARVIN_APP_CLIENT_ID: ${{ secrets.MARVIN_APP_CLIENT_ID }}
+      MARVIN_APP_PRIVATE_KEY: ${{ secrets.MARVIN_APP_PRIVATE_KEY }}
       # codex engine (design/codex-engine.md in the agents repo):
       # consumed only on items labeled engine:codex; optional.
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
