@@ -1,3 +1,7 @@
+## Unreleased
+
+- Checkpointing: A pre-existing entry planted at the in-sandbox work area (`/root/.cache/inspect`) now fails checkpoint setup and restore with a clear error instead of being reused.
+
 ## 0.3.265 (17 September 2026)
 
 - Agent Bridge: Bridged host tools are no longer denied under an approval policy when the sandboxed agent presents them to its model under a different name.
