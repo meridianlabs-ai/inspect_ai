@@ -6,9 +6,21 @@ from __future__ import annotations
 import argparse
 import json
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 from statistics import median
 from typing import Any
+
+
+def window_hours(start: str, end: str) -> float:
+    """Span between two ISO-8601 run start timestamps, in hours.
+
+    A fixed run count covers a variable stretch of time, so a summary
+    compared against a retained one needs the span to weight it: a nine-hour
+    window and a two-day window are not comparable samples.
+    """
+    parsed = [datetime.fromisoformat(ts.replace("Z", "+00:00")) for ts in (start, end)]
+    return round((parsed[1] - parsed[0]).total_seconds() / 3600, 2)
 
 
 def stats(values: list[float]) -> dict[str, float | int] | None:
@@ -108,7 +120,14 @@ def summarize(snapshot: dict[str, Any]) -> dict[str, Any]:
         "schema_version": 1,
         "generated_at": snapshot["generated_at"],
         "repo": snapshot["repo"],
-        "window": {"start": starts[0], "end": starts[-1], "runs": len(runs)},
+        "window": {
+            "start": starts[0],
+            "end": starts[-1],
+            "hours": window_hours(starts[0], starts[-1]),
+            "runs": len(runs),
+            # None for raw snapshots that predate the head-repository filter.
+            "excluded_untrusted_runs": snapshot.get("excluded_untrusted_runs"),
+        },
         "conclusions": dict(conclusions),
         "runner_minutes": None if unavailable_jobs else round(runner_seconds / 60, 2),
         "unavailable_job_timings": unavailable_jobs,
@@ -148,7 +167,7 @@ def render(summary: dict[str, Any]) -> str:
         "# CI performance measurements",
         "",
         f"Source: {summary['repo']}. Collected: {summary['generated_at']}.",
-        f"Window: {summary['window']['start']} to {summary['window']['end']}, {summary['window']['runs']} runs.",
+        f"Window: {summary['window']['start']} to {summary['window']['end']} ({summary['window']['hours']}h), {summary['window']['runs']} runs. Runs excluded from untrusted head repositories: {summary['window']['excluded_untrusted_runs']}.",
         f"Runner minutes: {summary['runner_minutes']}. Cancelled-run runner minutes: {summary['cancelled_runner_minutes']}. Missing or invalid job timings: {summary['unavailable_job_timings']}. None means unavailable, not zero.",
         "",
         f"Excluded missing or inverted observations: workflow wall {summary['excluded_timings']['workflow_wall']}, job wait {summary['excluded_timings']['job_wait']}, steps {summary['excluded_timings']['step']}.",
