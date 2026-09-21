@@ -89,9 +89,10 @@ re-measure the previous snapshot's runs; `window.new_runs`,
 `new_runs` is small, say so and treat window-over-window deltas as noise
 rather than a flat trend. Older runs add samples the previous snapshot lacked
 but may appear in an earlier retained summary, so check before counting them
-as independent. Retained summaries without `window.hours` predate
-these fields; their overlap is unknown, not zero. Do not present overlapping
-windows as independent samples or infer a weekly rate from incompatible windows.
+as independent. Retained summaries lacking the `window.previous_end` key
+predate these fields; their overlap is unknown, not zero. Do not present
+overlapping windows as independent samples or infer a weekly rate from
+incompatible windows.
 
 - Separate queue from execution. Wait-from-run-start includes dependencies.
   Read the analyzed checkout's `.github/workflows/*.yml` and subtract predecessor
