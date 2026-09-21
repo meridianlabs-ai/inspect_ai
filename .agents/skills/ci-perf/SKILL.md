@@ -43,9 +43,11 @@ python .agents/skills/ci-perf/scripts/collect_ci_data.py \
   --previous-summaries "$CI_PERF_OUTPUT_DIR/previous-summaries.json"
 ```
 
-`--previous-summaries` records the latest retained window end in the snapshot
-so `summary.json` can split the window into `window.new_runs` (started after
-that end) and `window.overlap_runs` (started at or before it); without it both
+`--previous-summaries` records the latest retained window's bounds in the
+snapshot so `summary.json` can split the window into `window.new_runs`
+(started after that window's end), `window.overlap_runs` (started within its
+bounds), and `window.older_runs` (started before its start, so never in that
+snapshot; a larger `--limit` or `--days` reaches them); without it all three
 are `null`, not zero. A run still in flight at the previous collection was not
 in that snapshot but still counts as overlap, so read `overlap_runs` as an
 upper bound on shared samples, not an exact count. `--since <ISO-8601 UTC>`
@@ -81,10 +83,13 @@ job across windows. Record window bounds, sample counts, overlap, and changes
 to workflow definitions. A 200-run window can cover much less than two days:
 read `window.hours` rather than assuming a span. The fetch cap binds backwards
 from collection time, so after a quiet stretch upstream most of a window can
-re-measure the previous snapshot's runs; `window.new_runs` and
-`window.overlap_runs` (against `window.previous_end`) say how much. When
+re-measure the previous snapshot's runs; `window.new_runs`,
+`window.overlap_runs`, and `window.older_runs` (against
+`window.previous_start` and `window.previous_end`) say how much. When
 `new_runs` is small, say so and treat window-over-window deltas as noise
-rather than a flat trend. Retained summaries without `window.hours` predate
+rather than a flat trend. Older runs add samples the previous snapshot lacked
+but may appear in an earlier retained summary, so check before counting them
+as independent. Retained summaries without `window.hours` predate
 these fields; their overlap is unknown, not zero. Do not present overlapping
 windows as independent samples or infer a weekly rate from incompatible windows.
 

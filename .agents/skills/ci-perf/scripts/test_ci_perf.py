@@ -12,7 +12,7 @@ import publish_ci_findings as publisher
 import pytest
 from collect_ci_data import parse_summary
 from publish_ci_findings import publish, validate_findings
-from summarize_ci_data import previous_window_end, render, stats, summarize
+from summarize_ci_data import PreviousWindow, previous_window, render, stats, summarize
 
 
 @pytest.fixture
@@ -70,37 +70,73 @@ def test_summary_preserves_samples_and_separates_cancelled(
 def test_window_records_span_and_overlap_with_previous_window(
     snapshot: dict[str, Any],
 ) -> None:
+    def split(window: dict[str, Any]) -> tuple[int, int, int]:
+        parts = (window["new_runs"], window["overlap_runs"], window["older_runs"])
+        assert sum(parts) == window["runs"]
+        return parts
+
     window = summarize(snapshot)["window"]
     assert window["hours"] == 2
-    assert window["previous_end"] is None
+    assert window["previous_start"] is None and window["previous_end"] is None
     assert window["new_runs"] is None and window["overlap_runs"] is None
+    assert window["older_runs"] is None
     assert "overlap with earlier summaries is unknown" in render(summarize(snapshot))
 
-    # Runs at 00:00 and 01:00 were available to a window ending 01:00; the
-    # run at exactly the previous end is shared, not new.
+    # Runs at 00:00 and 01:00 were available to a window 00:00 to 01:00; the
+    # runs at exactly its bounds are shared, not new or older.
+    snapshot["previous_window_start"] = "2026-09-09T00:00:00Z"
     snapshot["previous_window_end"] = "2026-09-09T01:00:00Z"
     result = summarize(snapshot)
     window = result["window"]
-    assert window["previous_end"] == "2026-09-09T01:00:00Z"
-    assert (window["new_runs"], window["overlap_runs"]) == (1, 2)
-    assert window["new_runs"] + window["overlap_runs"] == window["runs"]
-    assert "1 runs started after it and 2 started at or before it" in render(result)
+    assert (window["previous_start"], window["previous_end"]) == (
+        "2026-09-09T00:00:00Z",
+        "2026-09-09T01:00:00Z",
+    )
+    assert split(window) == (1, 2, 0)
+    assert (
+        "Previous window 2026-09-09T00:00:00Z to 2026-09-09T01:00:00Z: 1 runs "
+        "started after it, 2 started within it, and 0 started before it"
+    ) in render(result)
+
+    # A window that pages further back than the previous one reaches runs the
+    # previous snapshot never contained; they are older, not overlap.
+    snapshot["previous_window_start"] = "2026-09-09T00:30:00Z"
+    assert split(summarize(snapshot)["window"]) == (1, 1, 1)
 
     snapshot["previous_window_end"] = "2026-09-09T12:00:00Z"
-    window = summarize(snapshot)["window"]
-    assert (window["new_runs"], window["overlap_runs"]) == (0, 3)
+    assert split(summarize(snapshot)["window"]) == (0, 2, 1)
+
+    # One bound without the other cannot be split against, so it is rejected
+    # rather than read as an open-ended window.
+    del snapshot["previous_window_start"]
+    with pytest.raises(ValueError, match="only one previous window bound"):
+        summarize(snapshot)
+    snapshot["previous_window_start"] = "2026-09-09T13:00:00Z"
+    with pytest.raises(ValueError, match="is after its end"):
+        summarize(snapshot)
 
 
-def test_previous_window_end_is_latest_for_the_same_repo() -> None:
+def test_previous_window_is_the_latest_for_the_same_repo() -> None:
     repo = "UKGovernmentBEIS/inspect_ai"
-    assert previous_window_end([], repo) is None
+    assert previous_window([], repo) is None
     summaries = [
-        {"repo": repo, "window": {"end": "2026-09-13T00:00:00Z"}},
-        {"repo": repo, "window": {"end": "2026-09-11T00:00:00Z"}},
-        {"repo": "other/repo", "window": {"end": "2026-09-20T00:00:00Z"}},
+        {
+            "repo": repo,
+            "window": {"start": "2026-09-12T00:00:00Z", "end": "2026-09-13T00:00:00Z"},
+        },
+        {
+            "repo": repo,
+            "window": {"start": "2026-09-09T00:00:00Z", "end": "2026-09-11T00:00:00Z"},
+        },
+        {
+            "repo": "other/repo",
+            "window": {"start": "2026-09-19T00:00:00Z", "end": "2026-09-20T00:00:00Z"},
+        },
     ]
-    assert previous_window_end(summaries, repo) == "2026-09-13T00:00:00Z"
-    assert previous_window_end(summaries[2:], repo) is None
+    assert previous_window(summaries, repo) == PreviousWindow(
+        "2026-09-12T00:00:00Z", "2026-09-13T00:00:00Z"
+    )
+    assert previous_window(summaries[2:], repo) is None
 
 
 def test_render_reads_summaries_without_window_fields(
@@ -663,7 +699,7 @@ def test_since_tightens_created_range_without_loosening_validation(
         collector.fetch_runs("owner/repo", 1, since=since.replace(tzinfo=None))
 
 
-def test_collector_records_previous_window_end(
+def test_collector_records_previous_window_bounds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     import collect_ci_data as collector
@@ -694,8 +730,20 @@ def test_collector_records_previous_window_end(
     previous.write_text(
         json.dumps(
             [
-                {"repo": repo, "window": {"end": "2026-09-16T00:00:00Z"}},
-                {"repo": repo, "window": {"end": "2026-09-18T21:13:35Z"}},
+                {
+                    "repo": repo,
+                    "window": {
+                        "start": "2026-09-14T00:00:00Z",
+                        "end": "2026-09-16T00:00:00Z",
+                    },
+                },
+                {
+                    "repo": repo,
+                    "window": {
+                        "start": "2026-09-18T00:52:21Z",
+                        "end": "2026-09-18T21:13:35Z",
+                    },
+                },
             ]
         )
     )
@@ -721,21 +769,34 @@ def test_collector_records_previous_window_end(
         collector.main()
     assert not out.exists()
 
+    # The window pages back past the previous window's start (a larger --limit
+    # would do this), so the oldest run is older, not overlap.
     fetched.extend(
         [
             run(1, "2026-09-19T13:01:25Z"),
             run(2, "2026-09-18T21:13:35Z"),
             run(3, "2026-09-18T00:52:21Z"),
+            run(4, "2026-09-17T23:00:00Z"),
         ]
     )
     collector.main()
     assert since_args[-1].isoformat() == "2026-09-18T21:13:35+00:00"
-    assert json.loads(out.read_text())["previous_window_end"] == "2026-09-18T21:13:35Z"
-    window = json.loads(summary_out.read_text())["window"]
-    assert (window["new_runs"], window["overlap_runs"], window["runs"]) == (1, 2, 3)
-    assert (
-        "1 of 3 runs started after the previous window end" in capsys.readouterr().err
+    raw = json.loads(out.read_text())
+    assert (raw["previous_window_start"], raw["previous_window_end"]) == (
+        "2026-09-18T00:52:21Z",
+        "2026-09-18T21:13:35Z",
     )
+    window = json.loads(summary_out.read_text())["window"]
+    assert (
+        window["new_runs"],
+        window["overlap_runs"],
+        window["older_runs"],
+        window["runs"],
+    ) == (1, 2, 1, 4)
+    assert (
+        "1 of 4 runs started after the previous window end 2026-09-18T21:13:35Z; "
+        "2 overlap it and 1 predate its start 2026-09-18T00:52:21Z"
+    ) in capsys.readouterr().err
 
     # Naive, empty, and future timestamps and a missing history file are all
     # rejected before any fetch.
@@ -756,7 +817,8 @@ def test_collector_records_previous_window_end(
     previous.write_text("[]")
     monkeypatch.setattr(sys, "argv", argv[:-2])
     collector.main()
-    assert json.loads(out.read_text())["previous_window_end"] is None
+    raw = json.loads(out.read_text())
+    assert raw["previous_window_start"] is None and raw["previous_window_end"] is None
     assert json.loads(summary_out.read_text())["window"]["new_runs"] is None
 
 

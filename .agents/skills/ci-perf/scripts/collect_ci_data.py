@@ -24,7 +24,7 @@ from typing import Any, NamedTuple
 from urllib.parse import urlencode
 
 from summarize_ci_data import parse_ts as parse_required_ts
-from summarize_ci_data import previous_window_end, summarize, window_overlap
+from summarize_ci_data import previous_window, summarize, window_overlap
 
 # Upstream is public, so any fork's PR triggers CI there and its logs, step
 # names and run titles carry text the PR author wrote. Only these two head
@@ -349,7 +349,8 @@ def main() -> None:
         "--previous-summaries",
         type=Path,
         help="retained summaries JSON list (previous-summaries.json); records "
-        "the latest window end so the summary can count new vs overlapping runs",
+        "the latest window's bounds so the summary can count new, overlapping, "
+        "and older runs against it",
     )
     parser.add_argument(
         "--durations-runs",
@@ -370,14 +371,14 @@ def main() -> None:
         )
     if args.since is not None and args.since >= datetime.now(timezone.utc):
         parser.error(f"--since {args.since.isoformat()} is not in the past")
-    previous_end = None
+    previous = None
     if args.previous_summaries is not None:
         if not args.previous_summaries.is_file():
             parser.error(
                 f"--previous-summaries {args.previous_summaries} does not exist; "
                 "run publish_ci_findings.py --read-history first"
             )
-        previous_end = previous_window_end(
+        previous = previous_window(
             json.loads(args.previous_summaries.read_text()), args.repo
         )
 
@@ -393,11 +394,12 @@ def main() -> None:
         "untrusted head repositories; fetching jobs...",
         file=sys.stderr,
     )
-    if previous_end is not None:
-        overlap = window_overlap(raw_runs, previous_end)
+    if previous is not None:
+        overlap = window_overlap(raw_runs, previous)
         print(
             f"{overlap.new_runs} of {len(raw_runs)} runs started after the previous "
-            f"window end {previous_end}; {overlap.overlap_runs} overlap it",
+            f"window end {previous.end}; {overlap.overlap_runs} overlap it and "
+            f"{overlap.older_runs} predate its start {previous.start}",
             file=sys.stderr,
         )
 
@@ -431,9 +433,10 @@ def main() -> None:
         "repo": args.repo,
         "run_count": len(runs),
         "excluded_untrusted_runs": excluded_untrusted,
-        # None when no retained history was supplied; the summary then reports
-        # new and overlapping run counts as unknown rather than zero.
-        "previous_window_end": previous_end,
+        # Both None when no retained history was supplied; the summary then
+        # reports new, overlapping, and older run counts as unknown, not zero.
+        "previous_window_start": previous.start if previous is not None else None,
+        "previous_window_end": previous.end if previous is not None else None,
         "runs": runs,
         "pytest_durations": log_data.durations,
         "pytest_summaries": log_data.summaries,
