@@ -35,12 +35,26 @@ For an interactive run, create an output directory outside the repository:
 
 ```bash
 export CI_PERF_OUTPUT_DIR="$(mktemp -d /tmp/ci-perf.XXXXXX)"
-python .agents/skills/ci-perf/scripts/collect_ci_data.py \
-  --out "$CI_PERF_OUTPUT_DIR/raw.json" \
-  --summary-out "$CI_PERF_OUTPUT_DIR/summary.json"
 python .agents/skills/ci-perf/scripts/publish_ci_findings.py \
   --directory "$CI_PERF_OUTPUT_DIR" --read-history
+python .agents/skills/ci-perf/scripts/collect_ci_data.py \
+  --out "$CI_PERF_OUTPUT_DIR/raw.json" \
+  --summary-out "$CI_PERF_OUTPUT_DIR/summary.json" \
+  --previous-summaries "$CI_PERF_OUTPUT_DIR/previous-summaries.json"
 ```
+
+`--previous-summaries` records the latest retained window end in the snapshot
+so `summary.json` can split the window into `window.new_runs` (started after
+that end) and `window.overlap_runs` (already available to the previous
+snapshot); without it both are `null`, not zero. `--since <ISO-8601 UTC>`
+tightens the lower bound of the fetched creation-time range, so a run can page
+back only as far as the previous snapshot reached; `--limit` and `--days` still
+cap the window, and the per-record range validation still applies. Because the
+listing is filtered on creation time and completed status, a run created before
+`--since` but still running at the previous collection belongs to neither
+window: when chaining windows, pass a value earlier than the previous end by at
+least the longest run time, and expect a failed collection when no trusted run
+was created in that span.
 
 The scheduled workflow performs collection and history loading before analysis.
 Read those outputs instead of collecting again. Keep the summary produced by
@@ -62,9 +76,15 @@ interpret missing observations as zero or a speedup.
 Read the current snapshot, `previous-summaries.json`, and, if needed, the
 one-time `design/ci-perf/baseline.json`. Compare the same workflow and matrix
 job across windows. Record window bounds, sample counts, overlap, and changes
-to workflow definitions. A 200-run window can cover much less than two days.
-Do not present overlapping windows as independent samples or infer a weekly
-rate from incompatible windows.
+to workflow definitions. A 200-run window can cover much less than two days:
+read `window.hours` rather than assuming a span. The fetch cap binds backwards
+from collection time, so after a quiet stretch upstream most of a window can
+re-measure the previous snapshot's runs; `window.new_runs` and
+`window.overlap_runs` (against `window.previous_end`) say how much. When
+`new_runs` is small, say so and treat window-over-window deltas as noise
+rather than a flat trend. Retained summaries without `window.hours` predate
+these fields; their overlap is unknown, not zero. Do not present overlapping
+windows as independent samples or infer a weekly rate from incompatible windows.
 
 - Separate queue from execution. Wait-from-run-start includes dependencies.
   Read the analyzed checkout's `.github/workflows/*.yml` and subtract predecessor

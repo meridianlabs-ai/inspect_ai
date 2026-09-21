@@ -6,9 +6,55 @@ from __future__ import annotations
 import argparse
 import json
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 from statistics import median
-from typing import Any
+from typing import Any, NamedTuple
+
+
+def parse_ts(ts: str) -> datetime:
+    return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+
+
+def window_hours(start: str, end: str) -> float:
+    """Span between two ISO-8601 run start timestamps, in hours.
+
+    A fixed run count covers a variable stretch of time, so two summaries
+    cannot be weighed against each other without their spans.
+    """
+    return round((parse_ts(end) - parse_ts(start)).total_seconds() / 3600, 2)
+
+
+def previous_window_end(summaries: list[dict[str, Any]], repo: str) -> str | None:
+    """Latest `window.end` among retained summaries of `repo`, or None.
+
+    The tracking issue stores summaries in posting order, but a re-run or a
+    manual dispatch can post an older window after a newer one, so take the
+    maximum rather than the last entry. A dispatch against another repository
+    shares the tracking issue, so its windows are ignored.
+    """
+    ends = [s["window"]["end"] for s in summaries if s.get("repo") == repo]
+    return max(ends, key=parse_ts) if ends else None
+
+
+class WindowOverlap(NamedTuple):
+    new_runs: int
+    overlap_runs: int
+
+
+def window_overlap(runs: list[dict[str, Any]], previous_end: str) -> WindowOverlap:
+    """Split runs into those after the previous window's end and the rest.
+
+    A run that started at or before the previous window's end was already
+    available to the previous snapshot, so its timings re-measure the same
+    sample. Only runs that started later add information. The fetch cap binds
+    backwards from collection time, so a quiet upstream makes most of a fixed
+    run count overlap the previous window while every other count in the
+    summary looks normal.
+    """
+    cutoff = parse_ts(previous_end)
+    new = sum(parse_ts(run["run_started_at"]) > cutoff for run in runs)
+    return WindowOverlap(new, len(runs) - new)
 
 
 def stats(values: list[float]) -> dict[str, float | int] | None:
@@ -34,6 +80,9 @@ def summarize(snapshot: dict[str, Any]) -> dict[str, Any]:
     Wait-from-run-start includes dependency time, so it is not labeled queue
     time. Workflow wall uses the collector's updated_at proxy, not push time.
     Duration samples include only tests printed by pytest's slow-tail filter.
+    When the snapshot records `previous_window_end`, the window carries the
+    split between runs the previous snapshot could already have analyzed and
+    runs that are new; otherwise those counts are None, not zero.
     """
     runs = snapshot["runs"]
     if not runs:
@@ -104,11 +153,22 @@ def summarize(snapshot: dict[str, Any]) -> dict[str, Any]:
         if (value := stats(samples)) is not None
     }
     starts = sorted(run["run_started_at"] for run in runs)
+    previous_end = snapshot.get("previous_window_end")
+    overlap = window_overlap(runs, previous_end) if previous_end is not None else None
     return {
         "schema_version": 1,
         "generated_at": snapshot["generated_at"],
         "repo": snapshot["repo"],
-        "window": {"start": starts[0], "end": starts[-1], "runs": len(runs)},
+        "window": {
+            "start": starts[0],
+            "end": starts[-1],
+            "hours": window_hours(starts[0], starts[-1]),
+            "runs": len(runs),
+            # None means no previous window was recorded, not zero overlap.
+            "previous_end": previous_end,
+            "new_runs": overlap.new_runs if overlap is not None else None,
+            "overlap_runs": overlap.overlap_runs if overlap is not None else None,
+        },
         "conclusions": dict(conclusions),
         "runner_minutes": None if unavailable_jobs else round(runner_seconds / 60, 2),
         "unavailable_job_timings": unavailable_jobs,
@@ -142,13 +202,29 @@ def summarize(snapshot: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def overlap_line(window: dict[str, Any]) -> str:
+    """State how much of the window the previous snapshot already covered.
+
+    Summaries retained before these fields existed lack them entirely, so
+    read them as unknown rather than failing.
+    """
+    if window.get("previous_end") is None:
+        return "Previous window: none recorded, so overlap with earlier summaries is unknown."
+    return (
+        f"Previous window ended {window['previous_end']}: {window['new_runs']} runs "
+        f"started after it and {window['overlap_runs']} were already available to "
+        "the previous snapshot, so deltas against it re-measure those shared runs."
+    )
+
+
 def render(summary: dict[str, Any]) -> str:
     """Render the aggregate baseline so the report needs no raw snapshot."""
     lines = [
         "# CI performance measurements",
         "",
         f"Source: {summary['repo']}. Collected: {summary['generated_at']}.",
-        f"Window: {summary['window']['start']} to {summary['window']['end']}, {summary['window']['runs']} runs.",
+        f"Window: {summary['window']['start']} to {summary['window']['end']} ({summary['window'].get('hours')}h), {summary['window']['runs']} runs.",
+        overlap_line(summary["window"]),
         f"Runner minutes: {summary['runner_minutes']}. Cancelled-run runner minutes: {summary['cancelled_runner_minutes']}. Missing or invalid job timings: {summary['unavailable_job_timings']}. None means unavailable, not zero.",
         "",
         f"Excluded missing or inverted observations: workflow wall {summary['excluded_timings']['workflow_wall']}, job wait {summary['excluded_timings']['job_wait']}, steps {summary['excluded_timings']['step']}.",
