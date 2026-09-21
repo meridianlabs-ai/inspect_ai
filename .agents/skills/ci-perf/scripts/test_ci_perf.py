@@ -84,7 +84,7 @@ def test_window_records_span_and_overlap_with_previous_window(
     assert window["previous_end"] == "2026-09-09T01:00:00Z"
     assert (window["new_runs"], window["overlap_runs"]) == (1, 2)
     assert window["new_runs"] + window["overlap_runs"] == window["runs"]
-    assert "1 runs started after it and 2 were already available" in render(result)
+    assert "1 runs started after it and 2 started at or before it" in render(result)
 
     snapshot["previous_window_end"] = "2026-09-09T12:00:00Z"
     window = summarize(snapshot)["window"]
@@ -112,7 +112,10 @@ def test_render_reads_summaries_without_window_fields(
         "end": "2026-09-09T02:00:00Z",
         "runs": 3,
     }
-    assert "overlap with earlier summaries is unknown" in render(legacy)
+    markdown = render(legacy)
+    assert "overlap with earlier summaries is unknown" in markdown
+    assert "Window: 2026-09-09T00:00:00Z to 2026-09-09T02:00:00Z, 3 runs." in markdown
+    assert "Noneh" not in markdown
 
 
 def test_empty_samples_are_not_zero(snapshot: dict[str, Any]) -> None:

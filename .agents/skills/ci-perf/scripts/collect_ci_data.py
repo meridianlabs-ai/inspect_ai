@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 from urllib.parse import urlencode
 
+from summarize_ci_data import parse_ts as parse_required_ts
 from summarize_ci_data import previous_window_end, summarize, window_overlap
 
 # Upstream is public, so any fork's PR triggers CI there and its logs, step
@@ -65,7 +66,8 @@ def gh_api_text(path: str) -> str:
 
 
 def parse_ts(ts: str | None) -> datetime | None:
-    return datetime.fromisoformat(ts.replace("Z", "+00:00")) if ts else None
+    """Optional wrapper over the summarizer's parser for absent API fields."""
+    return parse_required_ts(ts) if ts else None
 
 
 def seconds_between(start: str | None, end: str | None) -> float | None:

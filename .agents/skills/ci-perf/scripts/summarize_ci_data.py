@@ -45,12 +45,15 @@ class WindowOverlap(NamedTuple):
 def window_overlap(runs: list[dict[str, Any]], previous_end: str) -> WindowOverlap:
     """Split runs into those after the previous window's end and the rest.
 
-    A run that started at or before the previous window's end was already
-    available to the previous snapshot, so its timings re-measure the same
-    sample. Only runs that started later add information. The fetch cap binds
-    backwards from collection time, so a quiet upstream makes most of a fixed
-    run count overlap the previous window while every other count in the
-    summary looks normal.
+    A run that started at or before the previous window's end is counted as
+    overlap. Most such runs were in the previous snapshot, so their timings
+    re-measure the same sample, but the listing keeps only completed runs, so
+    one still in flight at the previous collection was never there. Overlap is
+    therefore an upper bound on shared runs, not an exact count. Only runs that
+    started later add information. The fetch cap binds backwards from
+    collection time, so a quiet upstream makes most of a fixed run count
+    overlap the previous window while every other count in the summary looks
+    normal.
     """
     cutoff = parse_ts(previous_end)
     new = sum(parse_ts(run["run_started_at"]) > cutoff for run in runs)
@@ -212,9 +215,22 @@ def overlap_line(window: dict[str, Any]) -> str:
         return "Previous window: none recorded, so overlap with earlier summaries is unknown."
     return (
         f"Previous window ended {window['previous_end']}: {window['new_runs']} runs "
-        f"started after it and {window['overlap_runs']} were already available to "
-        "the previous snapshot, so deltas against it re-measure those shared runs."
+        f"started after it and {window['overlap_runs']} started at or before it. "
+        "The latter is an upper bound on runs shared with the previous snapshot "
+        "(runs still in flight then were not in it), and deltas against it "
+        "re-measure those shared runs."
     )
+
+
+def window_line(window: dict[str, Any]) -> str:
+    """State the window's bounds, span, and run count.
+
+    Summaries retained before `hours` existed lack it, so omit the span rather
+    than printing None with a unit suffix.
+    """
+    hours = window.get("hours")
+    span = f" ({hours}h)" if hours is not None else ""
+    return f"Window: {window['start']} to {window['end']}{span}, {window['runs']} runs."
 
 
 def render(summary: dict[str, Any]) -> str:
@@ -223,7 +239,7 @@ def render(summary: dict[str, Any]) -> str:
         "# CI performance measurements",
         "",
         f"Source: {summary['repo']}. Collected: {summary['generated_at']}.",
-        f"Window: {summary['window']['start']} to {summary['window']['end']} ({summary['window'].get('hours')}h), {summary['window']['runs']} runs.",
+        window_line(summary["window"]),
         overlap_line(summary["window"]),
         f"Runner minutes: {summary['runner_minutes']}. Cancelled-run runner minutes: {summary['cancelled_runner_minutes']}. Missing or invalid job timings: {summary['unavailable_job_timings']}. None means unavailable, not zero.",
         "",

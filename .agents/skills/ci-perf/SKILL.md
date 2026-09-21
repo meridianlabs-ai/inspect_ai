@@ -45,8 +45,10 @@ python .agents/skills/ci-perf/scripts/collect_ci_data.py \
 
 `--previous-summaries` records the latest retained window end in the snapshot
 so `summary.json` can split the window into `window.new_runs` (started after
-that end) and `window.overlap_runs` (already available to the previous
-snapshot); without it both are `null`, not zero. `--since <ISO-8601 UTC>`
+that end) and `window.overlap_runs` (started at or before it); without it both
+are `null`, not zero. A run still in flight at the previous collection was not
+in that snapshot but still counts as overlap, so read `overlap_runs` as an
+upper bound on shared samples, not an exact count. `--since <ISO-8601 UTC>`
 tightens the lower bound of the fetched creation-time range, so a run can page
 back only as far as the previous snapshot reached; `--limit` and `--days` still
 cap the window, and the per-record range validation still applies. Because the
