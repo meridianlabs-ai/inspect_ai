@@ -4,6 +4,13 @@
 #   - `meridian` (default branch, carries meridian-only workflows) gets
 #     upstream merged in; merge conflicts fail the run for a human to resolve
 # Lives on the `meridian` default branch (schedule only fires from there).
+#
+# The pushes authenticate as the `meridian-inspect-sync` GitHub App, a bypass
+# actor of the "Sync branch updates" ruleset that guards both branches (the
+# job token cannot be one). Its installation token is minted per run from the
+# `upstream-sync` environment, whose private key only a run on `meridian` may
+# read, and is revoked when the job ends. Nothing here falls back to another
+# identity: if the mint fails, the run fails.
 
 name: Sync upstream
 
@@ -13,24 +20,47 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   sync:
     runs-on: ubuntu-latest
+    # The environment's branch policy already restricts the key to
+    # `meridian`; the `if` refuses the job outright from any other
+    # repository, branch or tag, so a stray dispatch does not reach a
+    # runner at all.
+    if: github.repository == 'meridianlabs-ai/inspect_ai' && github.ref == 'refs/heads/meridian'
+    environment: upstream-sync
     steps:
-      # SYNC_TOKEN: fine-grained PAT (Contents R/W, this repo only) owned by a
-      # repo admin. Pushes authenticate as that admin, which is what satisfies
-      # the branch ruleset's admin-role bypass — the default GITHUB_TOKEN
-      # cannot bypass it (GitHub Actions isn't an allowed bypass actor type
-      # for repo rulesets).
       - uses: actions/checkout@v4
         with:
           ref: meridian
           fetch-depth: 0
-          token: ${{ secrets.SYNC_TOKEN }}
+          persist-credentials: false
 
+      - name: Mint the sync App's token
+        id: mint
+        uses: actions/create-github-app-token@v2
+        with:
+          # `app-id` accepts the App ID or the Client ID; v2 has no client-id input.
+          app-id: ${{ vars.SYNC_APP_ID }}
+          private-key: ${{ secrets.SYNC_APP_PRIVATE_KEY }}
+          owner: meridianlabs-ai
+          repositories: inspect_ai
+          permission-contents: write
+          permission-workflows: write
+
+      # The App token reaches git only through this step's credential helper,
+      # keyed to github.server_url so no other host is ever answered with it;
+      # nothing is written to .git/config or a remote URL.
       - name: Fast-forward main and merge into meridian
+        env:
+          GIT_TOKEN: ${{ steps.mint.outputs.token }}
+          GIT_CONFIG_COUNT: "2"
+          GIT_CONFIG_KEY_0: credential.helper
+          GIT_CONFIG_VALUE_0: ""
+          GIT_CONFIG_KEY_1: credential.${{ github.server_url }}.helper
+          GIT_CONFIG_VALUE_1: '!f() { echo username=x-access-token; echo "password=$GIT_TOKEN"; }; f'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
