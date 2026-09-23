@@ -4,6 +4,14 @@
 # diffs never include meridian infra commits. See the two-stage PR flow in the
 # README.
 #
+# Requires the Claude GitHub App installed on the repo (org-level install
+# covers this) and the machine account's two org secrets scoped to it,
+# MARVIN_APP_CLIENT_ID and MARVIN_APP_PRIVATE_KEY (the GitHub App the
+# workflow's gate and land jobs act as; without them pushes and PRs come
+# from github-actions[bot] and trigger nothing). Model auth uses Workload
+# Identity Federation — no API-key secret, but `id-token: write` below is
+# required for the OIDC exchange.
+#
 # Triggers are limited to issue_comment + issues on purpose: GitHub resolves
 # those from the default branch (meridian, where this file lives), but it
 # resolves pull_request-family events (pull_request_review_comment,
@@ -92,9 +100,10 @@ jobs:
     # reusable workflow so agent-opened PRs trigger CI and @review: the
     # GitHub App's client id and private key, from which the workflow's
     # gate and land jobs mint per-job tokens (Phase 2). Passed explicitly —
-    # NOT via `secrets: inherit` — so this repo's other secrets aren't
-    # exposed to an external workflow pinned to a mutable @main ref (least
-    # privilege; the reusable workflow consumes only the secrets named here).
+    # NOT via
+    # `secrets: inherit` — so this repo's other secrets aren't exposed to an
+    # external workflow pinned to a mutable @main ref (least privilege; the
+    # reusable workflow consumes only the secrets named here).
     # Absent secrets resolve to empty: the agent still runs, just with
     # issue-triggered PR creation degraded (see the reusable workflow's
     # secrets.MARVIN_APP_CLIENT_ID and design/auto-agent.md).
@@ -104,6 +113,8 @@ jobs:
       # codex engine (design/codex-engine.md in the agents repo):
       # consumed only on items labeled engine:codex; optional.
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    # Agent runs restore caches, never save them (agents repo: design/agent-cache-scope.md).
+    cache-mode: read
     permissions:
       contents: write
       pull-requests: write
@@ -111,6 +122,25 @@ jobs:
       id-token: write
       actions: read
     with:
+      # provision (optional; agents#136): the repository's provisioning recipe
+      # — bash run as the unprivileged agent user in the checkout, in place of
+      # the generic `uv venv && uv pip install -e .[dev]`. Codex runs use it
+      # today; Claude runs keep this repository's claude-setup action until
+      # they move to an agent user too, and then use this recipe instead
+      # (design/executed-paths-residual.md in the agents repo). The codex job
+      # never runs claude-setup (a composite runs as the runner; nothing from
+      # the checkout may run as the runner there), so put here what
+      # claude-setup does that the generic recipe does not. uv is on PATH,
+      # HOME is the agent user's (/home/codex), no sudo, network on; create
+      # .venv so the agent's tools are found. A stub that still sets the
+      # earlier `codex_provision` keeps working: it is used when `provision`
+      # is empty. Examples —
+      # a Python pin:          uv venv --python 3.11 && uv pip install -e ".[dev]"
+      # a lockfile sync:       uv venv --python 3.11 && uv sync --dev
+      # Node tooling:          corepack enable --install-directory ~/.local/bin && pnpm install --frozen-lockfile
+      provision: &provision |
+        uv venv --python 3.11
+        uv pip install -e ".[dev]"
       # trigger_phrase is single-valued, so resolve it from the SAME source the
       # action will check for this event (comment > issue), not from a union of
       # all sources — otherwise a stale @claude in an enclosing issue would mask
@@ -138,14 +168,6 @@ jobs:
         '@claude'
         }}
       base_branch: main
-      # Provisioning recipe (design/executed-paths-residual.md in the agents
-      # repo): bash run as the unprivileged agent user in the checkout, uv on
-      # PATH. Codex runs use it today; Claude runs keep their current
-      # provisioning until they move to an agent user, then use this instead.
-      # The Python pin and dev install match .github/actions/claude-setup.
-      provision: &provision |
-        uv venv --python 3.11
-        uv pip install -e ".[dev]"
       # No automatic review of the PRs this agent opens: a review is asked for
       # (an @review comment, or from an Orca workspace), never posted by the
       # land job (decision: Ransom, 2026-09-16; was "true" while the fork
@@ -272,6 +294,8 @@ jobs:
       # codex engine (design/codex-engine.md in the agents repo):
       # consumed only on items labeled engine:codex; optional.
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    # Agent runs restore caches, never save them (agents repo: design/agent-cache-scope.md).
+    cache-mode: read
     permissions:
       contents: write
       pull-requests: write
@@ -279,11 +303,26 @@ jobs:
       id-token: write
       actions: read
     with:
+      # provision (optional; agents#136): the repository's provisioning recipe
+      # — bash run as the unprivileged agent user in the checkout, in place of
+      # the generic `uv venv && uv pip install -e .[dev]`. Codex runs use it
+      # today; Claude runs keep this repository's claude-setup action until
+      # they move to an agent user too, and then use this recipe instead
+      # (design/executed-paths-residual.md in the agents repo). The codex job
+      # never runs claude-setup (a composite runs as the runner; nothing from
+      # the checkout may run as the runner there), so put here what
+      # claude-setup does that the generic recipe does not. uv is on PATH,
+      # HOME is the agent user's (/home/codex), no sudo, network on; create
+      # .venv so the agent's tools are found. A stub that still sets the
+      # earlier `codex_provision` keeps working: it is used when `provision`
+      # is empty. Examples —
+      # a Python pin:          uv venv --python 3.11 && uv pip install -e ".[dev]"
+      # a lockfile sync:       uv venv --python 3.11 && uv sync --dev
+      # Node tooling:          corepack enable --install-directory ~/.local/bin && pnpm install --frozen-lockfile
+      provision: *provision
       trigger_phrase: "@auto"
       label_trigger: "auto"
       base_branch: main
-      # Same provisioning recipe as the `claude` job (reused via the YAML anchor).
-      provision: *provision
       # No automatic review of the PRs this agent opens: a review is asked for
       # (an @review comment, or from an Orca workspace), never posted by the
       # land job (decision: Ransom, 2026-09-16; was "true" while the fork
