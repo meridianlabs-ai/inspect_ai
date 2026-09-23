@@ -116,6 +116,14 @@ jobs:
       # rejects bot actors unless listed here). The
       # reviewer is read-only, so this only ever starts a review — never a write.
       allowed_bots: "claude[bot]"
+      # Provisioning recipe (design/executed-paths-residual.md in the agents
+      # repo): bash run as the unprivileged agent user in the checkout, uv on
+      # PATH. Codex runs use it today; Claude runs keep their current
+      # provisioning until they move to an agent user, then use this instead.
+      # The Python pin and dev install match .github/actions/claude-setup.
+      provision: |
+        uv venv --python 3.11
+        uv pip install -e ".[dev]"
       # Fork-specific reviewer guidance. On this fork only top-level PR comments
       # reach the dev agent, so point authors there for follow-ups. The reviewer
       # must never emit ANY literal trigger token — @review would retrigger this

@@ -64,6 +64,14 @@ jobs:
       head_branch: ${{ github.event.workflow_run.head_branch }}
       pr_number: ${{ github.event.workflow_run.pull_requests[0].number }}
       ci_run_id: ${{ github.event.workflow_run.id }}
+      # Provisioning recipe (design/executed-paths-residual.md in the agents
+      # repo): bash run as the unprivileged agent user in the checkout, uv on
+      # PATH. Codex runs use it today; Claude runs keep their current
+      # provisioning until they move to an agent user, then use this instead.
+      # The Python pin and dev install match .github/actions/claude-setup.
+      provision: &provision |
+        uv venv --python 3.11
+        uv pip install -e ".[dev]"
       # Fork context (this fork is special; see claude.yml). Work only on the
       # existing PR branch; never commit to main/meridian or touch meridian-only
       # .github/workflows files. This fork's PRs are a review surface and are
@@ -107,6 +115,8 @@ jobs:
     with:
       pr_number: ${{ github.event.issue.number }}
       comment_author: ${{ github.event.comment.user.login }}
+      # Same provisioning recipe as the `ci-fix` job (reused via the YAML anchor).
+      provision: *provision
       # Same fork context, plus: the "handoff" here means ready for a human to
       # promote upstream (fork PRs are never merged in-fork), not "ready to merge".
       append_system_prompt: >-

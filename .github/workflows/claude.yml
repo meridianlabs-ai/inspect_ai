@@ -135,6 +135,14 @@ jobs:
         '@claude'
         }}
       base_branch: main
+      # Provisioning recipe (design/executed-paths-residual.md in the agents
+      # repo): bash run as the unprivileged agent user in the checkout, uv on
+      # PATH. Codex runs use it today; Claude runs keep their current
+      # provisioning until they move to an agent user, then use this instead.
+      # The Python pin and dev install match .github/actions/claude-setup.
+      provision: &provision |
+        uv venv --python 3.11
+        uv pip install -e ".[dev]"
       # No automatic review of the PRs this agent opens: a review is asked for
       # (an @review comment, or from an Orca workspace), never posted by the
       # land job (decision: Ransom, 2026-09-16; was "true" while the fork
@@ -271,6 +279,8 @@ jobs:
       trigger_phrase: "@auto"
       label_trigger: "auto"
       base_branch: main
+      # Same provisioning recipe as the `claude` job (reused via the YAML anchor).
+      provision: *provision
       # No automatic review of the PRs this agent opens: a review is asked for
       # (an @review comment, or from an Orca workspace), never posted by the
       # land job (decision: Ransom, 2026-09-16; was "true" while the fork
