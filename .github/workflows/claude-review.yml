@@ -1,20 +1,25 @@
 # Read-only reviewer for the meridianlabs-ai/inspect_ai fork, on demand only:
 # comment @review on a PR (or on an External-labeled issue) to run it.
-# Release-please PRs are skipped, gated in the reusable workflow.
 # Independent of the dev agent (claude.yml) — different trigger, different
-# (lower) permissions.
+# (lower) permissions. Requires the machine account's two org secrets
+# scoped to this repo, MARVIN_APP_CLIENT_ID and MARVIN_APP_PRIVATE_KEY:
+# the review is posted by the GitHub App they name, and a run without them
+# fails at the gate.
 #
-# Auto-review on PR open / ready_for_review is deliberately OFF (decision:
-# Ransom, 2026-09-16: no unasked CI reviews in any Meridian repo; reviews are
-# driven from Orca workspaces). The `pull_request` trigger this stub carried
-# never fired for PRs against `main` (GitHub resolves pull_request-family
-# workflows from the PR's branches, and `main` is a pristine mirror without
-# this file), but it did fire for PRs against `meridian` itself — #501 was
-# reviewed unasked on open, 2026-09-16 — so it is removed together with its
-# `if` clause. The dev agent's `request_review_after_open` in claude.yml is
-# off for the same reason. The template in meridianlabs-ai/agents
-# examples/claude-review-stub.yml keeps the trigger as a commented-out block;
-# copy it back from there to restore auto-review.
+# issue_comment is the ONLY trigger the reusable workflow admits — the
+# comment-only contract. Auto-review on PR open / ready_for_review was
+# switched off as policy on 2026-09-16 (decision: Ransom: no unasked CI
+# reviews; reviews are driven from Orca workspaces — first for
+# meridianlabs-ai/actions on 2026-09-14 after actions#110 was reviewed
+# unasked, then after inspect_ai#501 was) and the reusable's pull_request /
+# pull_request_target path was removed on 2026-09-22, when eight of the ten
+# deployed stubs were already comment-only (inspect_harbor and inspect_vscode
+# still carried PR triggers; see the agents repo's design/architecture.md →
+# The reviewer: auto-review tradeoffs). A stub that still fires a PR event
+# gets a red run with an error naming the fix, not a review. A repo that
+# wants a review from CI posts a top-level @review comment as a write-access
+# identity (the machine account, for example) and lets this trigger pick it
+# up.
 #
 # Caveat: PRs from forks — a maintainer can review a fork PR with an @review
 # comment, the same trust decision made explicitly — the reusable's trig
@@ -96,15 +101,19 @@ jobs:
        !contains(github.event.comment.body, '<!-- claude-review-comment -->'))
     uses: meridianlabs-ai/agents/.github/workflows/claude-review.yml@main
     # The machine account's secrets, for the gate's deterministic ack/stage
-    # steps (eyes reaction + board stage) and the land job's posts; never
-    # handed to the review agent, which stays read-only. Absent -> the gate
-    # steps no-op and the land job posts with the job token.
+    # steps (eyes reaction + board stage) and the land job's posts (the
+    # review itself lands there — agents#114); never handed to the review
+    # agent, which stays read-only. REQUIRED for the review to reach the PR:
+    # absent, the run fails at the gate's mint step, before any review runs
+    # (the job token below holds no write permission).
     secrets:
       MARVIN_APP_CLIENT_ID: ${{ secrets.MARVIN_APP_CLIENT_ID }}
       MARVIN_APP_PRIVATE_KEY: ${{ secrets.MARVIN_APP_PRIVATE_KEY }}
       # codex engine (design/codex-engine.md in the agents repo):
       # consumed only on items labeled engine:codex; optional.
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    # Agent runs restore caches, never save them (agents repo: design/agent-cache-scope.md).
+    cache-mode: read
     permissions:
       contents: read
       pull-requests: read     # the review is posted by the land job as the machine account (agents#114)
@@ -116,6 +125,25 @@ jobs:
       # rejects bot actors unless listed here). The
       # reviewer is read-only, so this only ever starts a review — never a write.
       allowed_bots: "claude[bot]"
+      # provision (optional; agents#136): the repository's provisioning recipe
+      # — bash run as the unprivileged agent user in the checkout, in place of
+      # the generic `uv venv && uv pip install -e .[dev]`. Codex runs use it
+      # today; Claude runs keep this repository's claude-setup action until
+      # they move to an agent user too, and then use this recipe instead
+      # (design/executed-paths-residual.md in the agents repo). The codex job
+      # never runs claude-setup (a composite runs as the runner; nothing from
+      # the checkout may run as the runner there), so put here what
+      # claude-setup does that the generic recipe does not. uv is on PATH,
+      # HOME is the agent user's (/home/codex), no sudo, network on; create
+      # .venv so the agent's tools are found. A stub that still sets the
+      # earlier `codex_provision` keeps working: it is used when `provision`
+      # is empty. Examples —
+      # a Python pin:          uv venv --python 3.11 && uv pip install -e ".[dev]"
+      # a lockfile sync:       uv venv --python 3.11 && uv sync --dev
+      # Node tooling:          corepack enable --install-directory ~/.local/bin && pnpm install --frozen-lockfile
+      provision: |
+        uv venv --python 3.11
+        uv pip install -e ".[dev]"
       # Fork-specific reviewer guidance. On this fork only top-level PR comments
       # reach the dev agent, so point authors there for follow-ups. The reviewer
       # must never emit ANY literal trigger token — @review would retrigger this
