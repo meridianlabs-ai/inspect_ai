@@ -21,6 +21,10 @@ on:
   # (unlike pull_request_review).
   issue_comment:
     types: [created]
+  # SCRATCH BRANCH ONLY (executed-paths-step2-provision-verify): a dispatch
+  # proves GitHub accepts this file as synced (cache-mode on the caller jobs);
+  # every job's gate is false for this event, so nothing runs.
+  workflow_dispatch:
 
 jobs:
   # CI-failure -> fix. Only a *failed* CI run for a *same-repo* PR (same-repo
