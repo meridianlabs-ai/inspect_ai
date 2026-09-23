@@ -26,6 +26,9 @@ on:
     types: [created, edited]
   issues:
     types: [opened, labeled]
+  # SCRATCH BRANCH ONLY (executed-paths-step2-provision-verify): dispatch runs
+  # verify-provision below; the agent jobs' gates are false for this event.
+  workflow_dispatch:
 
 jobs:
   claude:
@@ -289,3 +292,79 @@ jobs:
       # Same fork guidance as the `claude` job (reused via the YAML anchor).
       append_system_prompt: *fork_prompt
       branch_sync_append: *fork_branch_sync
+
+  # SCRATCH BRANCH ONLY: runs the stubs' `provision` recipe the way the codex
+  # jobs of the reusable workflows do (create-codex-user, provision-fallback
+  # with user: codex, reset-home, all @main), over `main` (the tree the agents
+  # work on), then checks the tools as codex.
+  verify-provision:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Check out the dispatched stubs
+        uses: actions/checkout@v4
+        with:
+          path: .stub-src
+          persist-credentials: false
+
+      - name: Read the recipe from every caller job of the three stubs
+        id: fx
+        run: |
+          set -euo pipefail
+          all=$(for f in claude claude-auto claude-review; do
+            yq -o=json 'explode(.) | [.jobs | to_entries[] | select(.value.uses) | {"file": "'"$f"'", "job": .key, "uses": .value.uses, "provision": .value.with.provision}]' ".stub-src/.github/workflows/$f.yml"
+          done | jq -s 'add')
+          echo "$all" | jq .
+          [ "$(jq 'length' <<<"$all")" = 5 ] || { echo "::error::expected 5 caller jobs"; exit 1; }
+          [ "$(jq '[.[].provision] | unique | length' <<<"$all")" = 1 ] || { echo "::error::recipes differ"; exit 1; }
+          recipe=$(jq -r '.[0].provision // ""' <<<"$all")
+          [ -n "$recipe" ] || { echo "::error::no provision recipe set"; exit 1; }
+          printf 'recipe:\n%s\n' "$recipe"
+          { echo "recipe<<RECIPE_EOF"; printf '%s\n' "$recipe"; echo "RECIPE_EOF"; } >>"$GITHUB_OUTPUT"
+          rm -rf .stub-src
+          git log -1 --format='project tree: main at %H'
+
+      - name: Create codex user
+        uses: meridianlabs-ai/agents/.github/actions/create-codex-user@main
+
+      - name: Provision as the codex user with the stubs' recipe
+        id: setup
+        timeout-minutes: 10
+        uses: meridianlabs-ai/agents/.github/actions/provision-fallback@main
+        with:
+          user: codex
+          recipe: ${{ steps.fx.outputs.recipe }}
+
+      - name: Reset codex home
+        uses: meridianlabs-ai/agents/.github/actions/create-codex-user@main
+        with:
+          mode: reset-home
+
+      - name: Tools run as codex
+        env:
+          BIN: ${{ steps.setup.outputs.bin }}
+          AS_CODEX: sudo -u codex -H --
+        run: |
+          set -euo pipefail
+          echo "bin: $BIN"
+          v=$($AS_CODEX .venv/bin/python -c 'import sys; print("%d.%d" % sys.version_info[:2])')
+          echo "venv python: $v"
+          [ "$v" = "3.11" ] || { echo "::error::expected Python 3.11, got $v"; exit 1; }
+          loc=$($AS_CODEX .venv/bin/python -c 'import inspect_ai, os; print(os.path.dirname(inspect_ai.__file__))')
+          echo "inspect_ai imported from: $loc"
+          [ "$loc" = "$GITHUB_WORKSPACE/src/inspect_ai" ] || { echo "::error::not an editable install of the checkout"; exit 1; }
+          for t in pytest ruff mypy; do
+            [ -x ".venv/bin/$t" ] || { echo "::error::$t missing from .venv/bin"; exit 1; }
+            $AS_CODEX ".venv/bin/$t" --version
+          done
+          $AS_CODEX .venv/bin/ruff check src/inspect_ai/_util
+          $AS_CODEX .venv/bin/pytest tests/util/test_file.py -q -p no:cacheprovider
