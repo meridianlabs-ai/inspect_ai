@@ -204,7 +204,8 @@ jobs:
         asked to address feedback from an upstream PR, read its comments with gh
         (upstream is public) and push fixes to the same branch in this fork; the
         upstream PR updates automatically. Never modify files under
-        .github/workflows that are meridian-only (claude.yml, sync-upstream.yml).
+        .github/workflows that are meridian-only (claude.yml, claude-auto.yml,
+        claude-review.yml, sync-upstream.yml).
         CHANGELOG: for changes to product functionality (not for test-only or
         build-only changes) add a CHANGELOG entry. Put it in the "## Unreleased"
         section at the top of the file; if that section does not exist, create
