@@ -25,6 +25,7 @@ from test_helpers.litellm_proxy.artifacts import (
 from test_helpers.litellm_proxy.proxy import (
     LiteLLMProxy,
     UpstreamExchange,
+    isolate_model_info,
     run_litellm_proxy,
     skip_if_no_litellm_proxy,
     upstream_exchange,
@@ -52,6 +53,12 @@ from inspect_ai.model import (
 from inspect_ai.tool import Tool, tool
 
 CALL_ID = "x-litellm-call-id"
+
+
+@pytest.fixture(autouse=True)
+def isolated_model_info(monkeypatch: pytest.MonkeyPatch) -> None:
+    isolate_model_info(monkeypatch)
+
 
 # Checker unit tests: hand-built payloads in each provider's wire format ------
 
@@ -594,20 +601,22 @@ def known_gap(
         # when redacted blocks sit between signed ones, Bedrock also rejects
         # the turn, so this shows up without a checked response too
         return Gap(
-            "LiteLLM: redacted_thinking is not converted to Bedrock redactedContent",
+            "LiteLLM #43009: redacted_thinking is not converted to Bedrock "
+            "redactedContent",
             (ReplayError, RuntimeError),
         )
     if not checked:
         return None
     if family == "anthropic" and responses_api and stream:
         return Gap(
-            "LiteLLM: the streaming Responses bridge doubles the thinking text "
+            "LiteLLM #43010: the streaming Responses bridge doubles the thinking text "
             "(the signature chunk repeats the full text)",
             ReplayError,
         )
     if family == "gemini" and responses_api and (scenario == "text" or text_with_tools):
         return Gap(
-            "LiteLLM: the Responses bridge drops thought signatures on text parts",
+            "LiteLLM #43011: the Responses bridge drops thought signatures on text "
+            "parts",
             ReplayError,
         )
     return None

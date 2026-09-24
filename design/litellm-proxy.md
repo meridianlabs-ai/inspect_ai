@@ -291,13 +291,15 @@ completions worked.
   and on for this provider, send text-only reasoning back as reasoning
   `content` and leave out empty text on tool-call turns.
 
-**LiteLLM bugs (report upstream; not worked around):**
-6. **Streaming Responses with Anthropic doubles the thinking text** in
+**LiteLLM bugs (reported upstream; not worked around):**
+6. **Streaming Responses with Anthropic doubles the thinking text**
+   ([#43010](https://github.com/BerriAI/litellm/issues/43010)) in
    `encrypted_content`. Anthropic accepts the doubled text; with Claude 4+ the
    reasoning state travels in the signature, so the impact is likely small.
    The same join runs over every block of a message, so interleaved thinking
    may merge text between blocks (not verified).
-7. **Bedrock loses redacted thinking.**
+7. **Bedrock loses redacted thinking**
+   ([#43009](https://github.com/BerriAI/litellm/issues/43009)).
    `translate_thinking_blocks_to_reasoning_content_blocks`
    (`prompt_templates/factory.py:4594`) has no `redactedContent` branch, on
    both paths (on chat completions the redacted block becomes empty text,
@@ -305,7 +307,8 @@ completions worked.
    redacted blocks alternate with signed ones, Bedrock rejects the replayed
    turn (`Invalid signature in thinking block`), so the conversation fails
    rather than only losing reasoning.
-8. **The Responses bridge drops Gemini text-part thought signatures.** The
+8. **The Responses bridge drops Gemini text-part thought signatures**
+   ([#43011](https://github.com/BerriAI/litellm/issues/43011)). The
    same Gemini 2.5 tool-loop impact as gap 5.
 9. **`reasoning_effort` is rejected** for some deployments (Together
    DeepSeek V4.1 raises `UnsupportedParamsError`). This is covered by §6
@@ -336,6 +339,54 @@ LiteLLM behavior therefore follows these rules:
 - **Watch for LiteLLM changes.** An occasional job pulls the latest proxy
   image and runs the offline matrix. A change in LiteLLM's conversions shows
   up as a strict xfail passing or a new failure.
+
+### Errors, retries and refusals
+
+Inspect retries rate limit and transient errors, and turns context window
+and content policy errors into model output (`model_length`,
+`content_filter`) rather than failing the sample. The proxy's errors were
+probed with a fake upstream that returns each provider's native errors
+(Anthropic, OpenAI, Gemini, Bedrock, DeepSeek, Moonshot, Azure), across chat
+and Responses, streaming and not, with the proxy's own retries off
+(`test_litellm_proxy_error_handling` in `test_litellm_proxy.py`).
+
+- **Retries work unchanged.** 429s arrive as `RateLimitError` (streaming
+  Responses: `response.failed` with `rate_limit_exceeded`), 5xx including
+  Anthropic 529 as `InternalServerError` (`server_error`), and a mid-stream
+  Anthropic `overloaded_error` as an `APIError` with code `"500"`. The base
+  class classifies all of them correctly. The proxy renames upstream
+  `retry-after` to `llm_provider-retry-after`, which does not matter because
+  Inspect does not use `retry_after` to decide how long to wait. The proxy's
+  router retries 408/409/429/5xx itself (`num_retries`, default 2), on top of
+  Inspect's retries.
+- **Bad request classification needs the provider.** LiteLLM sets the error
+  `code` to the HTTP status (`"400"`), so the base class's code matching
+  never fires. The mapped error class survives only as a message prefix
+  (`litellm.ContextWindowExceededError:`,
+  `litellm.ContentPolicyViolationError:`). Some upstream errors reach the
+  client without it: messages LiteLLM does not recognize (OpenAI's current
+  "exceeds the context window", Moonshot's "exceeded model token limit") and
+  Gemini chat streaming errors, which skip LiteLLM's mapping and carry the
+  raw upstream body. `_litellm_proxy_errors.py` matches the prefixes and the
+  upstream wording, and records the upstream message (without LiteLLM's
+  wrapping) as the output. The provider applies it in `handle_bad_request`
+  and in a new `handle_stream_error` hook on `OpenAICompatibleAPI`, which
+  covers Responses streaming failures (`response.failed`) and mid-stream chat
+  errors.
+- **200 refusals work.** Anthropic `refusal`, Gemini `SAFETY` and blocked
+  prompts, and Bedrock `guardrail_intervened` arrive as `finish_reason:
+  "content_filter"`.
+- **LiteLLM bugs (reported upstream):**
+  - Anthropic's `model_context_window_exceeded` stop reason is unmapped and
+    becomes `stop` ([#43012](https://github.com/BerriAI/litellm/issues/43012);
+    strict xfail).
+  - OpenAI's current context window message and Moonshot's are not mapped to
+    `ContextWindowExceededError`
+    ([#43013](https://github.com/BerriAI/litellm/issues/43013)).
+  - Gemini chat streaming errors skip exception mapping
+    ([#43014](https://github.com/BerriAI/litellm/issues/43014)).
+
+  The provider's matcher covers the last two until they are fixed.
 
 ### Where Inspect reads model attributes
 
@@ -378,7 +429,10 @@ deployments.
 - Any failure raises: timeout, connection error, non-2xx status, or an
   unparseable body. The error names the URL and the status, and points at
   `model_info=False`. A failure at construction stops an eval at startup
-  rather than partway through a run.
+  rather than partway through a run. LiteLLM's `{"error": {"message"}}` text
+  is shown when present. A proxy without a database cannot check virtual
+  keys and answers any key but the master key with `400 No connected db.`;
+  one with a database returns 401, which the error reports as a rejected key.
 - The `get_model_info()` dummy-key path already catches exceptions and returns
   None, so it is unaffected.
 - The fetch blocks the event loop once per (base URL, key) per process when
@@ -399,7 +453,7 @@ in this order:
 2. `litellm_params.model`, with `litellm_params.custom_llm_provider`
    prepended if it differs from the first segment.
 
-The normalizer (a pure function in `_providers/litellm_proxy_names.py`) turns
+The normalizer (a pure function in `_providers/_litellm_proxy_names.py`) turns
 the string into an ordered list of candidate Inspect database keys:
 
 - Split the LiteLLM provider segment. Map `vertex_ai_beta` to `vertex_ai`,
@@ -434,9 +488,32 @@ fuzzy stage is never used. `canonical_name()` returns the winning Inspect key.
 When nothing matches, it returns the normalized upstream name, or the alias if
 there is no deployment row.
 
-Several deployments: if every deployment resolves to the same Inspect key,
-that key is used. If they disagree, the first deployment's key is used and a
-warning is logged once.
+Several deployments: if every deployment that resolves gives the same Inspect
+key, that key is used (a deployment that does not resolve, such as an opaque
+ARN, does not block it). If they disagree, the first deployment's key is used
+and a warning is logged once.
+
+`model_family()` returns the model part of the canonical name (`gpt-5`, not
+`openai/gpt-5`, because checks such as `is_o_series_model` match anywhere in
+the name), unless the user registered a `family` with `set_model_info` under
+the alias, `litellm-proxy/<alias>` or the canonical name. So request shaping
+(`max_completion_tokens`, reasoning parameters) follows the upstream model.
+
+Implementation notes (phase 2):
+
+- A first segment that is not a LiteLLM provider and is followed by an
+  `org/model` path is also tried without it, which covers hosts LiteLLM
+  configures by name only (`replicate/`, `gmi/`, `crusoe/`).
+- A bare `base_model` in Bedrock form (`anthropic.claude-sonnet-4-5`,
+  `us.anthropic.…`) goes through the Bedrock rules.
+- Bedrock candidates try the model's own key before the Bedrock id alias, so
+  `anthropic/claude-3-5-haiku-20241022` wins over
+  `anthropic/anthropic.claude-3-5-haiku-20241022-v1:0`.
+- OpenRouter variant suffixes (`:free`, `:exacto`) are removed.
+- Against the 3,270 chat and Responses entries in LiteLLM 1.104's model
+  database, 1,692 resolve (the prototype: 1,298), with no entry the prototype
+  resolved lost or changed. The only hits whose key does not textually
+  contain the upstream name come from the explicit Bedrock id table.
 
 ### 4. Model info registration
 
@@ -453,21 +530,45 @@ Precedence for each field:
 
 | Proxy field | Inspect field |
 |---|---|
-| `max_input_tokens` | `context_length` (whether LiteLLM means input-only is still open) |
+| `max_input_tokens` | `context_length` (LiteLLM's value is input capacity: it equals Inspect's `input_tokens` for every compared model, e.g. 272k for gpt-5, whose context window is 400k) |
 | `max_output_tokens` | `output_tokens` |
 | `supports_reasoning` | `reasoning` |
 | `default_reasoning_effort` | `reasoning_effort_default` |
 | prices per token × 1e6 | `ModelCost` |
 
-`family` is set to the resolved canonical key, so model-family checks
+`family` is not registered. `model_family()` already returns the upstream
+model's name (without the organization, since checks such as
+`is_o_series_model` match anywhere in the name), so model-family checks
 (`needs_max_completion_tokens`, `is_gpt_5_plus`, `supports_max_reasoning_effort`
-and so on) see the upstream model instead of the alias.
+and so on) see the upstream model instead of the alias. A user-registered
+`family` still wins.
 
 With several deployments, limits take the minimum, since the router can send
 a request to any of them, and prices take the maximum.
 
 Cost is registered only when input and output prices are both present. A
-missing cache read or write price uses the input price.
+missing cache read or write price uses the input price. Inspect's database
+has no prices (0 of 808 models), so the proxy is usually the only automatic
+source of cost.
+
+Implementation notes (phase 3):
+
+- Precedence applies field by field: a user registration for
+  `litellm-proxy/<alias>` (e.g. only `family`) is merged with, not replaced
+  by, the database and proxy fields. The user's original is kept, so
+  constructing the model again merges from it again. A user registration for
+  the canonical name (e.g. `set_model_cost("openai/gpt-5", ...)`) comes in
+  through the database lookup.
+- A database input limit below the context window (gpt-5) is kept.
+- An alias that resolves to nothing still gets an empty registration (with
+  `require_model_info=false`), and `input_tokens_name()` returns the
+  registered key, so lookups stop there instead of fuzzy matching the alias.
+- `model_info=false` skips registration and the gate.
+- Limitations: the registry is keyed by model string, so two proxies
+  serving the same alias in one process share an entry (the last constructed
+  wins). `get_model_info("litellm-proxy/<alias>")` before the model is
+  constructed cannot reach the proxy (it runs with a placeholder key) and
+  still uses the database's fuzzy matching.
 
 ### 5. The model info gate
 
@@ -601,16 +702,24 @@ Each phase ends with review and approval before the next starts.
      items.
 
    Then turn the matching strict xfails into passing tests, rerun the live
-   matrix, and report LiteLLM bugs 6–8 upstream with captured payloads.
+   matrix, and report LiteLLM bugs 6–8 upstream with captured payloads
+   (done: #43009–#43011).
 6. **Docs, CHANGELOG, live tests.** Provider docs (including `base_model`
    guidance for opaque deployments), the CHANGELOG entry, and adding the
    provider to the `slow-tests` skill.
 
+   **PR description:** list the LiteLLM issues filed from this work, with
+   links, and the behavior each one causes (strict xfail, or covered by the
+   provider):
+   [#43009](https://github.com/BerriAI/litellm/issues/43009),
+   [#43010](https://github.com/BerriAI/litellm/issues/43010),
+   [#43011](https://github.com/BerriAI/litellm/issues/43011),
+   [#43012](https://github.com/BerriAI/litellm/issues/43012),
+   [#43013](https://github.com/BerriAI/litellm/issues/43013),
+   [#43014](https://github.com/BerriAI/litellm/issues/43014).
+
 ## Open questions
 
-- Is LiteLLM's `max_input_tokens` input-only, or the whole context window?
-  This decides whether it maps to `context_length` or to the private
-  `_input_tokens` override.
 - Does `/v2/model/info?model=` behave as the source suggests? If it does, it
   would avoid fetching every deployment on large proxies, but it skips the key
   allowlist, so v1 stays the default.
