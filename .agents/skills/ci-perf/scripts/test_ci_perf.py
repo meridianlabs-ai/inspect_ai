@@ -12,7 +12,7 @@ import publish_ci_findings as publisher
 import pytest
 from collect_ci_data import parse_summary
 from publish_ci_findings import publish, validate_findings
-from summarize_ci_data import render, stats, summarize
+from summarize_ci_data import PreviousWindow, previous_window, render, stats, summarize
 
 
 @pytest.fixture
@@ -65,6 +65,93 @@ def test_summary_preserves_samples_and_separates_cancelled(
     )
     assert result["suites"]["test (3.11)"]["passed"]["median"] == 100
     assert "not push-to-green" in render(result)
+
+
+def test_window_records_span_and_overlap_with_previous_window(
+    snapshot: dict[str, Any],
+) -> None:
+    def split(window: dict[str, Any]) -> tuple[int, int, int]:
+        parts = (window["new_runs"], window["overlap_runs"], window["older_runs"])
+        assert sum(parts) == window["runs"]
+        return parts
+
+    window = summarize(snapshot)["window"]
+    assert window["hours"] == 2
+    assert window["previous_start"] is None and window["previous_end"] is None
+    assert window["new_runs"] is None and window["overlap_runs"] is None
+    assert window["older_runs"] is None
+    assert "overlap with earlier summaries is unknown" in render(summarize(snapshot))
+
+    # Runs at 00:00 and 01:00 were available to a window 00:00 to 01:00; the
+    # runs at exactly its bounds are shared, not new or older.
+    snapshot["previous_window_start"] = "2026-09-09T00:00:00Z"
+    snapshot["previous_window_end"] = "2026-09-09T01:00:00Z"
+    result = summarize(snapshot)
+    window = result["window"]
+    assert (window["previous_start"], window["previous_end"]) == (
+        "2026-09-09T00:00:00Z",
+        "2026-09-09T01:00:00Z",
+    )
+    assert split(window) == (1, 2, 0)
+    assert (
+        "Previous window 2026-09-09T00:00:00Z to 2026-09-09T01:00:00Z: 1 runs "
+        "started after it, 2 started within it, and 0 started before it"
+    ) in render(result)
+
+    # A window that pages further back than the previous one reaches runs the
+    # previous snapshot never contained; they are older, not overlap.
+    snapshot["previous_window_start"] = "2026-09-09T00:30:00Z"
+    assert split(summarize(snapshot)["window"]) == (1, 1, 1)
+
+    snapshot["previous_window_end"] = "2026-09-09T12:00:00Z"
+    assert split(summarize(snapshot)["window"]) == (0, 2, 1)
+
+    # One bound without the other cannot be split against, so it is rejected
+    # rather than read as an open-ended window.
+    del snapshot["previous_window_start"]
+    with pytest.raises(ValueError, match="only one previous window bound"):
+        summarize(snapshot)
+    snapshot["previous_window_start"] = "2026-09-09T13:00:00Z"
+    with pytest.raises(ValueError, match="is after its end"):
+        summarize(snapshot)
+
+
+def test_previous_window_is_the_latest_for_the_same_repo() -> None:
+    repo = "UKGovernmentBEIS/inspect_ai"
+    assert previous_window([], repo) is None
+    summaries = [
+        {
+            "repo": repo,
+            "window": {"start": "2026-09-12T00:00:00Z", "end": "2026-09-13T00:00:00Z"},
+        },
+        {
+            "repo": repo,
+            "window": {"start": "2026-09-09T00:00:00Z", "end": "2026-09-11T00:00:00Z"},
+        },
+        {
+            "repo": "other/repo",
+            "window": {"start": "2026-09-19T00:00:00Z", "end": "2026-09-20T00:00:00Z"},
+        },
+    ]
+    assert previous_window(summaries, repo) == PreviousWindow(
+        "2026-09-12T00:00:00Z", "2026-09-13T00:00:00Z"
+    )
+    assert previous_window(summaries[2:], repo) is None
+
+
+def test_render_reads_summaries_without_window_fields(
+    snapshot: dict[str, Any],
+) -> None:
+    legacy = summarize(snapshot)
+    legacy["window"] = {
+        "start": "2026-09-09T00:00:00Z",
+        "end": "2026-09-09T02:00:00Z",
+        "runs": 3,
+    }
+    markdown = render(legacy)
+    assert "overlap with earlier summaries is unknown" in markdown
+    assert "Window: 2026-09-09T00:00:00Z to 2026-09-09T02:00:00Z, 3 runs." in markdown
+    assert "Noneh" not in markdown
 
 
 def test_empty_samples_are_not_zero(snapshot: dict[str, Any]) -> None:
@@ -563,6 +650,178 @@ def test_collection_repeated_page_is_bounded(monkeypatch: pytest.MonkeyPatch) ->
     assert calls == 6
 
 
+def test_since_tightens_created_range_without_loosening_validation(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from datetime import datetime, timedelta, timezone
+    from urllib.parse import parse_qs, urlparse
+
+    import collect_ci_data as collector
+
+    ranges: list[tuple[datetime, datetime]] = []
+    created_offset = timedelta(0)
+
+    def fake_api(path: str) -> Any:
+        lower, upper = parse_qs(urlparse(path).query)["created"][0].split("..")
+        ranges.append((datetime.fromisoformat(lower), datetime.fromisoformat(upper)))
+        created = (ranges[-1][0] - created_offset).isoformat()
+        return {
+            "workflow_runs": [
+                {"id": len(ranges), "created_at": created, "run_started_at": created}
+            ]
+        }
+
+    monkeypatch.setattr(collector, "gh_api", fake_api)
+    now = datetime.now(timezone.utc)
+
+    # A --since newer than the --days floor becomes the page range's lower bound.
+    since = (now - timedelta(days=1)).replace(microsecond=0)
+    collector.fetch_runs("owner/repo", 1, days=7, since=since)
+    assert ranges[-1][0] == since
+    assert ranges[-1][1] - since < timedelta(days=1, minutes=1)
+
+    assert "WARNING" not in capsys.readouterr().err
+
+    # A --since older than --days does not widen the range past the days bound,
+    # and says so.
+    collector.fetch_runs("owner/repo", 1, days=2, since=now - timedelta(days=30))
+    assert ranges[-1][1] - ranges[-1][0] == timedelta(days=2)
+    assert "older than the 2-day bound" in capsys.readouterr().err
+
+    # Records created before --since still fail the per-record range check.
+    created_offset = timedelta(seconds=1)
+    with pytest.raises(RuntimeError, match="all three"):
+        collector.fetch_runs("owner/repo", 1, days=7, since=since)
+
+    with pytest.raises(ValueError, match="not before collection time"):
+        collector.fetch_runs("owner/repo", 1, since=now + timedelta(hours=1))
+    with pytest.raises(ValueError, match="UTC offset"):
+        collector.fetch_runs("owner/repo", 1, since=since.replace(tzinfo=None))
+
+
+def test_collector_records_previous_window_bounds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import collect_ci_data as collector
+
+    def run(run_id: int, started: str) -> dict[str, Any]:
+        return {
+            "id": run_id,
+            "name": "Build",
+            "head_branch": "topic",
+            "conclusion": "success",
+            "run_attempt": 1,
+            "run_started_at": started,
+            "updated_at": started,
+            "head_repository": {"full_name": "UKGovernmentBEIS/inspect_ai"},
+        }
+
+    fetched: list[dict[str, Any]] = []
+    since_args: list[Any] = []
+
+    def fake_fetch(repo: str, limit: int, days: int, since: Any) -> Any:
+        since_args.append(since)
+        return fetched
+
+    monkeypatch.setattr(collector, "fetch_runs", fake_fetch)
+    monkeypatch.setattr(collector, "gh_api", lambda path: {"jobs": []})
+    repo = "UKGovernmentBEIS/inspect_ai"
+    previous = tmp_path / "previous-summaries.json"
+    previous.write_text(
+        json.dumps(
+            [
+                {
+                    "repo": repo,
+                    "window": {
+                        "start": "2026-09-14T00:00:00Z",
+                        "end": "2026-09-16T00:00:00Z",
+                    },
+                },
+                {
+                    "repo": repo,
+                    "window": {
+                        "start": "2026-09-18T00:52:21Z",
+                        "end": "2026-09-18T21:13:35Z",
+                    },
+                },
+            ]
+        )
+    )
+    out, summary_out = tmp_path / "raw.json", tmp_path / "summary.json"
+    argv = [
+        "collect",
+        "--out",
+        str(out),
+        "--summary-out",
+        str(summary_out),
+        "--durations-runs",
+        "0",
+        "--previous-summaries",
+        str(previous),
+        "--since",
+        "2026-09-18T21:13:35Z",
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+
+    # A window without trusted runs (the normal outcome of a --since bound
+    # after a quiet stretch) fails explicitly and writes nothing.
+    with pytest.raises(SystemExit, match="no completed PR runs"):
+        collector.main()
+    assert not out.exists()
+
+    # The window pages back past the previous window's start (a larger --limit
+    # would do this), so the oldest run is older, not overlap.
+    fetched.extend(
+        [
+            run(1, "2026-09-19T13:01:25Z"),
+            run(2, "2026-09-18T21:13:35Z"),
+            run(3, "2026-09-18T00:52:21Z"),
+            run(4, "2026-09-17T23:00:00Z"),
+        ]
+    )
+    collector.main()
+    assert since_args[-1].isoformat() == "2026-09-18T21:13:35+00:00"
+    raw = json.loads(out.read_text())
+    assert (raw["previous_window_start"], raw["previous_window_end"]) == (
+        "2026-09-18T00:52:21Z",
+        "2026-09-18T21:13:35Z",
+    )
+    window = json.loads(summary_out.read_text())["window"]
+    assert (
+        window["new_runs"],
+        window["overlap_runs"],
+        window["older_runs"],
+        window["runs"],
+    ) == (1, 2, 1, 4)
+    assert (
+        "1 of 4 runs started after the previous window end 2026-09-18T21:13:35Z; "
+        "2 overlap it and 1 predate its start 2026-09-18T00:52:21Z"
+    ) in capsys.readouterr().err
+
+    # Naive, empty, and future timestamps and a missing history file are all
+    # rejected before any fetch.
+    fetches = len(since_args)
+    for bad_argv in (
+        argv[:-1] + ["2026-09-18T21:13:35"],
+        argv[:-1] + [""],
+        argv[:-1] + ["2999-01-01T00:00:00Z"],
+        argv[:-4] + ["--previous-summaries", str(tmp_path / "missing.json")],
+    ):
+        monkeypatch.setattr(sys, "argv", bad_argv)
+        with pytest.raises(SystemExit):
+            collector.main()
+    assert len(since_args) == fetches
+    assert "does not exist" in capsys.readouterr().err
+
+    # An empty history is a legitimate first run and records no previous window.
+    previous.write_text("[]")
+    monkeypatch.setattr(sys, "argv", argv[:-2])
+    collector.main()
+    raw = json.loads(out.read_text())
+    assert raw["previous_window_start"] is None and raw["previous_window_end"] is None
+    assert json.loads(summary_out.read_text())["window"]["new_runs"] is None
+
+
 def test_untrusted_head_repository_runs_are_dropped_before_any_fetch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -607,7 +866,7 @@ def test_untrusted_head_repository_runs_are_dropped_before_any_fetch(
         requested.append(path)
         return "1.50s call tests/a.py::test_a\n== 1 passed in 1.50s =="
 
-    monkeypatch.setattr(collector, "fetch_runs", lambda repo, limit, days: fetched)
+    monkeypatch.setattr(collector, "fetch_runs", lambda *args: fetched)
     monkeypatch.setattr(collector, "gh_api", fake_api)
     monkeypatch.setattr(collector, "gh_api_text", fake_log)
     out, summary_out = tmp_path / "raw.json", tmp_path / "summary.json"

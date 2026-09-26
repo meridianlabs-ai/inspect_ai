@@ -31,7 +31,12 @@ distributions and counted in `excluded_timings`. The collector retains step
 status so the summarizer can omit skipped steps; legacy raw files lack that
 status, and the baseline does not retain step distributions. The collector keeps
 only runs whose PR head repository is upstream or the Meridian fork and records
-the number dropped in `excluded_untrusted_runs`.
+the number dropped in `excluded_untrusted_runs`. Given the retained summaries,
+the collector also records the previous window's start and end, and the
+summary splits its runs into `window.new_runs`, `window.overlap_runs`, and
+`window.older_runs` against those bounds; all are null when no history was
+supplied, and retained summaries lacking the `window.previous_end` key predate
+these fields.
 
 `report.md` and `prs.md` are historical records. Their referenced snapshots
 are available in Git history.
