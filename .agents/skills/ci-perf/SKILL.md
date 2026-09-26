@@ -51,7 +51,10 @@ The raw snapshot contains approximately 200 completed upstream PR workflow
 runs created in the last seven days, job and step timings, and pytest duration and outcome samples from recent
 successful Build runs. The collector retries stale or repeated API pages at most three times, then fails.
 The snapshot covers only PRs whose head repository is `UKGovernmentBEIS/inspect_ai`
-or `meridianlabs-ai/inspect_ai` (`excluded_untrusted_runs` counts the rest); the
+or `meridianlabs-ai/inspect_ai`. `--limit` counts those kept runs: the collector
+pages past runs from other forks until it has 200 trusted ones, and
+`excluded_untrusted_runs` (in the raw snapshot and under `window` in the
+summary, next to the window's span in `hours`) counts the runs it skipped. The
 agent's log evidence must come from the snapshot and the collected data, not
 from fetching other runs' logs itself.
 Report missing logs and data gaps explicitly. Do not
@@ -62,9 +65,11 @@ interpret missing observations as zero or a speedup.
 Read the current snapshot, `previous-summaries.json`, and, if needed, the
 one-time `design/ci-perf/baseline.json`. Compare the same workflow and matrix
 job across windows. Record window bounds, sample counts, overlap, and changes
-to workflow definitions. A 200-run window can cover much less than two days.
-Do not present overlapping windows as independent samples or infer a weekly
-rate from incompatible windows.
+to workflow definitions. A 200-run window can cover much less than two days;
+read `window.hours` rather than assuming a span, and note that summaries
+retained before 2026-09-15 lack `window.hours` and
+`window.excluded_untrusted_runs`. Do not present overlapping windows as
+independent samples or infer a weekly rate from incompatible windows.
 
 - Separate queue from execution. Wait-from-run-start includes dependencies.
   Read the analyzed checkout's `.github/workflows/*.yml` and subtract predecessor
