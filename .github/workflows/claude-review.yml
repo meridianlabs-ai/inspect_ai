@@ -29,10 +29,6 @@
 # reviewer's OS-level sandbox, project Claude Code configuration stripped
 # from the checkout, and the Claude engine even if the PR is labeled
 # engine:codex (agents#59).
-#
-# `allowed_bots: "claude[bot]"` below stays so a bot-authored top-level
-# `@review` comment still reaches the reviewer (claude-code-action rejects
-# bot actors otherwise); write-access humans can `@review` any PR.
 
 name: Review
 
@@ -121,10 +117,6 @@ jobs:
       id-token: write
       actions: read
     with:
-      # Honor a dev-agent @review comment (it runs as claude[bot]; the action
-      # rejects bot actors unless listed here). The
-      # reviewer is read-only, so this only ever starts a review — never a write.
-      allowed_bots: "claude[bot]"
       # provision (optional; agents#136): the repository's provisioning recipe
       # — bash run as the unprivileged agent user in the checkout, in place of
       # the generic `uv venv && uv pip install -e .[dev]`, on both engines
