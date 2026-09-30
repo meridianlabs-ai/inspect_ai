@@ -111,8 +111,17 @@ jobs:
         ruff check and mypy on changed files; if verification is impossible, say
         exactly what was not run. CHANGELOG: for product-functionality changes
         (not test/build-only) add a single-line entry under "## Unreleased" at
-        the top of CHANGELOG.md (create that section if absent). This fork's PRs
-        are a review surface only and are NEVER merged here.
+        the top of CHANGELOG.md (create that section if absent). In every commit
+        subject and body you write, and in any other text that travels with the
+        branch, write each issue or PR reference as
+        `meridianlabs-ai/inspect_ai#N`, never a bare `#N` or `(#N)`, even inside
+        backticks, and that includes the agent-involvement line (write "from
+        issue meridianlabs-ai/inspect_ai#N"). Upstream squash-merges with the
+        commit messages as the squash body, where a bare `#N` resolves against
+        UKGovernmentBEIS/inspect_ai and a closing keyword would close an
+        unrelated upstream issue, so promotion refuses a branch whose commit
+        messages carry a bare `#N`. This fork's PRs are a review surface only
+        and are NEVER merged here.
 
   # Review -> fix / handoff. The marker is a cheap router (it's forgeable — only
   # the reviewer posts it in practice); the reusable workflow does the authoritative
@@ -181,7 +190,16 @@ jobs:
         ruff check and mypy on changed files; if verification is impossible, say
         exactly what was not run. CHANGELOG: for product-functionality changes
         (not test/build-only) add a single-line entry under "## Unreleased" at
-        the top of CHANGELOG.md (create that section if absent). IMPORTANT: this
+        the top of CHANGELOG.md (create that section if absent). In every commit
+        subject and body you write, and in any other text that travels with the
+        branch, write each issue or PR reference as
+        `meridianlabs-ai/inspect_ai#N`, never a bare `#N` or `(#N)`, even inside
+        backticks, and that includes the agent-involvement line (write "from
+        issue meridianlabs-ai/inspect_ai#N"). Upstream squash-merges with the
+        commit messages as the squash body, where a bare `#N` resolves against
+        UKGovernmentBEIS/inspect_ai and a closing keyword would close an
+        unrelated upstream issue, so promotion refuses a branch whose commit
+        messages carry a bare `#N`. IMPORTANT: this
         fork's PRs are a review surface and are NEVER merged here — finished work
         is promoted by a HUMAN opening an upstream PR from the same branch
         (gh pr create --repo UKGovernmentBEIS/inspect_ai --head
