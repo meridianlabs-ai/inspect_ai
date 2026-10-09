@@ -620,7 +620,24 @@ class AsyncFilesystem(AbstractAsyncContextManager["AsyncFilesystem"]):
     async def read_file_bytes_fully(
         self, filename: str, start: int, end: int | None
     ) -> bytes:
-        """Read the byte range [start, end) of a file into bytes (end=None reads to EOF)."""
+        """Read the byte range [start, end) of a file into bytes (end=None reads to EOF).
+
+        A local range of at most one chunk is read inline on the event loop:
+        the read costs less than the thread hops of the streaming path, which
+        dominate when reading many small members such as an `.eval` log's
+        samples. Larger and open-ended local ranges still stream through a
+        worker thread so they do not block the loop.
+        """
+        if (
+            end is not None
+            and end - start <= _READ_FULLY_CHUNK_SIZE
+            and not is_s3_filename(filename)
+            and filesystem(filename).is_local()
+        ):
+            with open(local_path(filename), "rb") as f:
+                f.seek(start)
+                return f.read(max(0, end - start))
+
         stream = await self.read_file_bytes(filename, start, end)
         chunks: list[bytes] = []
         try:
@@ -1705,7 +1722,7 @@ _FSSPEC_WRITE_BLOCK_SIZE = 8 * 1024 * 1024  # 8 MB
 _STREAMING_COPY_BUFSIZE = 16 * 1024 * 1024  # 16 MB
 
 # Granularity for `read_file_bytes_fully`: one read hop per chunk while
-# accumulating a range into memory.
+# accumulating a range into memory, and the largest local range it reads inline.
 _READ_FULLY_CHUNK_SIZE = 1024 * 1024  # 1 MB
 
 _S3_ABORT_TIMEOUT = 30

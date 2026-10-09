@@ -19,6 +19,7 @@ from test_helpers.utils import skip_if_trio
 
 from inspect_ai._util._async import current_async_backend, run_coroutine, tg_collect
 from inspect_ai._util.asyncfiles import (
+    _READ_FULLY_CHUNK_SIZE,
     AsyncFilesystem,
     _current_async_fs,
     _RetiredClient,
@@ -508,6 +509,39 @@ async def test_local_read_file_bytes_fully_entire_file():
             assert result == test_data
     finally:
         Path(temp_path).unlink()
+
+
+async def test_local_read_file_bytes_fully_small_range_skips_worker_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A local range of at most one chunk is read without a worker-thread hop."""
+    test_data = os.urandom(_READ_FULLY_CHUNK_SIZE * 3)
+    path = tmp_path / "data.bin"
+    path.write_bytes(test_data)
+
+    thread_calls = 0
+    run_sync = anyio.to_thread.run_sync
+
+    async def counting_run_sync(*args: Any, **kwargs: Any) -> Any:
+        nonlocal thread_calls
+        thread_calls += 1
+        return await run_sync(*args, **kwargs)
+
+    monkeypatch.setattr(anyio.to_thread, "run_sync", counting_run_sync)
+
+    async with AsyncFilesystem() as fs:
+        for uri in [str(path), path.as_uri()]:
+            assert await fs.read_file_bytes_fully(uri, 10, 20) == test_data[10:20]
+            end = 5 + _READ_FULLY_CHUNK_SIZE
+            assert await fs.read_file_bytes_fully(uri, 5, end) == test_data[5:end]
+            assert await fs.read_file_bytes_fully(uri, 20, 10) == b""
+        assert thread_calls == 0
+
+        # larger and open-ended ranges still stream through a worker thread
+        end = 2 * _READ_FULLY_CHUNK_SIZE + 7
+        assert await fs.read_file_bytes_fully(str(path), 3, end) == test_data[3:end]
+        assert await fs.read_file_bytes_fully(str(path), 3, None) == test_data[3:]
+        assert thread_calls > 0
 
 
 # =============================================================================

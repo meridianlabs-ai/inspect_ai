@@ -14,6 +14,7 @@
 - Bugfix: `inspect log convert --stream` (and `convert_eval_logs(stream=...)`) no longer drops the error message and traceback from logs of failed evals.
 - Fixed `StoreModel` skipping field validation when constructed with an empty `instance` string.
 - Fixed the human reviewer filling in tool arguments inside tool output that contains `{{{...}}}` (three or more braces).
+- Eval Logs: Reading local `.eval` logs is faster, most noticeably for logs with many samples.
 
 - Tools: Tools with `*args` or `**kwargs` no longer advertise required `args`/`kwargs` parameters to models; declare model-chosen arguments with an explicit `ToolParams` schema instead.
 - Control Channel: `inspect ctl model throughput` now reports each model's input, output and cache read/write tokens per minute, in the table and in `--json` output; the table's output column is now per minute instead of per second.
