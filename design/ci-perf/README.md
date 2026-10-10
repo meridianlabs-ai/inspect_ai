@@ -30,8 +30,14 @@ inverted workflow wall, job wait, and step observations are excluded from their
 distributions and counted in `excluded_timings`. The collector retains step
 status so the summarizer can omit skipped steps; legacy raw files lack that
 status, and the baseline does not retain step distributions. The collector keeps
-only runs whose PR head repository is upstream or the Meridian fork and records
-the number dropped in `excluded_untrusted_runs`.
+only runs whose PR head repository is upstream or the Meridian fork. Its
+`--limit` counts kept runs, so it pages past other forks' runs (roughly half of
+upstream's PR volume) rather than letting them consume the window, and records
+the number dropped inside the analyzed window in `excluded_untrusted_runs`, both
+in the raw snapshot and in the summary's `window` alongside the span in `hours`.
+Summaries retained before 2026-09-15, including every `baseline.json` entry,
+omit both `window` fields; a raw snapshot from before the head-repository filter
+summarizes with `excluded_untrusted_runs` set to `null`.
 
 `report.md` and `prs.md` are historical records. Their referenced snapshots
 are available in Git history.
