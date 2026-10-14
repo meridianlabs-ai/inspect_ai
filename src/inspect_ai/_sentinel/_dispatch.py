@@ -19,6 +19,7 @@ from inspect_sentinel import (
     Report,
     Reported,
     Step,
+    Truncation,
 )
 from inspect_sentinel._integration import HostContext, run_sentinel, watched_stages
 
@@ -92,13 +93,15 @@ async def sentinel_before_tool_call(
 ) -> Decision | None:
     if not _watches(BeforeToolCall):
         return None
+    producer = _producing_event(call, history)
     step = BeforeToolCall(
         conversation=_conversation(),
         message=message,
         call=call,
         view=resolve_tool_call_view(call, viewer),
-        input=_model_input(call, history),
+        input=list(producer.input) if producer is not None else None,
         history=history,
+        tools=list(producer.tools) if producer is not None else None,
     )
     return await _run(step)
 
@@ -126,11 +129,13 @@ async def sentinel_after_tool_call(
     call: ToolCall,
     result: ChatMessageTool,
     output: ToolResult,
+    truncated: tuple[int, int] | None,
     viewer: ToolCallViewer | None,
     history: list[ChatMessage],
 ) -> None:
     if not _watches(AfterToolCall):
         return
+    producer = _producing_event(call, history)
     step = AfterToolCall(
         conversation=_conversation(),
         message=message,
@@ -138,8 +143,10 @@ async def sentinel_after_tool_call(
         result=result,
         output=output,
         view=resolve_tool_call_view(call, viewer),
-        input=_model_input(call, history),
+        input=list(producer.input) if producer is not None else None,
         history=history,
+        tools=list(producer.tools) if producer is not None else None,
+        truncated=Truncation(*truncated) if truncated is not None else False,
     )
     decision = await _run(step)
     if decision is not None and decision.action == "terminate":
@@ -242,7 +249,7 @@ async def _run(step: Step) -> Decision | None:
             RuntimeError(
                 f"inspect_sentinel returned an escalate at the {_stage(step)} stage, "
                 "which it should have turned into a terminate. inspect_ai requires "
-                "inspect_sentinel 0.1.1 or later: pip install --upgrade inspect-sentinel"
+                "inspect_sentinel 0.1.2 or later: pip install --upgrade inspect-sentinel"
             )
         )
     return decision
@@ -317,20 +324,17 @@ def _assistant_index(call: ToolCall, history: list[ChatMessage]) -> int | None:
     return None
 
 
-def _model_input(
-    call: ToolCall, history: list[ChatMessage]
-) -> list[ChatMessage] | None:
+def _producing_event(call: ToolCall, history: list[ChatMessage]) -> ModelEvent | None:
     index = _assistant_index(call, history)
     message_id = history[index].id if index is not None else None
     if message_id is None:
         return None
     try:
-        event = transcript().history.find_last(_produced_by(message_id))
+        return transcript().history.find_last(_produced_by(message_id))
     except TranscriptHistoryUnavailableError:
         return None
     except Exception as ex:
         raise SentinelFailure(ex) from ex
-    return list(event.input) if event is not None else None
 
 
 def _produced_by(message_id: str) -> Callable[[Event], TypeGuard[ModelEvent]]:
@@ -411,8 +415,17 @@ class _Host:
                     f"{', '.join(repr(c) for c in _HUMAN_CHOICES)}."
                 )
             offered.append(cast(ApprovalDecision, choice))
+        # the approval surfaces show the conversation; a step whose host could
+        # not provide the scaffold's history shows what the model saw instead,
+        # and nothing when that is unknown too
+        if step.history is not None:
+            conversation = step.history
+        elif step.input is not None:
+            conversation = step.input
+        else:
+            conversation = []
         approval = await human_approver(choices=offered)(
-            step.message, step.call, _human_view(step), step.history
+            step.message, step.call, _human_view(step), conversation
         )
         if approval.decision in offered:
             return HumanAnswer(decision=approval.decision, reason=approval.explanation)
