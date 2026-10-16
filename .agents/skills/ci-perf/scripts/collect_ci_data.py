@@ -23,7 +23,8 @@ from pathlib import Path
 from typing import Any, NamedTuple
 from urllib.parse import urlencode
 
-from summarize_ci_data import summarize
+from summarize_ci_data import parse_ts as parse_required_ts
+from summarize_ci_data import previous_window, summarize, window_overlap
 
 # Upstream is public, so any fork's PR triggers CI there and its logs, step
 # names and run titles carry text the PR author wrote. Only these two head
@@ -65,7 +66,8 @@ def gh_api_text(path: str) -> str:
 
 
 def parse_ts(ts: str | None) -> datetime | None:
-    return datetime.fromisoformat(ts.replace("Z", "+00:00")) if ts else None
+    """Optional wrapper over the summarizer's parser for absent API fields."""
+    return parse_required_ts(ts) if ts else None
 
 
 def seconds_between(start: str | None, end: str | None) -> float | None:
@@ -73,15 +75,57 @@ def seconds_between(start: str | None, end: str | None) -> float | None:
     return (e - s).total_seconds() if s and e else None
 
 
-def fetch_runs(repo: str, limit: int, days: int = 7) -> list[dict[str, Any]]:
+def since_arg(value: str) -> datetime:
+    """Parse a `--since` value, rejecting empty and offset-less timestamps.
+
+    The flag is meant to be fed from a shell variable, so an unset variable
+    must not silently fall back to the full `--days` window.
+    """
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            f"not an ISO-8601 timestamp: {value!r}"
+        ) from error
+    if parsed.tzinfo is None:
+        raise argparse.ArgumentTypeError(
+            f"{value!r} needs a UTC offset, e.g. 2026-09-19T13:01:25Z"
+        )
+    return parsed
+
+
+def fetch_runs(
+    repo: str, limit: int, days: int = 7, since: datetime | None = None
+) -> list[dict[str, Any]]:
     """Collect a bounded recent window, retrying stale or repeated API pages.
 
     The unfiltered endpoint has served weeks-old cached pages during live runs.
     Fix the created-at range for all pages and validate every returned record
     against it. Do not publish a partial mix of current and stale pages.
+
+    `since` tightens the created-at lower bound so a run pages back only that
+    far; `limit` still caps the window. It never widens the range: the `days`
+    bound still applies (with a warning when it wins), and every record is
+    validated against the same created-at range the pages requested. Because
+    the listing is filtered on creation time and completed status, a run that
+    was created before `since` but still running at the previous collection
+    belongs to neither window, so callers chaining windows should pass a value
+    earlier than the previous window's end by at least the longest run time.
     """
     until = datetime.now(timezone.utc).replace(microsecond=0)
-    since = until - timedelta(days=days)
+    oldest = until - timedelta(days=days)
+    if since is not None:
+        if since.tzinfo is None:
+            raise ValueError("since must carry a UTC offset")
+        if since >= until:
+            raise ValueError(f"since {since.isoformat()} is not before collection time")
+        if since < oldest:
+            print(
+                f"WARNING: since {since.isoformat()} is older than the {days}-day "
+                f"bound; collecting from {oldest.isoformat()} instead",
+                file=sys.stderr,
+            )
+    since = max(since, oldest) if since is not None else oldest
     for attempt in range(3):
         by_id: dict[int, dict[str, Any]] = {}
         page = 1
@@ -294,6 +338,21 @@ def main() -> None:
         "--days", type=int, default=7, help="maximum run creation age in days"
     )
     parser.add_argument(
+        "--since",
+        type=since_arg,
+        help="ISO-8601 UTC timestamp; fetch only runs created at or after it. "
+        "--limit and --days still cap the window. Filters on creation time, so "
+        "pass a value earlier than the previous window's end by at least the "
+        "longest run time or runs still in flight at that collection are lost",
+    )
+    parser.add_argument(
+        "--previous-summaries",
+        type=Path,
+        help="retained summaries JSON list (previous-summaries.json); records "
+        "the latest window's bounds so the summary can count new, overlapping, "
+        "and older runs against it",
+    )
+    parser.add_argument(
         "--durations-runs",
         type=int,
         default=10,
@@ -310,14 +369,39 @@ def main() -> None:
         parser.error(
             "--limit and --days must be positive; --durations-runs must be nonnegative"
         )
+    if args.since is not None and args.since >= datetime.now(timezone.utc):
+        parser.error(f"--since {args.since.isoformat()} is not in the past")
+    previous = None
+    if args.previous_summaries is not None:
+        if not args.previous_summaries.is_file():
+            parser.error(
+                f"--previous-summaries {args.previous_summaries} does not exist; "
+                "run publish_ci_findings.py --read-history first"
+            )
+        previous = previous_window(
+            json.loads(args.previous_summaries.read_text()), args.repo
+        )
 
-    fetched = fetch_runs(args.repo, args.limit, args.days)
+    fetched = fetch_runs(args.repo, args.limit, args.days, args.since)
     raw_runs, excluded_untrusted = trusted_runs(fetched)
+    if not raw_runs:
+        sys.exit(
+            f"ERROR: no completed PR runs from trusted head repositories in the "
+            f"requested window ({len(fetched)} fetched); nothing to snapshot"
+        )
     print(
         f"fetched {len(fetched)} runs; excluded {excluded_untrusted} from "
         "untrusted head repositories; fetching jobs...",
         file=sys.stderr,
     )
+    if previous is not None:
+        overlap = window_overlap(raw_runs, previous)
+        print(
+            f"{overlap.new_runs} of {len(raw_runs)} runs started after the previous "
+            f"window end {previous.end}; {overlap.overlap_runs} overlap it and "
+            f"{overlap.older_runs} predate its start {previous.start}",
+            file=sys.stderr,
+        )
 
     runs = [
         {
@@ -349,6 +433,10 @@ def main() -> None:
         "repo": args.repo,
         "run_count": len(runs),
         "excluded_untrusted_runs": excluded_untrusted,
+        # Both None when no retained history was supplied; the summary then
+        # reports new, overlapping, and older run counts as unknown, not zero.
+        "previous_window_start": previous.start if previous is not None else None,
+        "previous_window_end": previous.end if previous is not None else None,
         "runs": runs,
         "pytest_durations": log_data.durations,
         "pytest_summaries": log_data.summaries,
