@@ -1,5 +1,101 @@
 # Changelog
 
+## [0.3.282](https://github.com/meridianlabs-ai/inspect_ai/compare/0.3.281...0.3.282) (2026-10-16)
+
+
+### ⚠ BREAKING CHANGES
+
+* tool state scopes so agents running concurrently in one sample keep separate tool state ([#5861](https://github.com/meridianlabs-ai/inspect_ai/issues/5861))
+* require Python 3.11 and test on Python 3.14 ([#5862](https://github.com/meridianlabs-ai/inspect_ai/issues/5862))
+
+### Features
+
+* add swarm_controller and swarm_channel registry types ([#5860](https://github.com/meridianlabs-ai/inspect_ai/issues/5860)) ([a11afc9](https://github.com/meridianlabs-ai/inspect_ai/commit/a11afc94322a431782f57c0f48a3d6b7666413c3))
+* **agent-bridge:** filters can now tell which agent a bridged model request belongs to ([#4791](https://github.com/meridianlabs-ai/inspect_ai/issues/4791)) ([1b78969](https://github.com/meridianlabs-ai/inspect_ai/commit/1b78969d6350bd8ce84bba84a92cbaddf8b175d6))
+* **agent-bridge:** forward allowed Anthropic betas, Accept-Encoding and Responses reasoning context ([#5708](https://github.com/meridianlabs-ai/inspect_ai/issues/5708)) ([be4fd1f](https://github.com/meridianlabs-ai/inspect_ai/commit/be4fd1fba7bd6c31bf5f708a4d90f3fca969ae07))
+* **bridge:** resolve bare model names by endpoint provider ([#4897](https://github.com/meridianlabs-ai/inspect_ai/issues/4897)) ([773ebf8](https://github.com/meridianlabs-ai/inspect_ai/commit/773ebf8429387131fe7f418bd2fa679f8c2ed2ce))
+* **google:** support Gemini 4 Argon ([#5843](https://github.com/meridianlabs-ai/inspect_ai/issues/5843)) ([76e69f9](https://github.com/meridianlabs-ai/inspect_ai/commit/76e69f92b9e4f84fda6214d69c15842f8e20dd49))
+* keep the response headers of a model call ([#5795](https://github.com/meridianlabs-ai/inspect_ai/issues/5795)) ([1b16791](https://github.com/meridianlabs-ai/inspect_ai/commit/1b167913bce1c6bb9dbf85bd67edbc02015b706c))
+* let agent bridges transform model responses with `response_filter` ([#5715](https://github.com/meridianlabs-ai/inspect_ai/issues/5715)) ([19f9349](https://github.com/meridianlabs-ai/inspect_ai/commit/19f9349d2a21572333854f987a46c02327754ef1))
+* require Python 3.11 and test on Python 3.14 ([#5862](https://github.com/meridianlabs-ai/inspect_ai/issues/5862)) ([f612192](https://github.com/meridianlabs-ai/inspect_ai/commit/f612192808ddcb2575a205df16469c28a3bf7716))
+* sentinel monitors can call context.host.score ([#5865](https://github.com/meridianlabs-ai/inspect_ai/issues/5865)) ([b0a5cd1](https://github.com/meridianlabs-ai/inspect_ai/commit/b0a5cd1d3b0c5f240df3ba696d3edd1d15e78bb1))
+* sentinel monitors can watch every agent's model calls ([#5811](https://github.com/meridianlabs-ai/inspect_ai/issues/5811)) ([79663e2](https://github.com/meridianlabs-ai/inspect_ai/commit/79663e25740f37b9ee9cf90ba56fa868349aa9cb))
+* sentinel step.input is the exact model input even after events are evicted, or None when unavailable ([#5831](https://github.com/meridianlabs-ai/inspect_ai/issues/5831)) ([a1c6e8b](https://github.com/meridianlabs-ai/inspect_ai/commit/a1c6e8baa8613b5f0dc397626e00ccdb21d8324c))
+* **sharding:** conditional S3 writes and a local lock helper ([#5775](https://github.com/meridianlabs-ai/inspect_ai/issues/5775)) ([5384f73](https://github.com/meridianlabs-ai/inspect_ai/commit/5384f7393564f76b040be5d5e06cb2767e96037d))
+* show a sharded run as one task in inspect ctl --log-dir ([#5774](https://github.com/meridianlabs-ai/inspect_ai/issues/5774)) ([c0e60d0](https://github.com/meridianlabs-ai/inspect_ai/commit/c0e60d046796cb741ecaafc3184c1d027521e119))
+* tool state scopes so agents running concurrently in one sample keep separate tool state ([#5861](https://github.com/meridianlabs-ai/inspect_ai/issues/5861)) ([c03cd92](https://github.com/meridianlabs-ai/inspect_ai/commit/c03cd9274352a3b9d5d3466774aae778a23f20f2))
+
+
+### Bug Fixes
+
+* **agent/bridge:** preserve Anthropic system block boundaries ([#4893](https://github.com/meridianlabs-ai/inspect_ai/issues/4893)) ([19f57c2](https://github.com/meridianlabs-ai/inspect_ai/commit/19f57c29fe6e9a42239dd6239431b72b30ba44a4))
+* **analysis:** handle empty DataFrames in task_info and log_viewer ([#4826](https://github.com/meridianlabs-ai/inspect_ai/issues/4826)) ([#4827](https://github.com/meridianlabs-ai/inspect_ai/issues/4827)) ([0c82f86](https://github.com/meridianlabs-ai/inspect_ai/commit/0c82f860bf9776c0ec24f47b940b6d77b21e1a00))
+* Antigravity host tool calls being denied as unproposed by the sandbox agent bridge ([#5717](https://github.com/meridianlabs-ai/inspect_ai/issues/5717)) ([46e79a4](https://github.com/meridianlabs-ai/inspect_ai/commit/46e79a4f46f288cbbd67a43842dde684d598a469))
+* **approval:** accept percent-encoded file:// policy URIs ([#5262](https://github.com/meridianlabs-ai/inspect_ai/issues/5262)) ([6db313b](https://github.com/meridianlabs-ai/inspect_ai/commit/6db313beb0cefd6a384ea43c8c720d927ff511a5))
+* **approval:** support comma-separated tools and decode file URIs ([#5027](https://github.com/meridianlabs-ai/inspect_ai/issues/5027)) ([09322d6](https://github.com/meridianlabs-ai/inspect_ai/commit/09322d69e60ae9cdbded0652f6e1621c2fbcc56e))
+* Behavior change: Docker sandboxes now block writable host mounts by default; use read-only mounts, Sample.files or Docker-managed volumes, or the unsafe opt-in ([#5830](https://github.com/meridianlabs-ai/inspect_ai/issues/5830)) ([d7495e8](https://github.com/meridianlabs-ai/inspect_ai/commit/d7495e8020d362f22aa7ac8ae238c3c9c6ca5602))
+* **bridge:** deliver image tool results to sandboxed agents as MCP image content ([#4892](https://github.com/meridianlabs-ai/inspect_ai/issues/4892)) ([1ece5c6](https://github.com/meridianlabs-ai/inspect_ai/commit/1ece5c68a4ece9d843d6546a7e532503a8e88c7d))
+* **bridge:** resolve a client-named eval model to the eval's own Model instance ([#4706](https://github.com/meridianlabs-ai/inspect_ai/issues/4706)) ([e9add1d](https://github.com/meridianlabs-ai/inspect_ai/commit/e9add1d8531876ef9032f0455a2dddb04cf51c1e))
+* cancelled trio eval with the rich display fails instead of returning its log ([#5872](https://github.com/meridianlabs-ai/inspect_ai/issues/5872)) ([f99c61d](https://github.com/meridianlabs-ai/inspect_ai/commit/f99c61d02d4205c4caf740c456633d901dfb4d19))
+* count overlapping waits once in working time and add suspend_working_limit() ([#5758](https://github.com/meridianlabs-ai/inspect_ai/issues/5758)) ([974c17d](https://github.com/meridianlabs-ai/inspect_ai/commit/974c17d43738702adde22f404293d07c316242af))
+* **deepseek:** use JSON mode for structured output instead of json_schema ([#4917](https://github.com/meridianlabs-ai/inspect_ai/issues/4917)) ([04190d5](https://github.com/meridianlabs-ai/inspect_ai/commit/04190d5899728c46016120e0facd8bcec551fea5))
+* gemini-2.5-pro repeating tool calls after a tool result ([#5753](https://github.com/meridianlabs-ai/inspect_ai/issues/5753)) ([8181840](https://github.com/meridianlabs-ai/inspect_ai/commit/8181840c18f1c004c1be851f83919d73f67d0f82))
+* **google:** omit placeholder API key from ADC requests ([#5349](https://github.com/meridianlabs-ai/inspect_ai/issues/5349)) ([3f025fc](https://github.com/meridianlabs-ai/inspect_ai/commit/3f025fc28b1a379de46821c278aa9f46066220c8))
+* **google:** prefer explicit API keys over ambient ADC ([#5670](https://github.com/meridianlabs-ai/inspect_ai/issues/5670)) ([203dc42](https://github.com/meridianlabs-ai/inspect_ai/commit/203dc42caabc01980ac7afe767a8d1dcc2eb7f73))
+* **google:** wrap batch system_instruction in REST Content ([#5100](https://github.com/meridianlabs-ai/inspect_ai/issues/5100)) ([#5181](https://github.com/meridianlabs-ai/inspect_ai/issues/5181)) ([d4b9199](https://github.com/meridianlabs-ai/inspect_ai/commit/d4b9199d0627abf71da56b5f92711d0d63c9f1fe))
+* Groq and OpenAI on Bedrock requests failing during credential refresh ([#5707](https://github.com/meridianlabs-ai/inspect_ai/issues/5707)) ([618d6f0](https://github.com/meridianlabs-ai/inspect_ai/commit/618d6f0a49c9b6d969e1244717f78cc081400879))
+* keep a scored sample when a cancel first arrives during sandbox cleanup (AGENTC-1367) ([#5631](https://github.com/meridianlabs-ai/inspect_ai/issues/5631)) ([0d950ed](https://github.com/meridianlabs-ai/inspect_ai/commit/0d950ed4679421f931f2ac69393456b12acd7e40))
+* keep Score.reason when thinning sample summaries ([#5190](https://github.com/meridianlabs-ai/inspect_ai/issues/5190)) ([4055266](https://github.com/meridianlabs-ai/inspect_ai/commit/40552660d679bb7dd8ecf7a3be7774c1c7a13c77)), closes [#5185](https://github.com/meridianlabs-ai/inspect_ai/issues/5185)
+* **litellm-proxy:** Grok models keep reasoning across turns, accept every reasoning effort, and report refusals ([#5874](https://github.com/meridianlabs-ai/inspect_ai/issues/5874)) ([7158198](https://github.com/meridianlabs-ai/inspect_ai/commit/71581988aaabd7a7c44c31fe25fe907a01e81680))
+* **litellm-proxy:** Meta Muse models keep reasoning across turns, accept unsupported parameters, and report refusals ([#5878](https://github.com/meridianlabs-ai/inspect_ai/issues/5878)) ([08f8600](https://github.com/meridianlabs-ai/inspect_ai/commit/08f8600926ee7383c0b582faada2640c6c6f0740))
+* **litellm:** stop the function-calling hint making Gemini loop on tool calls ([#5761](https://github.com/meridianlabs-ai/inspect_ai/issues/5761)) ([0c3b3e4](https://github.com/meridianlabs-ai/inspect_ai/commit/0c3b3e46ee76afd2115c2aae09a719c01900f1c5))
+* **log:** raise a friendly error on Azure auth failures in log listing ([#5068](https://github.com/meridianlabs-ai/inspect_ai/issues/5068)) ([1c180b2](https://github.com/meridianlabs-ai/inspect_ai/commit/1c180b21d783f6ead55d789fe4a79b6bf720b136))
+* **mcp:** re-resolve a ToolSource's tools when the async scope changes ([#4891](https://github.com/meridianlabs-ai/inspect_ai/issues/4891)) ([57c5a0d](https://github.com/meridianlabs-ai/inspect_ai/commit/57c5a0d78d3f948b5040285e71dd9a6a3d390513))
+* **mockllm:** compute default token usage for callable custom_outputs ([#5091](https://github.com/meridianlabs-ai/inspect_ai/issues/5091)) ([#5195](https://github.com/meridianlabs-ai/inspect_ai/issues/5195)) ([3653dc2](https://github.com/meridianlabs-ai/inspect_ai/commit/3653dc27c16dbed4d3e442cc1229222e1416c470))
+* **model:** export compute_model_cost ([#5072](https://github.com/meridianlabs-ai/inspect_ai/issues/5072)) ([26d74b3](https://github.com/meridianlabs-ai/inspect_ai/commit/26d74b312dc31b85d322795a78e45ad958fe1e35))
+* **model:** preserve content position in ChatMessage text setter ([#4770](https://github.com/meridianlabs-ai/inspect_ai/issues/4770)) ([#4773](https://github.com/meridianlabs-ai/inspect_ai/issues/4773)) ([4acfd20](https://github.com/meridianlabs-ai/inspect_ai/commit/4acfd207ecca8e1c3b754a147c191f2f0f21ba71))
+* normalize lowercase UTC z suffix ([#5410](https://github.com/meridianlabs-ai/inspect_ai/issues/5410)) ([74a70f4](https://github.com/meridianlabs-ai/inspect_ai/commit/74a70f432d816fa1fe2e3f7b4ee62df06e2f6e64))
+* omit unsupported Nova reasoning configuration ([#5562](https://github.com/meridianlabs-ai/inspect_ai/issues/5562)) ([e403881](https://github.com/meridianlabs-ai/inspect_ai/commit/e40388168baabc62f1a2b3a41409e7daca64bac6))
+* **openai-responses:** avoid tool search output cache clobber ([#4969](https://github.com/meridianlabs-ai/inspect_ai/issues/4969)) ([b6589d8](https://github.com/meridianlabs-ai/inspect_ai/commit/b6589d81f449112bb9942b0003b6fd9b54f1c48e))
+* preserve OpenAI chat cache token usage ([#4997](https://github.com/meridianlabs-ai/inspect_ai/issues/4997)) ([a134a38](https://github.com/meridianlabs-ai/inspect_ai/commit/a134a38beac5a437e29143323b785041109f4636))
+* prevent StoreModel validation leaks and make store and instance read-only ([#5748](https://github.com/meridianlabs-ai/inspect_ai/issues/5748)) ([aaad90c](https://github.com/meridianlabs-ai/inspect_ai/commit/aaad90c850d82f302c5a8750f6f5c9775bfe3eaf))
+* reject unknown sandbox names even when only one environment exists ([#5723](https://github.com/meridianlabs-ai/inspect_ai/issues/5723)) ([3f9c2e3](https://github.com/meridianlabs-ai/inspect_ai/commit/3f9c2e3fb4cc4799577971f61d29a5c8cd381ed4))
+* remove duplicated CHANGELOG entry for OpenAPI schema generation ([#5086](https://github.com/meridianlabs-ai/inspect_ai/issues/5086)) ([c7e6fb6](https://github.com/meridianlabs-ai/inspect_ai/commit/c7e6fb6bf54eb1eb9a596dc9b13d642cda758eeb))
+* remove duplicated type: ignore comments that ast-serialize 0.13 rejects ([#5835](https://github.com/meridianlabs-ai/inspect_ai/issues/5835)) ([81c1668](https://github.com/meridianlabs-ai/inspect_ai/commit/81c1668d31030eebf7ff55e8376c2650b4f811ed))
+* report max-token truncation as finish_reason=length in the chat agent bridge ([#5189](https://github.com/meridianlabs-ai/inspect_ai/issues/5189)) ([93104c5](https://github.com/meridianlabs-ai/inspect_ai/commit/93104c50fca02f5e3a4f882876ce9014c83a2a6e))
+* **sandbox:** Docker `read_file()` no longer unpacks agent-controlled archives on the host or fills its disk ([#5829](https://github.com/meridianlabs-ai/inspect_ai/issues/5829)) ([86c1157](https://github.com/meridianlabs-ai/inspect_ai/commit/86c1157328b8d83ce02bf830484bba45afae053c))
+* **scorer:** decide a grader panel by strict majority, not mode ([#4769](https://github.com/meridianlabs-ai/inspect_ai/issues/4769)) ([21f7245](https://github.com/meridianlabs-ai/inspect_ai/commit/21f72452f1538c413d8c0548711491b90c38fa93))
+* **scorer:** fall back to full match in pattern scorer when no capture groups ([#4829](https://github.com/meridianlabs-ai/inspect_ai/issues/4829)) ([253d38f](https://github.com/meridianlabs-ai/inspect_ai/commit/253d38f255256a5d010836a921fdf9ac0917b86e))
+* **scorer:** let shaped metrics own their empty-input shape ([#5153](https://github.com/meridianlabs-ai/inspect_ai/issues/5153)) ([856f41f](https://github.com/meridianlabs-ai/inspect_ai/commit/856f41f19debe008756ec4c5831f0600c861c51a))
+* **scorer:** map numeric custom values in value_to_float instead of passing through ([#4928](https://github.com/meridianlabs-ai/inspect_ai/issues/4928)) ([0d5ae7c](https://github.com/meridianlabs-ai/inspect_ai/commit/0d5ae7c13f7ec87561f396b4acec6feea4ad80f0))
+* **scorer:** match(numeric=True) numbers with sentence or enclosing punctuation ([#4742](https://github.com/meridianlabs-ai/inspect_ai/issues/4742)) ([#4744](https://github.com/meridianlabs-ai/inspect_ai/issues/4744)) ([78c6a7e](https://github.com/meridianlabs-ai/inspect_ai/commit/78c6a7e42b1198c3e67fa6777bb7202cf447239f))
+* **scorer:** support tuples and non-list sequences in Target ([#5040](https://github.com/meridianlabs-ai/inspect_ai/issues/5040)) ([8248d37](https://github.com/meridianlabs-ai/inspect_ai/commit/8248d374747a534b00dc2a44b30ae5469345d782))
+* sentinel events record the action that lets a step go ahead as proceed, and read old logs' continue as proceed ([#5822](https://github.com/meridianlabs-ai/inspect_ai/issues/5822)) ([5c5e14a](https://github.com/meridianlabs-ai/inspect_ai/commit/5c5e14aebe9a41bdaaa3c7d17629242f9bdf6fe5))
+* **sentinel:** terminate the sample when an escalation reaches the top with nothing to handle it ([#5812](https://github.com/meridianlabs-ai/inspect_ai/issues/5812)) ([eff9920](https://github.com/meridianlabs-ai/inspect_ai/commit/eff9920dd1cfa265d2f21f446bdb8bba720acc1d))
+* slow reads of local .eval logs ([#5783](https://github.com/meridianlabs-ai/inspect_ai/issues/5783)) ([bf37243](https://github.com/meridianlabs-ai/inspect_ai/commit/bf3724303c4fbb8c8842a6fe1d15aba6aba8d1eb))
+* **solver:** allow empty user message text in TaskState.input_text ([#5047](https://github.com/meridianlabs-ai/inspect_ai/issues/5047)) ([99228c0](https://github.com/meridianlabs-ai/inspect_ai/commit/99228c01b7a3ea6119613d64752f21e264cbcf68))
+* **solver:** preserve Choice original_position across multiple shuffles ([#5011](https://github.com/meridianlabs-ai/inspect_ai/issues/5011)) ([57d5910](https://github.com/meridianlabs-ai/inspect_ai/commit/57d59106d676976088932574c3571a2854628627))
+* **solver:** support LaTeX and markdown wrapped multiple choice answers ([#5170](https://github.com/meridianlabs-ai/inspect_ai/issues/5170)) ([ff06b98](https://github.com/meridianlabs-ai/inspect_ai/commit/ff06b985ed6c4d0ce59d6127b89d0f6b6b27daca))
+* **solver:** use format_template in chain_of_thought ([#5166](https://github.com/meridianlabs-ai/inspect_ai/issues/5166)) ([#5174](https://github.com/meridianlabs-ai/inspect_ai/issues/5174)) ([68aa2ea](https://github.com/meridianlabs-ai/inspect_ai/commit/68aa2ea9a21364f1efdc779e1511f3608765a01b))
+* stop installing brotli with Inspect ([#5900](https://github.com/meridianlabs-ai/inspect_ai/issues/5900)) ([a699376](https://github.com/meridianlabs-ai/inspect_ai/commit/a699376315c95b6410f5aec01af37c8dec452aea))
+* store and state changes crashing, replaying wrong, or logging unchanged NaNs ([#5751](https://github.com/meridianlabs-ai/inspect_ai/issues/5751)) ([31a5661](https://github.com/meridianlabs-ai/inspect_ai/commit/31a5661544bc1c49dba9af8c5fed00087ef3fe9f))
+* **tool:** exclude *args and **kwargs from tool schema and parameter parsing ([#5081](https://github.com/meridianlabs-ai/inspect_ai/issues/5081)) ([2f01917](https://github.com/meridianlabs-ai/inspect_ai/commit/2f019173e6f3862b0868208f2f7507ae4e1fbee4))
+* usage undercounted when a provider call sends several billed requests ([#5643](https://github.com/meridianlabs-ai/inspect_ai/issues/5643)) ([9ac4412](https://github.com/meridianlabs-ai/inspect_ai/commit/9ac4412952ae391a179f744907a7edad0a5e6bac))
+* **util:** reject 0 in answer_index to prevent collision with Z ([#5160](https://github.com/meridianlabs-ai/inspect_ai/issues/5160)) ([ccdc03f](https://github.com/meridianlabs-ai/inspect_ai/commit/ccdc03f5ca4252fb762822c2feb99468bab77e8b))
+* **util:** support datetime instances in UtcDatetimeStr ([#5157](https://github.com/meridianlabs-ai/inspect_ai/issues/5157)) ([#5158](https://github.com/meridianlabs-ai/inspect_ai/issues/5158)) ([ed48193](https://github.com/meridianlabs-ai/inspect_ai/commit/ed48193d05eb264060d18ed037ddd4c1ad42e3b0))
+* **view:** enforce the log viewer's Content-Security-Policy in inspect view and view bundle ([#5552](https://github.com/meridianlabs-ai/inspect_ai/issues/5552)) ([7afcb24](https://github.com/meridianlabs-ai/inspect_ai/commit/7afcb2411d3459250bbab3246b454cef69a34d62))
+* **view:** return 403 for unreadable log headers ([#5240](https://github.com/meridianlabs-ai/inspect_ai/issues/5240)) ([58f2e9e](https://github.com/meridianlabs-ai/inspect_ai/commit/58f2e9e67988b7d21cc58efdadb2f4ede8e1ff7f))
+
+
+### Performance Improvements
+
+* faster events_df() on long agent transcripts ([#5819](https://github.com/meridianlabs-ai/inspect_ai/issues/5819)) ([21ea635](https://github.com/meridianlabs-ai/inspect_ai/commit/21ea6355860798307785592f05aa41bb6c3d47fe))
+
+
+### Reverts
+
+* remove the short-lived inspect_ai.core package added in 0.3.277; core data types stay at their original import paths ([#5828](https://github.com/meridianlabs-ai/inspect_ai/issues/5828)) ([295daba](https://github.com/meridianlabs-ai/inspect_ai/commit/295dabaaba23ffc8dc0480b9506344054e73fcc1))
+
 ## [0.3.281](https://github.com/UKGovernmentBEIS/inspect_ai/compare/0.3.280...0.3.281) (2026-10-15)
 
 
