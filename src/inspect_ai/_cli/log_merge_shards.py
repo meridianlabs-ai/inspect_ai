@@ -1,5 +1,6 @@
 """`inspect log merge-shards`: merge a sharded run's shard logs."""
 
+import functools
 import json
 import os
 import sys
@@ -172,14 +173,20 @@ def merge_shards_command(
             )
 
         with _merge_phase(paths.shards_dir):
-            from inspect_ai.log import merge_eval_log_shards
+            from inspect_ai._util._async import run_main
+            from inspect_ai.log import merge_eval_log_shards_async
 
-            result = merge_eval_log_shards(
-                log,
-                built,
-                sample_ids=ids,
-                sample_count=sample_count,
-                allow_incomplete=allow_incomplete,
+            # run_main, unlike the sync API's event loop, turns Ctrl-C under
+            # trio into a cancellation and then a plain KeyboardInterrupt
+            result = run_main(
+                functools.partial(
+                    merge_eval_log_shards_async,
+                    log,
+                    built,
+                    sample_ids=ids,
+                    sample_count=sample_count,
+                    allow_incomplete=allow_incomplete,
+                )
             )
 
         _print_result(result, json_output, stdout)

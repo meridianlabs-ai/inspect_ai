@@ -4663,11 +4663,11 @@ def test_merge_shards_command_binds_the_model_base_url_as_inspect_eval_does(
 
     base_urls: list[str | None] = []
 
-    def capture(*args: Any, **kwargs: Any) -> ShardMergeResult:
+    async def capture(*args: Any, **kwargs: Any) -> ShardMergeResult:
         base_urls.append(get_model().api.base_url)
         raise RuntimeError("stop")
 
-    monkeypatch.setattr("inspect_ai.log.merge_eval_log_shards", capture)
+    monkeypatch.setattr("inspect_ai.log.merge_eval_log_shards_async", capture)
     merged, _ = _cli_paths(task_file.parent, "plain")
     result = _merge_cli(
         merged,
@@ -4981,41 +4981,57 @@ def test_merge_shards_command_json_owns_stdout(task_file: Path) -> None:
         assert output in result.stderr
 
 
+@pytest.mark.parametrize("backend", ["asyncio", "trio"])
 def test_merge_shards_command_interrupted_before_publication(
-    task_file: Path, monkeypatch: pytest.MonkeyPatch
+    task_file: Path, monkeypatch: pytest.MonkeyPatch, backend: str
 ) -> None:
+    import _thread
+
     from inspect_ai.log._shards import _api
 
+    monkeypatch.setenv("INSPECT_ASYNC_BACKEND", backend)
     merged, shards = _cli_workers(task_file, "plain", [[1, 2], [3, 4]])
     _merged(_merge_cli(merged, "--task", f"{task_file}@plain", "--json"))
-    # a newer attempt, so the next merge would write
-    eval(
-        f"{task_file}@plain",
-        model="mockllm/model",
-        log_dir=f"{shards}/1",
-        sample_id=[3, 4],
-        display="none",
-    )
+    # newer attempts of both shards, so the next merge reads them concurrently
+    for k, ids in enumerate([[1, 2], [3, 4]]):
+        eval(
+            f"{task_file}@plain",
+            model="mockllm/model",
+            log_dir=f"{shards}/{k}",
+            sample_id=ids,
+            display="none",
+        )
     before = Path(merged).read_bytes()
+    read_attempt = _api._read_attempt
+    sent: list[bool] = []
 
-    async def interrupted(*args: Any, **kwargs: Any) -> Any:
-        raise KeyboardInterrupt
+    async def interrupted(fs: Any, shard: ShardDir) -> Any:
+        # Ctrl-C lands while the attempts are read
+        if not sent:
+            sent.append(True)
+            _thread.interrupt_main()
+        await anyio.sleep(0)
+        return await read_attempt(fs, shard)
 
-    monkeypatch.setattr(_api, "_read_attempts", interrupted)
-    result = _merge_cli(merged, "--task", f"{task_file}@plain", "--json")
+    with monkeypatch.context() as patch:
+        patch.setattr(_api, "_read_attempt", interrupted)
+        result = _merge_cli(merged, "--task", f"{task_file}@plain", "--json")
+    assert sent
     assert result.exit_code == 1 and result.stdout == ""
     assert result.stderr.strip() == "Aborted!"
     assert Path(merged).read_bytes() == before
     assert not os.path.exists(merged.replace(".eval", ".merge.lock"))
 
 
+@pytest.mark.parametrize("backend", ["asyncio", "trio"])
 def test_merge_shards_command_interrupted_during_publication(
-    task_file: Path, monkeypatch: pytest.MonkeyPatch
+    task_file: Path, monkeypatch: pytest.MonkeyPatch, backend: str
 ) -> None:
     import _thread
 
     from inspect_ai.log._shards import _publish
 
+    monkeypatch.setenv("INSPECT_ASYNC_BACKEND", backend)
     merged, _ = _cli_workers(task_file, "plain", [[1, 2], [3, 4]])
     replace = _publish._replace_local
 
@@ -5029,6 +5045,7 @@ def test_merge_shards_command_interrupted_during_publication(
         result = _merge_cli(merged, "--task", f"{task_file}@plain", "--json")
     assert result.exit_code == 1 and result.stdout == ""
     assert result.stderr.strip() == "Aborted!"
+    assert not os.path.exists(merged.replace(".eval", ".merge.lock"))
     again = _merged(_merge_cli(merged, "--task", f"{task_file}@plain", "--json"))
     assert again["written"] is False
 

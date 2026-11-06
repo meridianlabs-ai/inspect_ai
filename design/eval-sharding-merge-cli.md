@@ -359,12 +359,16 @@ in `recover`; it loads hooks, such as one that supplies API keys):
    the task's reducer, `--epochs-reducer` replaces it and
    `--no-epochs-reducer` disables reduction. This is the recipe the
    Sharding docs give API callers.
-6. **Merge**: `merge_eval_log_shards(LOG, task, sample_ids=...,
-   sample_count=..., allow_incomplete=...)`. The model and roles made
-   active in step 3 are the caller's model context the merge runs metrics
-   and reducers in; `run_coroutine` copies the context into its event
-   loop, so a coroutine run through it sees the model `init_active_model`
-   set, on asyncio and on Trio.
+6. **Merge**: `merge_eval_log_shards_async(LOG, task, sample_ids=...,
+   sample_count=..., allow_incomplete=...)`, run with `run_main`
+   (`_util/_async.py`), the runner `eval` uses. On Trio it turns the first
+   Ctrl-C into a cancellation of the merge and then a plain
+   `KeyboardInterrupt`; the synchronous API's `run_coroutine` would let a
+   Ctrl-C that lands in the merge's concurrent reads escape as a
+   `BaseExceptionGroup`. The model and roles made active in step 3 are the
+   caller's model context the merge runs metrics and reducers in; the
+   event loop copies the context, so the merge sees the model
+   `init_active_model` set, on asyncio and on Trio.
 
 The task's own `model`, `config` and `model_roles` are not made active for
 the merge, as they are for a native run's scoring: no surveyed metric or
@@ -647,13 +651,12 @@ network, Docker or provider keys. Each test writes a task file to
   before the task file is imported; `--log-dir` on the command line is
   `invalid_arguments`; a metric that raises is `internal` with its
   traceback on stderr.
-- **Interruption.** A command whose merge is cancelled before
-  publication (a patched shard read that cancels) prints no report and no
-  envelope, leaves the merged log byte-identical and removes its lock;
-  one cancelled after the local publication worker started (the
-  `_replace_local` pause of
-  `test_a_cancelled_publish_finishes_before_a_later_merge`) prints no
-  report and no envelope, and a re-run reports "No changes" with
+- **Interruption.** On asyncio and on Trio, a SIGINT
+  (`_thread.interrupt_main`) that lands while the merge reads two shard
+  attempts concurrently exits 1 with no report, no envelope and click's
+  `Aborted!` on stderr, leaves the merged log byte-identical and removes
+  its lock; one that lands while the local publication worker runs (in
+  `_replace_local`) does the same, and a re-run reports "No changes" with
   `written: false`. The publication boundary itself stays covered by that
   API test on asyncio; the S3 path's unknown outcome is the existing
   `write_file_conditional` contract and is not re-tested here.
