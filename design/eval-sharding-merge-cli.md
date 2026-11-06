@@ -435,7 +435,7 @@ so an error from the task's own code never reads as a merge refusal:
 | `invalid_arguments` | `check_merge_arguments` (`ValueError`), an empty `--sample-id` entry, `--log-dir` on the command line, `INSPECT_EVAL_RUN_CONFIG` or `INSPECT_EVAL_MODEL_SPEC` in the environment | |
 | `task` | steps 2 to 5: an unreadable `--task-config` or `--model-config`, a task spec not found, a factory that raises, a model or role that cannot be constructed (a missing API key's `PrerequisiteError`), no task, several tasks, several models, a `TaskSource` | |
 | `not_found` | the merge's `FileNotFoundError`: a file the merge needed was missing. Either neither the merged log nor any shard attempt exists, or an attempt the merge listed was removed before it was read (a worker's retry cleanup removing a superseded attempt); the message says which. In the second case running the merge again, once the workers have exited, reads the attempt that replaced it | |
-| `incomplete` | `ShardSetIncomplete` | `incomplete`: `status`, `missing` (`null` for a count or no selection), `running`, `failed` |
+| `incomplete` | `ShardSetIncomplete` | `incomplete`: `status`, `missing` (an array for an effective ID selection, including one retained from an earlier merge; `null` otherwise), `running`, `failed` |
 | `outside_selection` | `ShardSelectionError` | `outside` (`null` for a count) |
 | `refused` | any other `ShardSetError`, including a task that does not match the shards | |
 | `conflict` | `WriteConflictError`: another merge holds the lock or published first. A live merge's lock, or a lost S3 conditional upload, clears: re-run once the other merge has finished. A lock left by a local merge that crashed does not, and every re-run is refused until it is removed: the message names the host and process that held it; check that process has stopped, delete the lock file and re-run (`docs/sharding.qmd`, "Merging") | |
@@ -475,8 +475,9 @@ logs/<name>.eval --task mytask.py -T ...` with the task options it gave
 its workers, minus each worker's `--sample-id` or `--limit` and
 `--log-dir`. The page says which options are accepted and that they mean
 what they mean to `inspect eval`; that `--sample-id` takes exact ids, not
-patterns; that `--model` and `--model-role` are needed only if the task
-reads them when built, and need credentials; how to translate a run
+patterns; that `--model` and `--model-role` are needed when the task
+factory, its metrics or its epoch reducer uses that model context, and
+need credentials; how to translate a run
 launched with `--model-spec` or `--run-config` into flags, and that the
 command refuses their environment variables; that generate config options
 are not taken; the exit codes; and the `--json` object and envelope with
