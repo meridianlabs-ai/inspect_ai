@@ -247,7 +247,11 @@ with the equivalent flags: a spec's `model`, `base_url` and model args as
 needed, above); a run config's `task` and its arguments, `model` with
 its arguments and base URL, `model_roles`, and the `epochs` and
 `epochs_reducer` of its `eval_config` as `--task`, `-T`, `--model`, `-M`,
-`--model-base-url`, `--model-role`, `--epochs` and `--epochs-reducer`.
+`--model-base-url`, `--model-role`, `--epochs` and `--epochs-reducer`,
+except that `epochs_reducer: []` (no reduction) is `--epochs N
+--no-epochs-reducer`: `--epochs-reducer ''` or `'[]'` names a reducer
+that does not exist and raises `RegistryNameNotFound` (`task`). An
+`epochs_reducer` without `epochs` is not used, as under `--run-config`.
 The values are the ones the launcher gave its workers, taken from its own
 command line or the original spec or run config, including the model
 roles it passed. `inspect log export-config` of a shard log is not a
@@ -621,7 +625,10 @@ network, Docker or provider keys. Each test writes a task file to
 - **Epochs.** Workers run with `--epochs 2`, `--epochs 2 --epochs-reducer
   max` and `--epochs 2 --no-epochs-reducer` over a task with its own
   reducer merge with the same flags to the native results, and each is
-  refused with the flags of another (`refused`, epoch reducers).
+  refused with the flags of another (`refused`, epoch reducers). Workers
+  run with a run config's `eval_config: {epochs: 2, epochs_reducer: []}`
+  merge with `--epochs 2 --no-epochs-reducer`, and `--epochs-reducer ''`
+  and `'[]'` are `task` (`RegistryNameNotFound`).
 - **Selection and incomplete sets.** `--sample-id` and `--sample-count`
   merge as the API's `sample_ids` and `sample_count`; both together, a
   count of 0 and an empty id are `invalid_arguments`, with a marker the
