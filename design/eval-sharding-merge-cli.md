@@ -45,7 +45,10 @@ Goals:
 
 Non-goals:
 
-- Any change to what the merge does, checks or writes. The command's
+- Any change to what the merge does, checks or writes, with one
+  exception: an id selection is recorded in `eval.dataset.sample_ids` in
+  its given order with the held samples' typed ids, and an id no shard
+  holds as given ("The command", `--sample-id`). The command's
   guarantees are the API's: it compares the task's names with the shards,
   not its options ([implementation plan, "Matching the task"](eval-sharding-implementation.md#matching-the-task)).
 - Rebuilding the task, its model or its roles from a log (decision:
@@ -213,7 +216,17 @@ inside the command function, as in `recover`.
   `task:` prefix; a pattern is merged as a literal id, so the merge refuses
   it (the shards hold ids outside the selection, or the selection's id is
   missing). An empty id (`1,,2`, or an empty value) is refused before the
-  task is built. `--sample-count N`: the intended selection as a number of
+  task is built. The ids arrive as text (`parse_sample_id`), but the merged
+  log records the shards' typed ids: `build_header` (`_plan.py`) maps each
+  id of an id selection to the id of the merged sample with the same text,
+  as it already does for a count or no selection, and keeps an id no shard
+  holds (an `--allow-incomplete` merge) as given until a later merge holds
+  it. A dataset with integer ids therefore records `eval.dataset.sample_ids`
+  as `[1, 2]`, as a native run and an API merge given `[1, 2]` do, not
+  `["1", "2"]`, so typed readers (the `dataset_sample_ids` dataframe
+  column, `KnownKey.sample_id` in `_control/log_dir/select.py`) see the
+  same type. The change is in the API, so a Python caller that passes text
+  ids gets the same header. `--sample-count N`: the intended selection as a number of
   samples. Neither reads an environment variable (below):
   `INSPECT_EVAL_SAMPLE_ID` is a worker's own selection, not the run's. Both
   given, or a count below 1, is refused by the API's own check (below).
@@ -247,12 +260,16 @@ with the equivalent flags: a spec's `model`, `base_url` and model args as
 needed, above); a run config's `task` and its arguments, `model` with
 its arguments and base URL, `model_roles`, and the `epochs` and
 `epochs_reducer` of its `eval_config` as `--task`, `-T`, `--model`, `-M`,
-`--model-base-url`, `--model-role`, `--epochs` and `--epochs-reducer`,
-except that `epochs_reducer: []` (no reduction) is `--epochs N
---no-epochs-reducer`: `--epochs-reducer ''` or `'[]'` names a reducer
-that does not exist and raises `RegistryNameNotFound` (`task`). An
-`epochs_reducer` without `epochs` is not used, as under `--run-config`.
-The values are the ones the launcher gave its workers, taken from its own
+`--model-base-url`, `--model-role`, `--epochs` and `--epochs-reducer`.
+A run config overrides epochs only when its `eval_config` holds an
+`epochs` count: `RunConfigInput.to_params()` drops `epochs_reducer`
+without one (`_cli/eval.py:1804-1811`), so such a config translates to
+neither `--epochs` nor `--epochs-reducer`, and the task's own epochs and
+reducer stand. With a count, a non-empty `epochs_reducer` is `--epochs N
+--epochs-reducer R`, and an empty one (`[]`, reduction disabled) is
+`--epochs N --no-epochs-reducer`: `--epochs-reducer` takes reducer names,
+an empty value is not one, and leaving the flag out keeps the task's own
+reducer. The values are the ones the launcher gave its workers, taken from its own
 command line or the original spec or run config, including the model
 roles it passed. `inspect log export-config` of a shard log is not a
 substitute: it exports the model, arguments and roles recorded after
@@ -324,7 +341,8 @@ ignoring `--epochs-reducer` without `--epochs`.
 ### Building the task
 
 After the common options are processed and `platform_init()` has run (as
-in `recover`; it loads hooks, such as one that supplies API keys):
+in `recover`; it loads hooks, such as one that supplies API keys), both
+inside the `--json` boundary ("Output"):
 
 1. **Check the merge arguments first.** The first checks of
    `merge_eval_log_shards_async` after the `TypeError` check (`merge_paths`,
@@ -404,12 +422,23 @@ With `--json`, one JSON object on stdout and nothing else:
 
 `location`, `status`, `task`, `task_id` and `eval_id` are the fields of a
 log entry in `inspect eval --json`'s `done` record, taken from the
-returned header; `written` and `shards` are the merge's. The command runs
-everything (task import, factory, model construction, merge) inside
-`_stdout_owned_for_json` from `_cli/eval.py`, so a factory's `print`, a
-warning or a subprocess writes to stderr, and the object is written to
-the saved stdout. The display is set to `none`, as `inspect eval --json`
-sets it.
+returned header; `written` and `shards` are the merge's.
+
+Under `--json` the first statement of the command body enters
+`_stdout_owned_for_json` from `_cli/eval.py`, and `_merge_failures`
+("Errors") inside it, so everything after click has parsed the command
+line runs in one boundary: `process_common_options`, `platform_init()`,
+the task import, the factory, model construction and the merge. Inside
+it a `print`, a warning or a subprocess writes to stderr, and the object
+or the envelope is written to the saved stdout. `platform_init()` must be
+inside: `init_hooks()` prints its `inspect_ai vX` / `hooks enabled: N`
+banner through Rich's `print` to stdout whenever a registry or legacy
+hook is enabled (`hooks/_startup.py:31-37`), and the display type does
+not quiet Rich at that point (`init_display_type` only records it).
+Before `process_common_options` runs, the command sets `display` to
+`none` and `no_ansi` to `None` in the common options, as `inspect eval
+--json` does (`_cli/eval.py:1257-1260`). Without `--json` the command
+body runs in `_merge_failures` alone and stdout is not redirected.
 
 ### Errors
 
@@ -432,6 +461,7 @@ so an error from the task's own code never reads as a merge refusal:
 
 | `kind` | Raised by | Extra field |
 |---|---|---|
+| `setup` | the command's setup before step 1, `process_common_options` and `platform_init()`: an `--env` value that cannot be parsed, a debugger that cannot listen, a hook that fails to load | |
 | `invalid_arguments` | `check_merge_arguments` (`ValueError`), an empty `--sample-id` entry, `--log-dir` on the command line, `INSPECT_EVAL_RUN_CONFIG` or `INSPECT_EVAL_MODEL_SPEC` in the environment | |
 | `task` | steps 2 to 5: an unreadable `--task-config` or `--model-config`, a task spec not found, a factory that raises, a model or role that cannot be constructed (a missing API key's `PrerequisiteError`), no task, several tasks, several models, a `TaskSource` | |
 | `not_found` | the merge's `FileNotFoundError`: a file the merge needed was missing. Either neither the merged log nor any shard attempt exists, or an attempt the merge listed was removed before it was read (a worker's retry cleanup removing a superseded attempt); the message says which. In the second case running the merge again, once the workers have exited, reads the attempt that replaced it | |
@@ -461,8 +491,10 @@ The incomplete message the API raises names the Python argument; it
 becomes "Pass allow_incomplete (--allow-incomplete on the command line) to
 write an incomplete merged log." so the same text serves both callers.
 
-The whole command body runs inside one context manager,
-`_merge_failures(json_output)`, that does the classification and printing,
+The whole command body, from before `process_common_options`, runs
+inside one context manager, `_merge_failures(json_output, stdout)` (with
+`stdout` the saved stdout under `--json`, `sys.stdout` otherwise), that
+does the classification and printing,
 and the module raises no `click.exceptions.Exit`, `ClickException` or
 `SystemExit` of its own; a test pins that (as
 `test_no_bare_click_exit_in_ctl_error_sites` does for ctl).
@@ -475,9 +507,11 @@ logs/<name>.eval --task mytask.py -T ...` with the task options it gave
 its workers, minus each worker's `--sample-id` or `--limit` and
 `--log-dir`. The page says which options are accepted and that they mean
 what they mean to `inspect eval`; that `--sample-id` takes exact ids, not
-patterns; that `--model` and `--model-role` are needed when the task
-factory, its metrics or its epoch reducer uses that model context, and
-need credentials; how to translate a run
+patterns; that the model options (`--model`, `--model-base-url`, `-M`,
+`--model-config`, `--model-role`) are needed when the task reads them when
+built or when a metric or reducer reads the model when the merge runs it
+(the merge runs them in the command's model context), that passing the
+workers' values is the safe default, and that they need credentials; how to translate a run
 launched with `--model-spec` or `--run-config` into flags, and that the
 command refuses their environment variables; that generate config options
 are not taken; the exit codes; and the `--json` object and envelope with
@@ -559,6 +593,11 @@ No migration required.
 - `merge_eval_log_shards()`: same signature, checks and errors; its
   argument checks run through `check_merge_arguments`, in the same order.
   The incomplete message's last sentence names `--allow-incomplete` too.
+  An id selection given as text for samples whose ids are integers is now
+  recorded in `eval.dataset.sample_ids` with the shards' integer ids
+  (before, as given); matching and the stored selection's comparison, both
+  by text, are unchanged. A merged log already written keeps its text ids
+  until a merge next writes it.
 - No stored format, schema or viewer type changes.
 
 ## Security
@@ -595,7 +634,12 @@ network, Docker or provider keys. Each test writes a task file to
 - **The command equals the API.** Two shards of a sample-id selection:
   the command's merged results and reductions equal a native unsharded
   run's, and equal the API's merge of the same shards with the same task;
-  a second run prints "No changes" with `written: false`.
+  a second run prints "No changes" with `written: false`. The dataset has
+  integer ids, and the command's `eval.dataset.sample_ids` equals the API
+  merge's given the same ids as integers, in the same order, and holds the
+  native run's ids with their types. An API merge given the ids as text
+  records integers too; with `allow_incomplete` and one id no shard holds,
+  that id stays as given.
 - **The construction context reaches the factory.** A factory that picks
   its metric by `get_model().name` merges with `--model mockllm/model`
   and is refused (`refused`, metric names) without it; one that reads
@@ -641,6 +685,11 @@ network, Docker or provider keys. Each test writes a task file to
   shard is `incomplete` with exit 1 and its `missing` ids; with
   `--allow-incomplete` the command writes a `started` log and exits 0. A
   pattern (`--sample-id 'a*'`) is refused as `outside_selection`.
+- **Setup errors.** A patched `platform_init` that prints to stdout and
+  then raises, and `INSPECT_API_KEY_OVERRIDE` naming a module that does
+  not exist (with `_override_api_key` reset as below), are each `setup`,
+  with exactly one JSON object on stdout under `--json` (the print on
+  stderr) and the task file not imported.
 - **Task errors.** A file with two tasks, a spec with no task, a missing
   file, a factory that raises, `--model a,b`, and `--model openai/gpt-4o`
   with no `OPENAI_API_KEY` are each `task`, with every file in the log
@@ -661,9 +710,14 @@ network, Docker or provider keys. Each test writes a task file to
   `written: false`. The publication boundary itself stays covered by that
   API test on asyncio; the S3 path's unknown outcome is the existing
   `write_file_conditional` contract and is not re-tested here.
-- **`--json` owns stdout.** With a factory that prints and a metric that
+- **`--json` owns stdout.** With a hook that prints its startup banner
+  (`INSPECT_API_KEY_OVERRIDE` naming a function in a test module, and
+  `hooks._legacy._override_api_key` reset with `monkeypatch` so
+  `init_hooks` loads it again), a factory that prints and a metric that
   logs a warning, stdout parses as exactly one JSON object, on success and
-  on each error kind above; stderr holds the print and the warning.
+  on each error kind above, `setup` included; stderr holds the banner,
+  the print and the warning. Without `--json` the banner is on stdout,
+  which shows the hook was enabled.
 - **Storage.** One `s3://` merge through the `mock_s3` fixture (moto, no
   network).
 - **Trio.** The equality test is parametrized over `INSPECT_ASYNC_BACKEND`
@@ -682,14 +736,16 @@ One PR, after PR 5 and before PR 6 of the
 titled as a `feat:` (the title is the changelog line; no CHANGELOG edit),
 in three commits:
 
-1. **Shared pieces, no behaviour change.** `model_options`,
+1. **Shared pieces and typed ids.** `model_options`,
    `model_role_option`, `task_args_options`, `epochs_options` and
    `parse_epochs_options` in `src/inspect_ai/_cli/eval.py`, used by
    `eval_options` and `eval_exec`; `check_merge_arguments` in
    `src/inspect_ai/log/_shards/_api.py`, used by
    `merge_eval_log_shards_async`; the incomplete message names
-   `--allow-incomplete`. Files: those two, `tests/log/test_shards.py` (the
-   message assertion, if one matches it).
+   `--allow-incomplete`; `build_header` in
+   `src/inspect_ai/log/_shards/_plan.py` records an id selection with the
+   merged samples' typed ids. Files: those three, `tests/log/test_shards.py`
+   (the typed-id assertions; the message assertion, if one matches it).
 2. **The command.** `src/inspect_ai/_cli/log_merge_shards.py`
    (`merge_shards_command`, `_merge_failures`), registered in
    `src/inspect_ai/_cli/log.py`; the tests above in
