@@ -1904,15 +1904,16 @@ def test_merge_records_and_reads_back_each_selection_form(tmp_path: Path) -> Non
     merged, shards = _paths(tmp_path)
     _run(shards, "0", sample_id=[1, 2])
     header = merge_eval_log_shards(
-        merged, _task(), sample_ids=["2", 1, 3], allow_incomplete=True
+        merged, _task(), sample_ids=["2", 1, "3"], allow_incomplete=True
     ).log
     assert header.eval.shards is not None
     assert header.eval.shards.selection == "ids"
-    assert header.eval.dataset.sample_ids == ["2", 1, 3]
+    # held ids take the samples' types, in the given order; unheld stay as given
+    assert header.eval.dataset.sample_ids == [2, 1, "3"]
     # a later pass without a selection uses the recorded one
     with pytest.raises(ShardSetIncomplete) as raised:
         merge_eval_log_shards(merged, _task())
-    assert raised.value.missing == [3]
+    assert raised.value.missing == ["3"]
 
     result = merge_eval_log_shards(merged, _task(), sample_count=2)
     assert result.written and result.log.status == "success"
@@ -4509,7 +4510,9 @@ def test_merge_shards_command_equals_the_api_and_a_native_run(
     api_merged, api_shards = _cli_paths(task_file.parent / "api", "plain")
     shutil.copytree(shards, api_shards)
 
-    result = _merge_cli(merged, "--task", f"{task_file}@plain", "--json")
+    result = _merge_cli(
+        merged, "--task", f"{task_file}@plain", "--sample-id", "1,2,3,4", "--json"
+    )
     output = _merged(result)
     header = read_eval_log(merged, header_only=True)
     assert output == {
@@ -4521,7 +4524,12 @@ def test_merge_shards_command_equals_the_api_and_a_native_run(
         "eval_id": header.eval.eval_id,
         "shards": 2,
     }
-    api = merge_eval_log_shards(api_merged, load_tasks([f"{task_file}@plain"])[0])
+    api = merge_eval_log_shards(
+        api_merged, load_tasks([f"{task_file}@plain"])[0], sample_ids=[1, 2, 3, 4]
+    )
+    assert header.eval.dataset.sample_ids == api.log.eval.dataset.sample_ids
+    assert header.eval.dataset.sample_ids == native.eval.dataset.sample_ids
+    assert header.eval.dataset.sample_ids == [1, 2, 3, 4]
     assert header.results is not None and native.results is not None
     assert header.results.scores == native.results.scores
     assert api.log.results is not None
@@ -4950,35 +4958,87 @@ def test_merge_shards_command_reports_a_failing_metric_with_its_traceback(
     assert "Traceback" in result.stderr
 
 
+@pytest.mark.parametrize("cause", ["platform_init", "hook"])
+def test_merge_shards_command_setup_errors(
+    task_file: Path, monkeypatch: pytest.MonkeyPatch, cause: str
+) -> None:
+    from inspect_ai._util import platform
+    from inspect_ai.hooks import _legacy
+
+    merged, _ = _cli_workers(task_file, "plain", [[1, 2, 3, 4]])
+    if cause == "platform_init":
+
+        def failing_init(hooks: bool = True) -> None:
+            print("setup output")
+            raise RuntimeError("setup failed")
+
+        monkeypatch.setattr(platform, "platform_init", failing_init)
+    else:
+        monkeypatch.setattr(_legacy, "_override_api_key", None)
+        monkeypatch.setenv("INSPECT_API_KEY_OVERRIDE", "no_such_module.override")
+    result = _merge_cli(merged, "--task", f"{task_file}@plain", "--json")
+    error = _failed(result, "setup")
+    if cause == "platform_init":
+        assert error["message"] == "setup failed"
+        assert "setup output" in result.stderr
+    else:
+        assert "INSPECT_API_KEY_OVERRIDE" in error["message"]
+    assert not _imported(task_file)
+
+
 def test_merge_shards_command_json_owns_stdout(task_file: Path) -> None:
     import subprocess
     import sys
 
     merged, _ = _cli_workers(task_file, "noisy", [[1, 2, 3, 4]])
-    env = {k: v for k, v in os.environ.items() if k not in _CLI_ENV_CLEARED}
-    # a real process, so the subprocess the factory runs writes to fd 1
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "from inspect_ai._cli.main import main; main()",
-            "log",
-            "merge-shards",
-            merged,
-            "--task",
-            f"{task_file}@noisy",
-            "--json",
-        ],
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=120,
+    hooks = task_file.parent / "hooks"
+    hooks.mkdir()
+    (hooks / "banner_hook.py").write_text(
+        "def override(var, value):\n    return None\n"
     )
+    env = {k: v for k, v in os.environ.items() if k not in _CLI_ENV_CLEARED}
+    # a hook makes platform_init() print its startup banner
+    env["INSPECT_API_KEY_OVERRIDE"] = "banner_hook.override"
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(hooks), *filter(None, [env.get("PYTHONPATH")])]
+    )
+
+    def command(*args: str) -> "subprocess.CompletedProcess[str]":
+        # a real process, so the subprocess the factory runs writes to fd 1
+        return subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from inspect_ai._cli.main import main; main()",
+                "log",
+                "merge-shards",
+                merged,
+                "--task",
+                f"{task_file}@noisy",
+                *args,
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+
+    result = command("--json")
     assert result.returncode == 0, result.stderr
     assert len(result.stdout.splitlines()) == 1, result.stdout
     assert json.loads(result.stdout)["written"]
-    for output in ("factory output", "subprocess output", "metric warning"):
+    for output in (
+        "banner_hook.override",
+        "factory output",
+        "subprocess output",
+        "metric warning",
+    ):
         assert output in result.stderr
+
+    # without --json the banner is on stdout
+    result = command()
+    assert result.returncode == 0, result.stderr
+    assert "banner_hook.override" in result.stdout
 
 
 @pytest.mark.parametrize("backend", ["asyncio", "trio"])

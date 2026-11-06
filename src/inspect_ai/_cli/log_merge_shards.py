@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from inspect_ai.log import ShardMergeResult
 
 _Kind = Literal[
+    "setup",
     "invalid_arguments",
     "task",
     "not_found",
@@ -142,12 +143,14 @@ def merge_shards_command(
     """
     if json_output:
         common["display"] = "none"
+        common["no_ansi"] = None
     with _merge_failures(json_output) as stdout:
-        process_common_options(common)
+        with _phase("setup"):
+            process_common_options(common)
 
-        from inspect_ai._util.platform import platform_init
+            from inspect_ai._util.platform import platform_init
 
-        platform_init()
+            platform_init()
 
         with _phase("invalid_arguments"):
             _check_command_line(ctx)
@@ -364,20 +367,21 @@ def _merge_failures(json_output: bool) -> Iterator[TextIO]:
 
 
 @contextmanager
-def _phase(kind: Literal["invalid_arguments", "task"]) -> Iterator[None]:
+def _phase(kind: Literal["setup", "invalid_arguments", "task"]) -> Iterator[None]:
     """Classify a failure of a phase before the merge.
 
     In the argument checks only a `ValueError` is `invalid_arguments`;
-    anything else there is `internal`. Any failure building the task is
-    `task`, so an error from the task's own code never reads as a merge
-    refusal.
+    anything else there is `internal`. Any failure of setup (common
+    options, platform init and its hooks) is `setup`, and any failure
+    building the task is `task`, so an error from the task's own code never
+    reads as a merge refusal.
     """
     try:
         yield
     except ValueError as ex:
         raise _MergeFailure(kind, ex, _message(ex)) from ex
     except Exception as ex:
-        if kind == "task":
+        if kind != "invalid_arguments":
             raise _MergeFailure(kind, ex, _message(ex)) from ex
         raise
 
