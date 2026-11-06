@@ -118,7 +118,7 @@ On failure the object is an error, `{"error": {"kind": ..., "exception": ..., "m
 | `storage_error` | Reading or writing the logs failed. |
 | `internal` | Anything else, such as a metric that raises. Its traceback is on stderr. |
 
-An interrupted command (Ctrl-C) prints nothing. If it was interrupted while publishing, the merged log may already be written: run it again, which reports `No changes` if so.
+On Ctrl-C, the command prints no merge report or JSON error envelope; Click prints `Aborted!` to stderr and it exits 1. If it was interrupted while publishing, the merged log may already be written: run it again, which reports `No changes` if so.
 
 ## Limitations
 

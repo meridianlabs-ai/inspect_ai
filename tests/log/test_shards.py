@@ -5004,6 +5004,7 @@ def test_merge_shards_command_interrupted_before_publication(
     monkeypatch.setattr(_api, "_read_attempts", interrupted)
     result = _merge_cli(merged, "--task", f"{task_file}@plain", "--json")
     assert result.exit_code == 1 and result.stdout == ""
+    assert result.stderr.strip() == "Aborted!"
     assert Path(merged).read_bytes() == before
     assert not os.path.exists(merged.replace(".eval", ".merge.lock"))
 
@@ -5027,6 +5028,7 @@ def test_merge_shards_command_interrupted_during_publication(
         patch.setattr(_publish, "_replace_local", interrupted)
         result = _merge_cli(merged, "--task", f"{task_file}@plain", "--json")
     assert result.exit_code == 1 and result.stdout == ""
+    assert result.stderr.strip() == "Aborted!"
     again = _merged(_merge_cli(merged, "--task", f"{task_file}@plain", "--json"))
     assert again["written"] is False
 
