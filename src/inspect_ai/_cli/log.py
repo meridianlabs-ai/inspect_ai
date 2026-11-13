@@ -10,6 +10,7 @@ from pydantic_core import to_jsonable_python
 from typing_extensions import Unpack
 
 from inspect_ai._cli.common import CommonOptions, common_options, process_common_options
+from inspect_ai._cli.log_merge_shards import merge_shards_command
 from inspect_ai._cli.util import int_or_bool_flag_callback
 from inspect_ai._util.constants import PKG_PATH
 from inspect_ai.log import EvalStatus, IncompleteAction, list_eval_logs
@@ -530,6 +531,9 @@ def recover_command(
         if stats.failed_count > 0 and log.status == "error":
             print(f"\nTo re-run the {stats.failed_count} failed/cancelled samples:")
             print(f"  inspect eval-retry {output_path}")
+
+
+log_command.add_command(merge_shards_command)
 
 
 _TS_MONO_APP = PKG_PATH / "_view" / "ts-mono" / "apps" / "inspect"
