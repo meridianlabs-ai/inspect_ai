@@ -1,9 +1,11 @@
+import re
 import textwrap
+import time
 
 import pytest
 from test_helpers.utils import simple_task_state
 
-from inspect_ai.scorer import CORRECT, INCORRECT, Target, answer
+from inspect_ai.scorer import CORRECT, INCORRECT, AnswerPattern, Target, answer
 
 
 @pytest.mark.anyio
@@ -142,3 +144,38 @@ async def test_line_multiple_matches():
     result = await scorer(state, Target(["0.1"]))
 
     assert result.text == CORRECT
+
+
+@pytest.mark.parametrize(
+    "model_output,expected",
+    [
+        ("ANSWER:\n\n  42\n", "42"),
+        ("ANSWER: 42  \n\n", "42  "),
+        ("ANSWER: a ANSWER: b", "a ANSWER: b"),
+        ("ANSWER: a\nANSWER: b\n", "b"),
+        ("ANSWER: \t\n\n", "\t"),
+        ("ANSWER:\n\n", None),
+        ("ANSWER: a\nmore", None),
+    ],
+)
+def test_line_pattern_captures(model_output: str, expected: str | None) -> None:
+    match = re.search(AnswerPattern.LINE, model_output)
+    assert (match.group(1) if match else None) == expected
+
+
+@pytest.mark.parametrize(
+    "model_output",
+    [
+        pytest.param("ANSWER:" + " " * 100_000 + "\nx\ny", id="spaces"),
+        pytest.param("ANSWER:" + " \t" * 50_000 + "\nx\ny", id="tabs"),
+        pytest.param("ANSWER: x" + " " * 100_000 + "\nx\ny", id="after-answer"),
+        pytest.param(("ANSWER:" + " " * 1_000 + "\nx\n") * 100 + "y", id="repeated"),
+        pytest.param("ANSWER:" * 15_000 + "\nx\ny", id="markers-on-one-line"),
+    ],
+)
+def test_line_pattern_is_linear(model_output: str) -> None:
+    # The previous pattern took ~0.6 s for 800 spaces (cubic) and ~16 s for
+    # 15,000 markers on one line (quadratic).
+    started = time.perf_counter()
+    assert re.search(AnswerPattern.LINE, model_output) is None
+    assert time.perf_counter() - started < 2.0
