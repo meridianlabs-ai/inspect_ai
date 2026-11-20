@@ -853,11 +853,83 @@ def test_long_output_extraction_is_bounded() -> None:
         _answer_candidates("x" * (math_module._MAX_COMPLETION_CHARS + 1))
 
 
+@pytest.mark.timeout(30)
+@pytest.mark.parametrize(
+    "output",
+    [
+        "factorial(factorial(20))",
+        "2**(10*10**5)",
+        "binomial(10**9, 10**8)",
+        "factorial(2**20)",
+        r"\boxed{(((9^{99})^{99})^{99})^{99}}",
+        r"\boxed{\binom{10^{9}}{10^{8}}}",
+        r"\boxed{\Gamma(10^{9})}",
+        r"\boxed{\lfloor 1E99999 \rfloor !}",
+    ],
+)
+def test_huge_evaluated_values_are_compared_structurally(output: str) -> None:
+    # Each literal is small, but evaluating the value (as `.equals()` does)
+    # would build an astronomically large integer.
+    assert _parse_candidate(output).expensive
+    assert _score_answer(output, ("1",)).status == "incorrect"
+    assert _score_answer(output, (output,)).status == "correct"
+
+
+@pytest.mark.timeout(30)
+@pytest.mark.parametrize("filler", [r"\,", r"\quad ", "**"])
+def test_long_answer_line_normalization_is_bounded(filler: str) -> None:
+    run = filler * ((math_module._MAX_COMPLETION_CHARS - 20) // len(filler))
+    for completion in (f"answer: {run}x", f"answer: x{run}"):
+        with pytest.raises(_MathLimitError, match="expression is too long"):
+            _score_answer_candidates(completion)
+
+
+def _score_answer_candidates(completion: str) -> None:
+    for candidate in _answer_candidates(completion):
+        _parse_candidate(candidate)
+
+
+async def test_answer_timeout_kills_worker_process() -> None:
+    scorer = math(timeout=1)
+
+    async def score_42() -> Any:
+        result = await scorer(simple_task_state(model_output="42"), Target(["42"]))
+        assert result is not None
+        return result.value
+
+    assert await score_42() == CORRECT
+    worker = math_module._MATH_WORKER_CONTEXT.get()
+    process = worker.process
+    assert process is not None
+
+    # Symbolic expansion is not bounded by the static limits; the budget is.
+    result = await scorer(simple_task_state(model_output="(x+1)**2000"), Target(["x"]))
+
+    assert result is not None
+    assert result.metadata == {"math_scorer_status": "answer_timeout"}
+    assert worker.process is None
+    assert process.returncode is not None
+    assert await score_42() == CORRECT
+
+    # A worker idle long enough that it may exit by itself is replaced.
+    process = worker.process
+    assert process is not None
+    worker.last_used -= math_module._WORKER_IDLE_SECONDS
+    assert await score_42() == CORRECT
+    assert worker.process is not process
+    assert process.returncode is not None
+
+
+async def _no_worker_start(_worker: Any) -> None:
+    pass
+
+
 async def test_target_timeout_is_unscored(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def slow_run_sync(*_args: Any, **_kwargs: Any) -> None:
+    async def slow_worker_request(*_args: Any, **_kwargs: Any) -> None:
         await anyio.sleep(1)
 
-    monkeypatch.setattr(math_module, "run_sync", slow_run_sync)
+    monkeypatch.setattr(math_module, "_worker_request", slow_worker_request)
+    monkeypatch.setattr(math_module, "_start_worker", _no_worker_start)
     monkeypatch.setattr(math_module, "_MIN_COLD_TIMEOUT_SECONDS", 0.01)
 
     result = await math(timeout=0.01)(
@@ -875,14 +947,15 @@ async def test_target_timeout_is_unscored(monkeypatch: pytest.MonkeyPatch) -> No
 async def test_answer_timeout_is_incorrect(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = 0
 
-    async def staged_run_sync(*_args: Any, **_kwargs: Any) -> Any:
+    async def staged_worker_request(*_args: Any, **_kwargs: Any) -> Any:
         nonlocal calls
         calls += 1
         if calls == 1:
-            return ([math_module._ParsedValue(None, "42", "42")], None)
+            return {"error": None}
         await anyio.sleep(1)
 
-    monkeypatch.setattr(math_module, "run_sync", staged_run_sync)
+    monkeypatch.setattr(math_module, "_worker_request", staged_worker_request)
+    monkeypatch.setattr(math_module, "_start_worker", _no_worker_start)
 
     result = await math(timeout=0.01)(
         simple_task_state(model_output="42"),
@@ -932,13 +1005,14 @@ def test_scorer_runs_under_unguarded_top_level_entry() -> None:
 async def test_worker_queue_time_is_not_expression_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def short_worker_call(function: Any, *_args: Any, **_kwargs: Any) -> Any:
+    async def short_worker_call(_worker: Any, request: dict[str, Any]) -> Any:
         await anyio.sleep(0.02)
-        if function is math_module._parse_targets_worker:
-            return ([math_module._ParsedValue(None, "42", "42")], None)
-        return math_module._WorkerScore("correct", "42")
+        if "targets" in request:
+            return {"error": None}
+        return {"status": "correct", "answer": "42", "reason": None}
 
-    monkeypatch.setattr(math_module, "run_sync", short_worker_call)
+    monkeypatch.setattr(math_module, "_worker_request", short_worker_call)
+    monkeypatch.setattr(math_module, "_start_worker", _no_worker_start)
 
     scorer = math(timeout=0.05)
     results = []
@@ -960,13 +1034,14 @@ async def test_worker_queue_time_is_not_expression_timeout(
 def test_worker_context_resets_across_event_loops(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def cold_worker_call(function: Any, *_args: Any, **_kwargs: Any) -> Any:
+    async def cold_worker_call(_worker: Any, request: dict[str, Any]) -> Any:
         await anyio.sleep(0.02)
-        if function is math_module._parse_targets_worker:
-            return ([math_module._ParsedValue(None, "42", "42")], None)
-        return math_module._WorkerScore("correct", "42")
+        if "targets" in request:
+            return {"error": None}
+        return {"status": "correct", "answer": "42", "reason": None}
 
-    monkeypatch.setattr(math_module, "run_sync", cold_worker_call)
+    monkeypatch.setattr(math_module, "_worker_request", cold_worker_call)
+    monkeypatch.setattr(math_module, "_start_worker", _no_worker_start)
     scorer = math(timeout=0.05)
 
     async def run_once() -> None:
