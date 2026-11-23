@@ -97,6 +97,15 @@ def test_triggers_are_schedule_and_manual_dispatch() -> None:
     assert on["schedule"] == [{"cron": "17 * * * *"}]
 
 
+def test_actions_are_pinned_to_commit_shas() -> None:
+    # The job holds the App private key, so a tag moved upstream must not
+    # change the code it runs. Comments are lost in the YAML, so check text.
+    uses = re.findall(r"^\s*(?:- )?uses:\s*(.*)$", WORKFLOW.read_text(), re.MULTILINE)
+    assert len(uses) == len([s for s in sync_job()["steps"] if "uses" in s])
+    for ref in uses:
+        assert re.fullmatch(r"[\w.-]+/[\w.-]+@[0-9a-f]{40} # v\d+\.\d+\.\d+", ref), ref
+
+
 def test_checkout_persists_no_credential() -> None:
     steps = sync_job()["steps"]
     checkout = steps[0]
@@ -110,7 +119,7 @@ def test_checkout_persists_no_credential() -> None:
 
 def test_mint_step_scopes_the_app_token() -> None:
     mint = step_with_id(MINT_STEP_ID)
-    assert mint["uses"] == "actions/create-github-app-token@v2"
+    assert mint["uses"].startswith("actions/create-github-app-token@")
     assert mint["with"] == {
         "app-id": "${{ vars.SYNC_APP_ID }}",
         "private-key": "${{ secrets.SYNC_APP_PRIVATE_KEY }}",
