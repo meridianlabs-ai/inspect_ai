@@ -32,7 +32,7 @@ jobs:
     if: github.repository == 'meridianlabs-ai/inspect_ai' && github.ref == 'refs/heads/meridian'
     environment: upstream-sync
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: meridian
           fetch-depth: 0
@@ -40,7 +40,7 @@ jobs:
 
       - name: Mint the sync App's token
         id: mint
-        uses: actions/create-github-app-token@v2
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
         with:
           # `app-id` accepts the App ID or the Client ID; v2 has no client-id input.
           app-id: ${{ vars.SYNC_APP_ID }}
