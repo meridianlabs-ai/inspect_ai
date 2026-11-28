@@ -2,8 +2,10 @@ import base64
 import html
 import json
 import re
+from array import array
+from bisect import bisect_left
 from logging import getLogger
-from typing import Literal, NamedTuple
+from typing import Iterator, Literal, NamedTuple, Sequence
 
 from pydantic import JsonValue
 
@@ -112,7 +114,7 @@ def parse_content_with_reasoning(content: str) -> tuple[str, ReasoningCapsule | 
     - The first element is the input content with the <think> tag and its contents fully removed.
     - The second element is a ReasoningCapsule named tuple (or None if no <think> tag is found).
     """
-    block = _parse_think_block(content)
+    block = next(_think_blocks(content), None)
     if block is None:
         return content, None
     return (content[: block.start] + content[block.end :]).strip(), block.capsule
@@ -128,12 +130,13 @@ def split_content_with_reasoning(content: str) -> list[str | ReasoningCapsule]:
     other whitespace, such as code indentation, is kept. Empty text is omitted.
     """
     segments: list[str | ReasoningCapsule] = []
-    while (block := _parse_think_block(content)) is not None:
-        if text := content[: block.start].strip("\n"):
+    pos = 0
+    for block in _think_blocks(content):
+        if text := content[pos : block.start].strip("\n"):
             segments.append(text)
         segments.append(block.capsule)
-        content = content[block.end :]
-    if text := content.strip("\n"):
+        pos = block.end
+    if text := content[pos:].strip("\n"):
         segments.append(text)
     return segments
 
@@ -144,23 +147,17 @@ class _ThinkBlock(NamedTuple):
     capsule: ReasoningCapsule
 
 
-def _parse_think_block(content: str) -> _ThinkBlock | None:
-    """Find the first <think/> block, returning its span and parsed capsule.
+def _think_blocks(content: str) -> Iterator[_ThinkBlock]:
+    """Yield each <think/> block in order, with its span and parsed capsule.
 
     A block whose `internal` attribute `decode_internal` rejects is literal
     text (e.g. a model quoting the marker): it is skipped whole and the search
     continues after it.
     """
-    # Match <think> tag with any attributes
-    pattern = r"<think([^>]*)>(.*?)</think>"
-    offset = 0
-    while match := _find_nested_think_block(content, offset) or re.compile(
-        pattern, re.DOTALL
-    ).search(content, offset):
+    for match in _think_matches(content):
         try:
             internal = _parse_internal_attr(match.group(1))
         except NotInternal:
-            offset = match.end()
             continue
 
         attrs_str = match.group(1)
@@ -180,7 +177,7 @@ def _parse_think_block(content: str) -> _ThinkBlock | None:
 
         start, end = match.span()
 
-        return _ThinkBlock(
+        yield _ThinkBlock(
             start=start,
             end=end,
             capsule=ReasoningCapsule(
@@ -191,30 +188,62 @@ def _parse_think_block(content: str) -> _ThinkBlock | None:
                 internal=internal,
             ),
         )
-    return None
 
 
-def _find_nested_think_block(content: str, offset: int = 0) -> re.Match[str] | None:
-    start: int | None = None
-    depth = 0
-    pattern = re.compile(r"<think([^>]*)>(.*)</think>", re.DOTALL)
+_THINK_TAG = re.compile(r"<think([^>]*)>|</think>")
+_THINK_BLOCK_BALANCED = re.compile(r"<think([^>]*)>(.*)</think>", re.DOTALL)
+_THINK_BLOCK_FIRST_CLOSE = re.compile(r"<think([^>]*)>(.*?)</think>", re.DOTALL)
 
-    for match in re.compile(r"<think([^>]*)>|</think>", re.DOTALL).finditer(
-        content, offset
-    ):
-        tag = match.group(0)
-        if tag.startswith("<think"):
-            if start is None:
-                start = match.start()
-                depth = 1
+
+def _think_matches(content: str) -> Iterator[re.Match[str]]:
+    """Yield each candidate <think/> block, searching after the previous one.
+
+    A block runs from the first opening tag to its balanced closing tag or,
+    when it has none, to the first closing tag after it.
+
+    The text may come from a model or a sandboxed agent, so this runs in time
+    linear in its length (it is called on the event loop): each region is
+    scanned once, and the openings without a balanced close are recorded the
+    first time a scan reaches the end of the text rather than found again by
+    rescanning from each later opening.
+    """
+    # Every block ends with "</think>", so nothing after the last one matters.
+    # Stopping there also keeps `[^>]*` from scanning to the end of the text
+    # from each "<think" that has no ">".
+    last_close = content.rfind("</think>")
+    if last_close == -1:
+        return
+    tags_end = last_close + len("</think>")
+    # Sorted starts of openings with no balanced close, once known (an array
+    # rather than a list or set keeps this to 8 bytes per opening).
+    unbalanced: array[int] | None = None
+    offset = 0
+    while (start := content.find("<think", offset, tags_end)) != -1:
+        match: re.Match[str] | None = None
+        if unbalanced is None or not _sorted_contains(unbalanced, start):
+            opens = array("q")
+            for tag in _THINK_TAG.finditer(content, start, tags_end):
+                if tag.group(1) is not None:
+                    opens.append(tag.start())
+                    continue
+                opens.pop()
+                if not opens:
+                    match = _THINK_BLOCK_BALANCED.match(content, start, tag.end())
+                    break
             else:
-                depth += 1
-        elif start is not None:
-            depth -= 1
-            if depth == 0:
-                return pattern.search(content, start, match.end())
+                unbalanced = opens
+        if match is None:
+            # If this opening has no closing tag after it, neither does a later one.
+            match = _THINK_BLOCK_FIRST_CLOSE.match(content, start)
+            if match is None:
+                return
+        yield match
+        offset = match.end()
 
-    return None
+
+def _sorted_contains(values: Sequence[int], value: int) -> bool:
+    i = bisect_left(values, value)
+    return i < len(values) and values[i] == value
 
 
 def _parse_attr(attrs_str: str, name: str) -> str | None:
@@ -238,10 +267,16 @@ def _parse_internal_attr(attrs_str: str) -> JsonValue | None:
     return None if raw is None else decode_internal(raw)
 
 
+_SUMMARY = re.compile(r"<summary>(.*?)</summary>\s*", re.DOTALL)
+
+
 def _parse_summary(content: str) -> tuple[str, str | None]:
     """Extract <summary> tag from content, returning (remaining_content, summary)."""
-    pattern = r"<summary>(.*?)</summary>\s*"
-    match = re.search(pattern, content, re.DOTALL)
+    # If the first opening has no closing tag after it, neither does a later
+    # one, so match only there rather than searching (which would rescan to
+    # the end of the text from every opening).
+    start = content.find("<summary>")
+    match = _SUMMARY.match(content, start) if start != -1 else None
     if match:
         summary = match.group(1)
         remaining = content[: match.start()] + content[match.end() :]

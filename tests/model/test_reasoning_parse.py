@@ -1,4 +1,5 @@
 import base64
+import time
 
 import pytest
 
@@ -498,3 +499,37 @@ def test_split_content_with_reasoning_keeps_every_block_in_order():
 def test_split_content_with_reasoning_without_think_tag():
     assert split_content_with_reasoning("plain text") == ["plain text"]
     assert split_content_with_reasoning("") == []
+
+
+def test_split_content_with_reasoning_after_unbalanced_block():
+    """A block after an unclosed opening is found once the opening falls back."""
+    segments = split_content_with_reasoning(
+        "<think>a <think>b</think>c<think>d</think>e"
+    )
+    assert segments == [
+        ReasoningCapsule(reasoning="a <think>b"),
+        "c",
+        ReasoningCapsule(reasoning="d"),
+        "e",
+    ]
+
+
+@pytest.mark.parametrize(
+    "unit,tail",
+    [
+        ("<think>", "</think>"),
+        ("<think", "</think>"),
+        ("<think><think>a</think>", ""),
+        ("<think>a</think>b", ""),
+        ('<think internal="!"><think>x</think>', ""),
+        ('<think internal="!">x</think>', ""),
+        ("<summary>", "</think>"),
+    ],
+)
+def test_reasoning_parse_time_is_linear(unit: str, tail: str) -> None:
+    """Adversarial marker text parses in linear time (it was quadratic)."""
+    text = "<think>" + unit * (512 * 1024 // len(unit)) + tail
+    start = time.perf_counter()
+    parse_content_with_reasoning(text)
+    split_content_with_reasoning(text)
+    assert time.perf_counter() - start < 5
