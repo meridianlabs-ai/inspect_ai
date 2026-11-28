@@ -3,15 +3,23 @@
 from __future__ import annotations
 
 import ast
+import contextlib
+import json
 import math as stdlib_math
+import os
 import re
+import subprocess
+import sys
+import threading
+import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Literal
 
 import anyio
+from anyio.abc import Process
 from anyio.lowlevel import RunVar
-from anyio.to_thread import run_sync
+from anyio.streams.buffered import BufferedByteReceiveStream
 
 from inspect_ai._util.error import PrerequisiteError, pip_dependency_error
 from inspect_ai.solver._task_state import TaskState
@@ -46,13 +54,24 @@ _SYMBOLIC_POWER_EXPONENT_LIMIT = 10_000
 _MAX_FACTORIAL_ARGUMENT = 10_000
 
 _DEFAULT_TIMEOUT_SECONDS = 2.0
-# The first call also pays one-time imports (sympy, latex2sympy2) in the worker
-# thread, so its budget is floored well above the steady-state timeout.
+# The first call also starts the worker process and pays its one-time imports
+# (sympy, latex2sympy2), so its budget is floored well above the steady-state
+# timeout.
 _MIN_COLD_TIMEOUT_SECONDS = 10.0
-# SymPy parsing and `.equals()` are pure-Python CPU-bound work, so additional
-# worker threads only share the GIL: no throughput gain, just more wall-clock
-# per parse and more spurious timeouts against the per-item budget. Keep one.
+# One worker process, reused across scorings: each new process pays the
+# one-time imports, and a single worker bounds the host CPU the scorer uses.
 _MATH_WORKERS = 1
+# Address space the worker may grow by beyond its size after imports (Linux).
+_WORKER_MEMORY_HEADROOM_BYTES = 2 * 1024**3
+_MAX_WORKER_RESPONSE_BYTES = 1_000_000
+_WORKER_START_TIMEOUT_SECONDS = 60.0
+_WORKER_IDLE_SECONDS = 60.0
+# Run the worker with the parent's sys.path so it imports this same module,
+# without re-executing the caller's __main__ (as anyio.to_process would).
+_WORKER_SCRIPT = (
+    "import json, sys; sys.path[:] = json.loads(sys.argv[1]); "
+    "from inspect_ai.scorer._math import _worker_main; _worker_main()"
+)
 
 _BOX_START = re.compile(
     r"(?:\\(?:beginboxed|boxed|fbox)|(?<![A-Za-z\\])(?:boxed|fbox|oxed))\s*\{"
@@ -94,6 +113,9 @@ _EAGER_PARSER_OPERATION = re.compile(
     re.IGNORECASE,
 )
 _UNEVALUATED_LATEX_CONSTRUCTOR = re.compile(r"\\(?:binom|gamma)\b", re.IGNORECASE)
+_SPACING_COMMANDS = (r"\qquad", r"\quad", r"\,", r"\;", r"\:", r"\!")
+# Functions whose value has about n*log2(n) bits for an argument n.
+_COMBINATORIAL_FUNCTIONS = {"binomial", "factorial", "gamma"}
 
 _PLAIN_FUNCTIONS = {
     "abs",
@@ -169,16 +191,15 @@ class _MathWorkerContext:
     # A single-slot limiter serializes scorings ahead of the per-item budget.
     # The `async with queue` sits outside `fail_after`, so time spent waiting
     # for the worker does not consume the budget. Parsing then runs in one
-    # worker thread: it keeps the event loop responsive and — crucially — gives
-    # `fail_after` an await to cancel, which is the only reason the budget is
-    # enforceable (a synchronous inline parse has no await point to interrupt).
-    #
-    # The budget does not bound the worker itself: with `abandon_on_cancel=True`
-    # a timed-out parse is abandoned, not killed, so it keeps running. The
-    # static complexity limits reduce but do not eliminate that; a real CPU
-    # bound would need a killable subprocess pool.
+    # worker process, which keeps the event loop responsive even while SymPy
+    # or a regex holds the GIL. When the budget expires (or the scoring is
+    # cancelled) the process is killed, so no abandoned work keeps consuming
+    # CPU or memory; the next scoring starts a fresh one.
     queue: anyio.CapacityLimiter
     started: bool = False
+    process: Process | None = None
+    output: BufferedByteReceiveStream | None = None
+    last_used: float = 0.0
 
 
 _MATH_WORKER_CONTEXT: RunVar[_MathWorkerContext] = RunVar("math_worker_context")
@@ -296,6 +317,9 @@ def _last_delimited_math(text: str) -> str | None:
 
 def _strip_delimiters(text: str) -> str:
     text = text.strip()
+    if len(text) > _MAX_CANDIDATE_CHARS:
+        # `_validate_candidate` rejects it; skip normalizing unbounded text.
+        return text
     while len(text) >= 4 and text.startswith("**") and text.endswith("**"):
         text = text[2:-2].strip()
     for opening, closing in (
@@ -311,8 +335,24 @@ def _strip_delimiters(text: str) -> str:
         ):
             text = text[len(opening) : -len(closing)].strip()
     text = re.sub(r"^(?:(?:\\[,;:!]|\\quad|\\qquad)\s*)+", "", text)
-    text = re.sub(r"(?:(?:\\[,;:!]|\\quad|\\qquad)\s*)+$", "", text)
-    return text.rstrip(" \t\r\n.,;:")
+    # Trailing spacing commands are stripped by scanning back from the end: an
+    # unanchored `(...)+$` regex rescans the remainder from every position.
+    end = len(text)
+    while True:
+        while end and text[end - 1].isspace():
+            end -= 1
+        command = next(
+            (
+                command
+                for command in _SPACING_COMMANDS
+                if text.endswith(command, 0, end)
+            ),
+            None,
+        )
+        if command is None:
+            break
+        end -= len(command)
+    return text[:end].rstrip(" \t\r\n.,;:")
 
 
 def _append_candidate(candidates: list[str], candidate: str | None) -> None:
@@ -945,7 +985,48 @@ def _validate_expression(expression: Any, sympy: Any) -> _ExpressionInfo:
             raise _MathLimitError("parsed expression has too many arguments")
         stack.extend((arg, depth + 1) for arg in args if isinstance(arg, sympy.Basic))
 
+    if any(_evaluated_bits(root, sympy) > _MAX_INTEGER_BITS for root in roots):
+        expensive = True
     return _ExpressionInfo(expensive=expensive)
+
+
+def _evaluated_bits(node: Any, sympy: Any) -> float:
+    """Upper bound on the bit size of the numbers SymPy may build evaluating `node`.
+
+    The parsers build trees with `evaluate=False`, so the literals checked above
+    stay small even when the value they denote is huge (`factorial(10**9)`,
+    `(9^{99})^{99}`). Comparison evaluates the whole tree, so its cost depends
+    on the evaluated size through nested bases, exponents and arguments.
+    Symbols and constants count as one bit.
+    """
+    if isinstance(node, sympy.Rational):
+        return max(stdlib_math.log2(max(abs(int(node.p)), int(node.q))), 1.0)
+    if isinstance(node, sympy.Float):
+        _, _, exponent, precision = node._mpf_
+        return float(max(abs(exponent + precision), precision, 1))
+    args = [arg for arg in node.args if isinstance(arg, sympy.Basic)]
+    if not args:
+        return 1.0
+
+    def magnitude(bits: float) -> float:
+        return stdlib_math.ldexp(1.0, stdlib_math.ceil(min(bits, 1_000.0)))
+
+    if isinstance(node, sympy.Pow):
+        base, exponent = node.args
+        if isinstance(exponent, sympy.Rational):
+            power = -(-abs(int(exponent.p)) // int(exponent.q))
+            exponent_bound = (
+                float(power) if power.bit_length() < 1_000 else stdlib_math.inf
+            )
+        else:
+            exponent_bound = magnitude(_evaluated_bits(exponent, sympy))
+        return _evaluated_bits(base, sympy) * max(exponent_bound, 1.0)
+
+    bits = [_evaluated_bits(arg, sympy) for arg in args]
+    if getattr(node.func, "__name__", "") in _COMBINATORIAL_FUNCTIONS:
+        largest = max(bits)
+        return magnitude(largest) * largest
+    return sum(bits)
 
 
 def _parse_candidate(
@@ -1240,6 +1321,143 @@ def _score_answer_worker(
         clear_cache()
 
 
+def _limit_worker_memory() -> None:
+    """Cap the worker's address space so runaway allocation fails in the worker."""
+    try:
+        import resource
+
+        with open("/proc/self/statm") as statm:
+            used = int(statm.read().split()[0]) * resource.getpagesize()
+        _, hard = resource.getrlimit(resource.RLIMIT_AS)
+        limit = used + _WORKER_MEMORY_HEADROOM_BYTES
+        if hard != resource.RLIM_INFINITY:
+            limit = min(limit, hard)
+        resource.setrlimit(resource.RLIMIT_AS, (limit, hard))
+    except (ImportError, OSError, ValueError):
+        # Not Linux: the worker is still killed when the time budget expires.
+        pass
+
+
+def _worker_main() -> None:
+    """Serve parse and score requests from `score()` as JSON lines on stdin/stdout.
+
+    A target request parses and keeps the targets; the following answer request
+    is scored against them. Only plain JSON crosses the process boundary:
+    unpickling SymPy objects would evaluate them.
+    """
+    from importlib import import_module
+
+    # Import before capping memory, so the cap is headroom over a loaded worker.
+    import_module("latex2sympy2_extended")
+    import_module("sympy")
+    _limit_worker_memory()
+    # Keep stray prints from the parsers out of the response stream.
+    responses = os.fdopen(os.dup(1), "w", encoding="utf-8")
+    os.dup2(2, 1)
+
+    # The parent cannot close a worker whose event loop has ended (the pipe
+    # stays open), so the worker exits once idle; the parent replaces idle
+    # workers before reusing them (`_start_worker`).
+    idle_since: float | None = time.monotonic()
+
+    def exit_when_idle() -> None:
+        while True:
+            time.sleep(1)
+            since = idle_since
+            if since is not None and time.monotonic() - since > _WORKER_IDLE_SECONDS:
+                os._exit(0)
+
+    threading.Thread(target=exit_when_idle, daemon=True).start()
+    responses.write("ready\n")
+    responses.flush()
+
+    parsed_targets: list[_ParsedValue] = []
+    while line := sys.stdin.readline():
+        idle_since = None
+        request = json.loads(line)
+        response: dict[str, Any]
+        try:
+            if "targets" in request:
+                parsed_targets, error = _parse_targets_worker(tuple(request["targets"]))
+                response = {"error": error}
+            else:
+                try:
+                    result = _score_answer_worker(request["completion"], parsed_targets)
+                except MemoryError:
+                    result = _WorkerScore(
+                        "answer_limit", None, "expression exceeded the memory limit"
+                    )
+                response = asdict(result)
+        except Exception as ex:
+            response = {"exception": f"{type(ex).__name__}: {ex}"[:1_000]}
+        responses.write(json.dumps(response) + "\n")
+        responses.flush()
+        idle_since = time.monotonic()
+
+
+async def _start_worker(worker: _MathWorkerContext) -> None:
+    """Start the worker process unless a recently used one is running.
+
+    Start-up (spawn and imports) is not driven by model output, so it is bounded
+    separately rather than by the scoring budget. A worker unused for half its
+    idle limit may be about to exit (see `_worker_main`), so it is replaced.
+    """
+    if (
+        worker.process is not None
+        and anyio.current_time() - worker.last_used < _WORKER_IDLE_SECONDS / 2
+    ):
+        return
+    await _stop_worker(worker)
+    try:
+        with anyio.fail_after(_WORKER_START_TIMEOUT_SECONDS):
+            worker.process = await anyio.open_process(
+                [sys.executable, "-c", _WORKER_SCRIPT, json.dumps(sys.path)],
+                stderr=subprocess.DEVNULL,
+            )
+            assert worker.process.stdout is not None
+            worker.output = BufferedByteReceiveStream(worker.process.stdout)
+            await worker.output.receive_until(b"\n", _MAX_WORKER_RESPONSE_BYTES)
+    except BaseException:
+        await _stop_worker(worker)
+        raise
+    worker.last_used = anyio.current_time()
+
+
+async def _worker_request(
+    worker: _MathWorkerContext, request: dict[str, Any]
+) -> dict[str, Any]:
+    """Send one request to the worker process started by `_start_worker`.
+
+    Any failure or cancellation (including the scoring timeout) kills the
+    worker, so a timed-out parse does not keep running.
+    """
+    try:
+        assert worker.process is not None and worker.process.stdin is not None
+        assert worker.output is not None
+        await worker.process.stdin.send(json.dumps(request).encode() + b"\n")
+        response: dict[str, Any] = json.loads(
+            await worker.output.receive_until(b"\n", _MAX_WORKER_RESPONSE_BYTES)
+        )
+    except BaseException:
+        await _stop_worker(worker)
+        raise
+    worker.last_used = anyio.current_time()
+    if "exception" in response:
+        raise RuntimeError(f"math() scorer worker failed: {response['exception']}")
+    return response
+
+
+async def _stop_worker(worker: _MathWorkerContext) -> None:
+    process, worker.process, worker.output = worker.process, None, None
+    worker.started = False
+    if process is None:
+        return
+    with contextlib.suppress(ProcessLookupError):
+        process.kill()
+    with anyio.CancelScope(shield=True), contextlib.suppress(OSError):
+        await process.aclose()
+
+
 def _dependency_error() -> Exception:
     return pip_dependency_error(
         "math() scorer", [f"{_PARSER_PACKAGE}=={_PARSER_VERSION}"]
@@ -1306,53 +1524,52 @@ def math(*, timeout: float = _DEFAULT_TIMEOUT_SECONDS) -> Scorer:
 
     async def score(state: TaskState, target: Target) -> Score:
         worker = _math_worker_context()
-        targets = tuple(target)
-        try:
-            async with worker.queue:
+        targets = list(target)
+        # Both phases run under one queue slot: the worker keeps the parsed
+        # targets for the answer request that follows.
+        async with worker.queue:
+            try:
+                await _start_worker(worker)
                 target_timeout = timeout if worker.started else cold_timeout
                 with anyio.fail_after(target_timeout):
-                    parsed_targets, target_error = await run_sync(
-                        _parse_targets_worker,
-                        targets,
-                        abandon_on_cancel=True,
+                    target_response = await _worker_request(
+                        worker, {"targets": targets}
                     )
-            worker.started = True
-        except TimeoutError:
-            worker.started = False
-            # A timeout is the scorer failing to run, not the model failing
-            # to answer: record it in `reason` so analysis can attribute the
-            # dropped sample to a slow host.
-            return Score.unscored(
-                explanation="Mathematical target exceeded the parsing time limit.",
-                reason="scoring_failed",
-                metadata=_status_metadata("target_timeout"),
-            )
+                worker.started = True
+            except TimeoutError:
+                worker.started = False
+                # A timeout is the scorer failing to run, not the model failing
+                # to answer: record it in `reason` so analysis can attribute the
+                # dropped sample to a slow host.
+                return Score.unscored(
+                    explanation="Mathematical target exceeded the parsing time limit.",
+                    reason="scoring_failed",
+                    metadata=_status_metadata("target_timeout"),
+                )
 
-        if target_error is not None:
-            raise ValueError(
-                f"Could not parse any mathematical target: {target_error}."
-            )
+            if target_response["error"] is not None:
+                raise ValueError(
+                    f"Could not parse any mathematical target: {target_response['error']}."
+                )
 
-        try:
-            async with worker.queue:
+            try:
                 with anyio.fail_after(timeout):
-                    result = await run_sync(
-                        _score_answer_worker,
-                        state.output.completion,
-                        parsed_targets,
-                        abandon_on_cancel=True,
+                    result = _WorkerScore(
+                        **await _worker_request(
+                            worker, {"completion": state.output.completion}
+                        )
                     )
-        except TimeoutError:
-            worker.started = False
-            # A timeout is the scorer not running to completion, not the
-            # model failing to answer: record `timeout` in `reason` so
-            # analysis can separate a slow host from a wrong answer.
-            return Score(
-                value=INCORRECT,
-                explanation="Mathematical answer exceeded the scoring time limit.",
-                reason="timeout",
-                metadata=_status_metadata("answer_timeout"),
-            )
+            except TimeoutError:
+                worker.started = False
+                # A timeout is the scorer not running to completion, not the
+                # model failing to answer: record `timeout` in `reason` so
+                # analysis can separate a slow host from a wrong answer.
+                return Score(
+                    value=INCORRECT,
+                    explanation="Mathematical answer exceeded the scoring time limit.",
+                    reason="timeout",
+                    metadata=_status_metadata("answer_timeout"),
+                )
 
         if result.status == "correct":
             return Score(
